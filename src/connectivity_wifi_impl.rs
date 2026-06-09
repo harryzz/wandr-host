@@ -90,6 +90,59 @@ fn parse_security(tok: &str) -> SecurityKind {
     }
 }
 
+/// The wire token for a `security-kind` (inverse of [`parse_security`]).
+fn sec_token(s: SecurityKind) -> &'static str {
+    match s {
+        SecurityKind::Open => "open",
+        SecurityKind::Owe => "owe",
+        SecurityKind::WpaPsk => "wpa-psk",
+        SecurityKind::Sae => "sae",
+        SecurityKind::WpaEap => "wpa-eap",
+    }
+}
+
+/// b64-decode a wire token to a `String` (lossy — SSIDs are conventionally UTF-8).
+fn b64_str(s: &str) -> String {
+    String::from_utf8_lossy(&b64_decode(s)).into_owned()
+}
+
+/// True if the reply's first token is an OK status (`OK` from a module verb, `ok`
+/// from a daemon-relayed verb — the arbiter mixes both prefixes).
+fn is_ok(reply: &str) -> bool {
+    let t = reply.trim_start();
+    t.starts_with("OK") || t.starts_with("ok")
+}
+
+/// Strip the leading status token (`OK`/`ok`/`ERR`/`err`) from a reply body line.
+fn strip_status(line: &str) -> &str {
+    let t = line.trim();
+    t.strip_prefix("OK ")
+        .or_else(|| t.strip_prefix("ok "))
+        .or_else(|| t.strip_prefix("ERR "))
+        .or_else(|| t.strip_prefix("err "))
+        .unwrap_or(t)
+}
+
+/// Parse `… id=<n> …` out of an OK reply, or surface the error body.
+fn parse_ok_id(reply: &str) -> Result<u32, String> {
+    if !is_ok(reply) {
+        return Err(strip_status(reply).to_string());
+    }
+    reply
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix("id=").and_then(|v| v.parse().ok()))
+        .ok_or_else(|| "malformed reply (no id)".to_string())
+}
+
+/// OK → `Ok(())`; otherwise the error body.
+fn parse_ok(reply: &str) -> Result<(), String> {
+    if is_ok(reply) {
+        Ok(())
+    } else {
+        Err(strip_status(reply).to_string())
+    }
+}
+
 impl Host for crate::HostState {
     fn set_enabled(&mut self, on: bool) {
         let n = on as u8;
@@ -171,36 +224,91 @@ impl Host for crate::HostState {
         }
     }
 
-    // ── M3 (saved-network store / WifiConfigManager) — not yet wired ──────────
+    // ── M3 — saved-network store (WifiConfigManager, arbiter wandr-arbiter-net) ──
     fn list_saved(&mut self) -> Vec<SavedNetwork> {
-        Vec::new()
+        let reply = match query_full("wifi-saved-list\n") {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("wifi: list-saved forward failed: {e:#}");
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for ln in reply.lines() {
+            let Some(rest) = strip_status(ln).strip_prefix("saved ") else { continue };
+            let (mut id, mut ssid, mut sec, mut auto) =
+                (0u32, String::new(), SecurityKind::Open, false);
+            for kv in rest.split_whitespace() {
+                if let Some(v) = kv.strip_prefix("id=") {
+                    id = v.parse().unwrap_or(0);
+                } else if let Some(v) = kv.strip_prefix("ssid=") {
+                    ssid = b64_str(v);
+                } else if let Some(v) = kv.strip_prefix("sec=") {
+                    sec = parse_security(v);
+                } else if let Some(v) = kv.strip_prefix("auto=") {
+                    auto = v == "1";
+                }
+            }
+            if id != 0 {
+                out.push(SavedNetwork { id, ssid, security: sec, auto_connect: auto });
+            }
+        }
+        out
     }
 
-    fn add_network(&mut self, _cfg: WifiConfig) -> Result<u32, String> {
-        Err("saved-network store is M3 (use connect-new for now)".into())
+    fn add_network(&mut self, cfg: WifiConfig) -> Result<u32, String> {
+        let line = format!(
+            "wifi-saved-add {} {} {} {} {}\n",
+            b64_encode(cfg.ssid.as_bytes()),
+            sec_token(cfg.security),
+            b64_encode(cfg.passphrase.unwrap_or_default().as_bytes()),
+            cfg.auto_connect as u8,
+            cfg.hidden as u8,
+        );
+        let reply = query_full(&line).map_err(|e| format!("arbiter unreachable: {e}"))?;
+        parse_ok_id(&reply)
     }
 
-    fn update_network(&mut self, _id: u32, _cfg: WifiConfig) -> Result<(), String> {
-        Err("saved-network store is M3".into())
+    fn update_network(&mut self, id: u32, cfg: WifiConfig) -> Result<(), String> {
+        let line = format!(
+            "wifi-saved-update {id} {} {} {} {} {}\n",
+            b64_encode(cfg.ssid.as_bytes()),
+            sec_token(cfg.security),
+            b64_encode(cfg.passphrase.unwrap_or_default().as_bytes()),
+            cfg.auto_connect as u8,
+            cfg.hidden as u8,
+        );
+        let reply = query_full(&line).map_err(|e| format!("arbiter unreachable: {e}"))?;
+        parse_ok(&reply)
     }
 
     fn remove_network(&mut self, id: u32) {
-        log::info!("wifi: remove-network {id} ignored (saved-network store is M3)");
+        if let Err(e) = query_full(&format!("wifi-saved-remove {id}\n")) {
+            log::warn!("wifi: remove-network {id} forward failed: {e:#}");
+        }
     }
 
     fn set_auto_connect(&mut self, id: u32, on: bool) {
-        log::info!("wifi: set-auto-connect {id}={on} ignored (saved-network store is M3)");
+        let n = on as u8;
+        if let Err(e) = query_full(&format!("wifi-saved-auto-connect {id} {n}\n")) {
+            log::warn!("wifi: set-auto-connect {id}={on} forward failed: {e:#}");
+        }
     }
 
-    fn connect(&mut self, _id: u32) -> Result<(), String> {
-        Err("connect-by-saved-id is M3 (use connect-new)".into())
+    fn connect(&mut self, id: u32) -> Result<(), String> {
+        let reply = query_full(&format!("wifi-connect-saved {id}\n"))
+            .map_err(|e| format!("arbiter unreachable: {e}"))?;
+        parse_ok(&reply)
     }
 
+    // ── connection control without a saved-store / daemon-disconnect verb ──────
     fn disconnect(&mut self) {
-        log::info!("wifi: disconnect ignored (M3 — needs a daemon disconnect verb)");
+        // Needs a daemon supplicant-disconnect verb (set-enabled false tears the
+        // whole chip down — too blunt). Deferred to a follow-up; logged, not faked.
+        log::info!("wifi: disconnect not yet wired (needs a daemon disconnect verb)");
     }
 
     fn forget_current(&mut self) {
-        log::info!("wifi: forget-current ignored (M3 — saved-network store)");
+        log::info!("wifi: forget-current not yet wired (needs daemon disconnect + current-ssid)");
     }
 }
