@@ -129,6 +129,12 @@ pub enum InboundEvent {
     /// export (if the guest exports it).
     NotificationClicked { id: u64 },
 
+    /// Task 90 event bus — the arbiter fanned an event on a topic this guest
+    /// subscribed to. Delivered as `event <topic> <base64-payload>` on the control
+    /// socket; the standalone drain calls the guest's
+    /// `wandr:events/incoming-handler.handle(msg)` export (if it exports it).
+    Event { topic: String, data: Vec<u8> },
+
     /// PowerManager (wandr-arbiter-power) — the arbiter decided the doze state and
     /// pushed `doze <cadence-ms>` to this host. `cadence_ms = 0` means resume
     /// normal pacing; `>0` means slow the render/bg-tick loop to that coarse
@@ -364,6 +370,21 @@ fn parse_and_queue(line: &str) {
                 }
             }
             Err(_) => log::warn!("ime-inbound: bad notification-clicked id in {line:?}"),
+        }
+    } else if let Some(rest) = line.strip_prefix("event ") {
+        // Task 90 event bus — `event <topic> <base64-payload>`. Decode + enqueue;
+        // the standalone drain calls the guest's wandr:events/incoming-handler.
+        let mut it = rest.trim().splitn(2, ' ');
+        if let Some(topic) = it.next() {
+            let payload_b64 = it.next().unwrap_or("");
+            match crate::events_host_impl::b64_decode(payload_b64) {
+                Some(data) => {
+                    if let Ok(mut q) = queue().lock() {
+                        q.push_back(InboundEvent::Event { topic: topic.to_string(), data });
+                    }
+                }
+                None => log::warn!("ime-inbound: bad base64 payload in event line {line:?}"),
+            }
         }
     } else if let Some(rest) = line.strip_prefix("doze ") {
         // PowerManager — arbiter-decided doze cadence (ms; 0 = resume normal).

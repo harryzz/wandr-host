@@ -570,6 +570,11 @@ fn run_cwasm_loop(
     let notify_events = inst.notify_events;
     // wandr-arbiter-audio M2 — Some(...) only if the guest exports wandr:audio-focus/focus-handler.
     let audio_focus_events = inst.audio_focus_events;
+    // Task 90 event bus — Some(...) only if the guest exports wandr:events/incoming-handler.
+    // The `evt-subscribe` send is DEFERRED until after the control socket is bound
+    // (below), so the arbiter's retained-value-on-subscribe delivery isn't dropped
+    // by a not-yet-listening socket.
+    let events_incoming = inst.events_incoming;
     // Task 64 — Some(...) only if the guest exports my:skiko-gfx/frame-pacing.
     let frame_pacing = inst.frame_pacing;
     // Signal bg-receipt (M2) — a background-service keeps pumping its engine
@@ -650,6 +655,23 @@ fn run_cwasm_loop(
             None
         }
     };
+
+    // Task 90 event bus — subscribe NOW that the control socket is bound, so the
+    // arbiter's retained-value delivery (sent in reply to `evt-subscribe`) lands on
+    // a listening socket. Subscription is host-config (not a WIT call): register the
+    // guest's `package.toml [events] subscribe` topics. The arbiter delivers each
+    // topic's retained value immediately + every later change as an
+    // `event <topic> <payload>` line → the drain calls `handle`.
+    if events_incoming.is_some() {
+        let pid = std::process::id();
+        for topic in loaded.event_subscriptions() {
+            if let Err(e) = send_arbiter_oneshot(&format!("evt-subscribe {pid} {topic}\n")) {
+                log::debug!("standalone: evt-subscribe {topic} failed ({e}); arbiter down?");
+            } else {
+                log::info!("standalone: subscribed to event topic {topic:?}");
+            }
+        }
+    }
 
     // (Chrome overlays already self-registered with the arbiter during surface
     // creation above — register-chrome's reply gave their strip height. The
@@ -1053,6 +1075,28 @@ fn run_cwasm_loop(
                         },
                         None => log::warn!(
                             "notify-inbound: notification-clicked({id}) but guest exports no wandr:notify/notify-handler"
+                        ),
+                    }
+                }
+                crate::ime_inbound::InboundEvent::Event { topic, data } => {
+                    // Task 90 event bus — the arbiter fanned an event on a subscribed
+                    // topic; call the guest's wandr:events/incoming-handler.handle(msg).
+                    // Inert if the guest doesn't export it (events_incoming == None).
+                    dirty = true; // delivering guest work warrants a frame
+                    match events_incoming.as_ref() {
+                        Some(ei) => {
+                            let msg = crate::events_incoming_bindings::wandr::events::types::Message {
+                                topic: topic.clone(),
+                                content_type: None,
+                                data,
+                            };
+                            match ei.wandr_events_incoming_handler().call_handle(&mut store, &msg) {
+                                Ok(()) => log::info!("event-inbound: dispatched handle(topic={topic:?})"),
+                                Err(e) => log::warn!("event-inbound: handle(topic={topic:?}) failed: {e:#}"),
+                            }
+                        }
+                        None => log::warn!(
+                            "event-inbound: event(topic={topic:?}) but guest exports no wandr:events/incoming-handler"
                         ),
                     }
                 }

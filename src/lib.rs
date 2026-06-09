@@ -31,6 +31,7 @@ mod ime_host_impl;
 mod keyboard_host_impl;
 mod alarm_host_impl;
 mod task_manager_host_impl;
+mod events_host_impl;
 mod notify_host_impl;
 mod keyguard_host_impl;
 mod audio_focus_host_impl;
@@ -128,6 +129,29 @@ mod task_manager_host_bindings {
     wasmtime::component::bindgen!({
         path: "../../wit/task-manager.wit",
         world: "task-manager-host",
+    });
+}
+
+/// Task 90 — host-import side of the wandr event bus (`wandr:events`, vocabulary
+/// aligned to `wasi:messaging`). The host implements `producer` (`publish` →
+/// forwarded to the arbiter `evt-publish`; see `events_host_impl.rs`) and
+/// `add_to_linker`s it onto every guest's linker. Subscription is via
+/// `package.toml [events] subscribe`.
+mod events_host_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/events.wit",
+        world: "events-host",
+    });
+}
+
+/// Task 90 — export side: typed `call_handle` for guests that export
+/// `wandr:events/incoming-handler`. The standalone loop calls it when the arbiter
+/// fans an event on a subscribed topic. Bound conditionally per instance (like
+/// `alarm_events`); guests that don't export it yield `None` (inert).
+mod events_incoming_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/events.wit",
+        world: "events-incoming",
     });
 }
 

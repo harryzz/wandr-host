@@ -155,6 +155,21 @@ impl LoadedApp {
             .and_then(|doc| doc.get("background").and_then(|v| v.as_bool()))
             .unwrap_or(false)
     }
+
+    /// Task 90 — the event-bus topics this app subscribes to. Read from the
+    /// installed `package.toml` `[events] subscribe = ["net.status", …]` (an
+    /// array of strings; absent / dev-load → empty). Subscription is host-config,
+    /// not a WIT call (matching wasi:messaging's delivery model): the host
+    /// registers each topic with the arbiter (`evt-subscribe <pid> <topic>`) for a
+    /// guest that also exports `wandr:events/incoming-handler`.
+    pub fn event_subscriptions(&self) -> Vec<String> {
+        self.install_dir.as_ref()
+            .and_then(|dir| fs::read_to_string(dir.join("package.toml")).ok())
+            .and_then(|src| src.parse::<toml::Value>().ok())
+            .and_then(|doc| doc.get("events").and_then(|e| e.get("subscribe")).and_then(|v| v.as_array()).cloned())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// One resolved + deserialized same-Store dep.
@@ -207,6 +222,11 @@ pub struct InstantiatedApp {
     /// `on-focus-changed(change)` on these when an `on-focus-changed` push
     /// arrives; `None` for guests that don't track focus.
     pub audio_focus_events: Option<crate::audio_focus_events_bindings::AudioFocusEvents>,
+    /// Task 90 — `Some(...)` if the component exports `wandr:events/incoming-handler`.
+    /// The standalone loop calls `handle(msg)` on these when the arbiter fans an
+    /// event on a topic the guest subscribed to (`package.toml [events]`); `None`
+    /// for guests that don't receive events.
+    pub events_incoming: Option<crate::events_incoming_bindings::EventsIncoming>,
 }
 
 impl LoadedApp {
@@ -222,6 +242,8 @@ impl LoadedApp {
             .map_err(|e| anyhow!("AlarmHost::add_to_linker: {e:#}"))?; // Arbiter Inc. 3c
         crate::task_manager_host_bindings::TaskManagerHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("TaskManagerHost::add_to_linker: {e:#}"))?; // task 92
+        crate::events_host_bindings::EventsHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+            .map_err(|e| anyhow!("EventsHost::add_to_linker: {e:#}"))?; // task 90 event bus
         crate::notify_host_bindings::NotifyHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("NotifyHost::add_to_linker: {e:#}"))?; // Signal bg-receipt M3
         crate::keyguard_host_bindings::KeyguardHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
@@ -281,8 +303,15 @@ impl LoadedApp {
         if audio_focus_events.is_some() {
             log::info!("loader: app exports wandr:audio-focus/focus-handler — focus changes enabled");
         }
+        // Task 90 — optional event-bus receiver (same .ok() probe).
+        let events_incoming =
+            crate::events_incoming_bindings::EventsIncoming::new(&mut *store, &instance).ok();
+        if events_incoming.is_some() {
+            log::info!("loader: app exports wandr:events/incoming-handler — event-bus delivery enabled");
+        }
         Ok(InstantiatedApp {
             skiko, ime_events, frame_pacing, alarm_events, bg_tick, notify_events, audio_focus_events,
+            events_incoming,
         })
     }
 
@@ -306,6 +335,8 @@ impl LoadedApp {
             .map_err(|e| anyhow!("AlarmHost::add_to_linker: {e:#}"))?; // Arbiter Inc. 3c
         crate::task_manager_host_bindings::TaskManagerHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("TaskManagerHost::add_to_linker: {e:#}"))?; // task 92
+        crate::events_host_bindings::EventsHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+            .map_err(|e| anyhow!("EventsHost::add_to_linker: {e:#}"))?; // task 90 event bus
         crate::notify_host_bindings::NotifyHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("NotifyHost::add_to_linker: {e:#}"))?; // Signal bg-receipt M3
         crate::keyguard_host_bindings::KeyguardHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
