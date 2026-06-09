@@ -220,6 +220,8 @@ impl LoadedApp {
             .map_err(|e| anyhow!("SkikoUi::add_to_linker: {e:#}"))?;
         crate::alarm_host_bindings::AlarmHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("AlarmHost::add_to_linker: {e:#}"))?; // Arbiter Inc. 3c
+        crate::task_manager_host_bindings::TaskManagerHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+            .map_err(|e| anyhow!("TaskManagerHost::add_to_linker: {e:#}"))?; // task 92
         crate::notify_host_bindings::NotifyHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("NotifyHost::add_to_linker: {e:#}"))?; // Signal bg-receipt M3
         crate::keyguard_host_bindings::KeyguardHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
@@ -302,6 +304,8 @@ impl LoadedApp {
             .map_err(|e| anyhow!("SkikoUi::add_to_linker: {e:#}"))?;
         crate::alarm_host_bindings::AlarmHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("AlarmHost::add_to_linker: {e:#}"))?; // Arbiter Inc. 3c
+        crate::task_manager_host_bindings::TaskManagerHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+            .map_err(|e| anyhow!("TaskManagerHost::add_to_linker: {e:#}"))?; // task 92
         crate::notify_host_bindings::NotifyHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("NotifyHost::add_to_linker: {e:#}"))?; // Signal bg-receipt M3
         crate::keyguard_host_bindings::KeyguardHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)

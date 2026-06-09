@@ -30,6 +30,7 @@ pub mod wms_impl;
 mod ime_host_impl;
 mod keyboard_host_impl;
 mod alarm_host_impl;
+mod task_manager_host_impl;
 mod notify_host_impl;
 mod keyguard_host_impl;
 mod audio_focus_host_impl;
@@ -116,6 +117,17 @@ mod alarm_host_bindings {
     wasmtime::component::bindgen!({
         path: "../../wit/alarm.wit",
         world: "alarm-host",
+    });
+}
+
+/// Task 92 — host-import side of `wandr:task-manager`. The host implements
+/// `task-manager` (list-apps/system-mem/kill-app → forwarded to the arbiter +
+/// `/proc` enrichment; see `task_manager_host_impl.rs`) and `add_to_linker`s it
+/// onto every guest's linker.
+mod task_manager_host_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/task-manager.wit",
+        world: "task-manager-host",
     });
 }
 
