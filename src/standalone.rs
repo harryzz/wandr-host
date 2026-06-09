@@ -991,7 +991,7 @@ fn run_cwasm_loop(
                             crate::ime_bindings::wandr::ime::types::InputType::Text
                         }
                     };
-                    if let Err(e) = ie.war_ime_ime()
+                    if let Err(e) = ie.wandr_ime_ime()
                         .call_on_editor_attached(&mut store, wit_input_type)
                     {
                         log::warn!(
@@ -1018,7 +1018,7 @@ fn run_cwasm_loop(
                         );
                         continue;
                     };
-                    if let Err(e) = ie.war_ime_ime().call_on_editor_detached(&mut store) {
+                    if let Err(e) = ie.wandr_ime_ime().call_on_editor_detached(&mut store) {
                         log::warn!("ime-inbound: on-editor-detached failed: {e:#}");
                     } else {
                         log::info!("ime-inbound: dispatched on-editor-detached");
@@ -1030,7 +1030,7 @@ fn run_cwasm_loop(
                     // doesn't export it (alarm_events == None).
                     dirty = true; // doing guest work this iteration warrants a frame
                     match alarm_events.as_ref() {
-                        Some(ae) => match ae.war_alarm_alarm_handler().call_on_alarm(&mut store, id) {
+                        Some(ae) => match ae.wandr_alarm_alarm_handler().call_on_alarm(&mut store, id) {
                             Ok(()) => log::info!("alarm-inbound: dispatched on-alarm({id})"),
                             Err(e) => log::warn!("alarm-inbound: on-alarm({id}) failed: {e:#}"),
                         },
@@ -1045,7 +1045,7 @@ fn run_cwasm_loop(
                     dirty = true;
                     match notify_events.as_ref() {
                         Some(ne) => match ne
-                            .war_notify_notify_handler()
+                            .wandr_notify_notify_handler()
                             .call_on_notification_click(&mut store, id)
                         {
                             Ok(()) => log::info!("notify-inbound: dispatched on-notification-click({id})"),
@@ -1081,7 +1081,7 @@ fn run_cwasm_loop(
                     dirty = true;
                     match audio_focus_events.as_ref() {
                         Some(fe) => match fe
-                            .war_audio_focus_focus_handler()
+                            .wandr_audio_focus_focus_handler()
                             .call_on_focus_changed(&mut store, fc)
                         {
                             Ok(()) => log::info!("focus-inbound: dispatched on-focus-changed({change})"),
@@ -1278,7 +1278,7 @@ fn run_cwasm_loop(
             let delay = bg_tick
                 .as_ref()
                 .unwrap()
-                .war_background_background()
+                .wandr_background_background()
                 .call_bg_tick(&mut store)
                 .unwrap_or(BG_TICK_DEFAULT_MS as u32)
                 .clamp(BG_TICK_MIN_MS as u32, IDLE_CAP_MS as u32) as u64;
