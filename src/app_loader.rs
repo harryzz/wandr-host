@@ -170,6 +170,31 @@ impl LoadedApp {
             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
             .unwrap_or_default()
     }
+
+    /// Task 90 M2 — whether this guest may import the privileged WiFi-management
+    /// interface (`wandr:connectivity/wifi`). The gate is the host's, not the
+    /// manifest's alone: a guest gets `wifi` only if it is BOTH
+    ///   1. installed under `system-apps/` (came from the trusted system image,
+    ///      not a user-sideloaded `apps/` bundle — the same install-class boundary
+    ///      `task_manager_host_impl::kind_and_label` derives), AND
+    ///   2. explicitly opts in with `wifi-control = true` in its `package.toml`
+    ///      (least-privilege — even system apps must ask).
+    /// Both conditions derive from on-disk facts the host owns; no hardcoded
+    /// app-id allowlist. Dev loads (`install_dir == None`) are never privileged.
+    /// When this returns false the host simply doesn't `add_to_linker` `wifi`, so a
+    /// guest that imports it fails to instantiate — that *is* the denial.
+    pub fn wifi_privileged(&self) -> bool {
+        let Some(dir) = self.install_dir.as_ref() else { return false };
+        let system_install = dir
+            .components()
+            .any(|c| c.as_os_str() == "system-apps");
+        let opted_in = fs::read_to_string(dir.join("package.toml"))
+            .ok()
+            .and_then(|src| src.parse::<toml::Value>().ok())
+            .and_then(|doc| doc.get("wifi-control").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        system_install && opted_in
+    }
 }
 
 /// One resolved + deserialized same-Store dep.
@@ -242,6 +267,14 @@ impl LoadedApp {
             .map_err(|e| anyhow!("AlarmHost::add_to_linker: {e:#}"))?; // Arbiter Inc. 3c
         crate::task_manager_host_bindings::TaskManagerHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("TaskManagerHost::add_to_linker: {e:#}"))?; // task 92
+        // Task 90 M2 — privileged wifi-management interface, gated: only a
+        // system-install guest that opts in (`wifi-control = true`) gets it. A
+        // non-privileged guest importing `wifi` fails to instantiate (denied).
+        if self.wifi_privileged() {
+            crate::wifi_host_bindings::WifiHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+                .map_err(|e| anyhow!("WifiHost::add_to_linker: {e:#}"))?;
+            log::info!("app_loader: wifi-management linked (privileged) for {}", self.source_label);
+        }
         crate::events_host_bindings::EventsHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("EventsHost::add_to_linker: {e:#}"))?; // task 90 event bus
         crate::notify_host_bindings::NotifyHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
@@ -335,6 +368,14 @@ impl LoadedApp {
             .map_err(|e| anyhow!("AlarmHost::add_to_linker: {e:#}"))?; // Arbiter Inc. 3c
         crate::task_manager_host_bindings::TaskManagerHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("TaskManagerHost::add_to_linker: {e:#}"))?; // task 92
+        // Task 90 M2 — privileged wifi-management interface, gated: only a
+        // system-install guest that opts in (`wifi-control = true`) gets it. A
+        // non-privileged guest importing `wifi` fails to instantiate (denied).
+        if self.wifi_privileged() {
+            crate::wifi_host_bindings::WifiHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+                .map_err(|e| anyhow!("WifiHost::add_to_linker: {e:#}"))?;
+            log::info!("app_loader: wifi-management linked (privileged) for {}", self.source_label);
+        }
         crate::events_host_bindings::EventsHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("EventsHost::add_to_linker: {e:#}"))?; // task 90 event bus
         crate::notify_host_bindings::NotifyHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)

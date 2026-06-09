@@ -31,6 +31,7 @@ mod ime_host_impl;
 mod keyboard_host_impl;
 mod alarm_host_impl;
 mod task_manager_host_impl;
+mod connectivity_wifi_impl;
 mod events_host_impl;
 mod notify_host_impl;
 mod keyguard_host_impl;
@@ -129,6 +130,20 @@ mod task_manager_host_bindings {
     wasmtime::component::bindgen!({
         path: "../../wit/task-manager.wit",
         world: "task-manager-host",
+    });
+}
+
+/// Task 90 M2 — host-import side of the privileged WiFi-management interface
+/// (`wandr:connectivity/wifi`). The host implements `wifi` (forwarding `scan` /
+/// `connect-new` / `set-enabled` to the arbiter `wifi-*` relay → the wandr-net
+/// daemon; see `connectivity_wifi_impl.rs`) and `add_to_linker`s it ONLY onto a
+/// privileged guest's linker (`LoadedApp::wifi_privileged` — the Settings /
+/// wifi-picker chrome). Ordinary guests can't import it (instantiation fails on
+/// the missing import) — that *is* the gate.
+mod wifi_host_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/connectivity.wit",
+        world: "wifi-host",
     });
 }
 
