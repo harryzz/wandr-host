@@ -1,0 +1,21 @@
+// sf_probe — task 33 Step 1 keystone de-risk (boot-model standalone surface).
+// Built in-tree on the LineageOS source machine: soong resolves all libgui /
+// AIDL / HIDL header + codegen deps automatically. System-side cc_binary
+// (external/ path => system partition, links the real libgui — not VNDK).
+//
+// Deploy to ~/android/lineage/external/sf_probe/Android.bp on the build host.
+cc_binary {
+    name: "sf_probe",
+    srcs: ["sf_probe.cpp"],
+    shared_libs: [
+        "libgui",
+        "libui",
+        "libutils",
+        "libbinder",
+        "liblog",
+        "libEGL",
+        "libGLESv2",
+        "libnativewindow",
+    ],
+    cflags: ["-Wall", "-Wextra"],
+}

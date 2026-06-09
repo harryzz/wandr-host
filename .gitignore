@@ -1,0 +1,42 @@
+# Cargo build output (~2.8 GB after a release build)
+target/
+
+# cargo-apk intermediate
+**/cargo-apk-temp-extra-link-libraries/
+
+# Embedded WASM component — produced by the wandr-app AOT pipeline, not by this crate.
+# Keep this dir tracked (it's in [package.metadata.android] assets), but skip the binary.
+assets/*.cwasm
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.code-workspace
+.vs/
+
+# rust-analyzer
+rust-project.json
+
+# Profiling / sanitizer outputs
+*.profraw
+*.profdata
+perf.data*
+flamegraph.svg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backtraces / core dumps
+core
+core.*
+
+# Task 33: vendored AOSP source + AIDL codegen for the (abandoned)
+# out-of-tree libgui compile — large and regenerable (scripts/gen-libgui-aidl.sh;
+# the shim now builds in-tree on the AOSP host). Not committed.
+/vendor/aosp-system-core/
+/vendor/aosp-system-libbase/
+/vendor/aosp-system-logging/
+/vendor/generated-aidl/
+cpp/build/
