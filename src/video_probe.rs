@@ -29,8 +29,11 @@ pub fn probe_video() {
 
 #[cfg(target_os = "android")]
 mod android {
+    // The NDK FFI + binder-threadpool plumbing was promoted to the real
+    // `wandr:video` backend (task 93 Phase 1) — the probe rides on it.
+    use crate::video::ndk::*;
     use std::ffi::{CStr, CString};
-    use std::os::raw::{c_char, c_int, c_void};
+    use std::os::raw::{c_int, c_void};
     use std::ptr;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::Relaxed};
     use std::time::Instant;
@@ -46,166 +49,6 @@ mod android {
         }};
     }
 
-    // ── Opaque NDK types (used only behind pointers) ─────────────────────────
-    #[repr(C)] pub struct ACameraManager { _p: [u8; 0] }
-    #[repr(C)] pub struct ACameraDevice { _p: [u8; 0] }
-    #[repr(C)] pub struct ACameraCaptureSession { _p: [u8; 0] }
-    #[repr(C)] pub struct ACaptureRequest { _p: [u8; 0] }
-    #[repr(C)] pub struct ACameraOutputTarget { _p: [u8; 0] }
-    #[repr(C)] pub struct ACaptureSessionOutput { _p: [u8; 0] }
-    #[repr(C)] pub struct ACaptureSessionOutputContainer { _p: [u8; 0] }
-    #[repr(C)] pub struct AMediaCodec { _p: [u8; 0] }
-    #[repr(C)] pub struct AMediaFormat { _p: [u8; 0] }
-    #[repr(C)] pub struct ANativeWindow { _p: [u8; 0] }
-    #[repr(C)] pub struct AImageReader { _p: [u8; 0] }
-    #[repr(C)] pub struct AImage { _p: [u8; 0] }
-
-    #[repr(C)]
-    struct ACameraIdList {
-        num_cameras: c_int,
-        camera_ids: *mut *const c_char,
-    }
-
-    #[repr(C)]
-    struct ACameraDeviceStateCallbacks {
-        context: *mut c_void,
-        on_disconnected: extern "C" fn(*mut c_void, *mut ACameraDevice),
-        on_error: extern "C" fn(*mut c_void, *mut ACameraDevice, c_int),
-    }
-
-    #[repr(C)]
-    struct ACameraCaptureSessionStateCallbacks {
-        context: *mut c_void,
-        on_closed: extern "C" fn(*mut c_void, *mut ACameraCaptureSession),
-        on_ready: extern "C" fn(*mut c_void, *mut ACameraCaptureSession),
-        on_active: extern "C" fn(*mut c_void, *mut ACameraCaptureSession),
-    }
-
-    #[repr(C)]
-    struct AMediaCodecBufferInfo {
-        offset: i32,
-        size: i32,
-        presentation_time_us: i64,
-        flags: u32,
-    }
-
-    // camera_status_t / media_status_t: 0 == OK.
-    const ACAMERA_OK: c_int = 0;
-    const AMEDIA_OK: c_int = 0;
-    // ACameraDevice_request_template
-    const TEMPLATE_RECORD: c_int = 3;
-    // TEMPLATE_PREVIEW (=1) avoids the qcom HAL's video-stabilization (EIS) path,
-    // which needs the gyro via android.frameworks.sensorservice.ISensorManager
-    // (gone under --no-art → HAL SIGABRT at startChannelLocked). task 93.
-    const TEMPLATE_PREVIEW: c_int = 1;
-    // MediaCodec
-    const COLOR_FORMAT_SURFACE: i32 = 0x7F00_0789; // COLOR_FormatSurface
-    const CONFIGURE_FLAG_ENCODE: u32 = 1;
-    const BUFFER_FLAG_KEY_FRAME: u32 = 1;
-    const INFO_OUTPUT_FORMAT_CHANGED: isize = -2;
-
-    #[link(name = "camera2ndk")]
-    extern "C" {
-        fn ACameraManager_create() -> *mut ACameraManager;
-        fn ACameraManager_delete(mgr: *mut ACameraManager);
-        fn ACameraManager_getCameraIdList(mgr: *mut ACameraManager, out: *mut *mut ACameraIdList) -> c_int;
-        fn ACameraManager_deleteCameraIdList(list: *mut ACameraIdList);
-        fn ACameraManager_openCamera(mgr: *mut ACameraManager, id: *const c_char,
-            cbs: *const ACameraDeviceStateCallbacks, out: *mut *mut ACameraDevice) -> c_int;
-        fn ACameraDevice_close(dev: *mut ACameraDevice) -> c_int;
-        fn ACameraDevice_createCaptureRequest(dev: *mut ACameraDevice, template: c_int,
-            out: *mut *mut ACaptureRequest) -> c_int;
-        fn ACameraDevice_createCaptureSession(dev: *mut ACameraDevice,
-            outputs: *const ACaptureSessionOutputContainer,
-            cbs: *const ACameraCaptureSessionStateCallbacks,
-            out: *mut *mut ACameraCaptureSession) -> c_int;
-        fn ACaptureSessionOutputContainer_create(out: *mut *mut ACaptureSessionOutputContainer) -> c_int;
-        fn ACaptureSessionOutputContainer_free(c: *mut ACaptureSessionOutputContainer);
-        fn ACaptureSessionOutput_create(win: *mut ANativeWindow, out: *mut *mut ACaptureSessionOutput) -> c_int;
-        fn ACaptureSessionOutput_free(o: *mut ACaptureSessionOutput);
-        fn ACaptureSessionOutputContainer_add(c: *mut ACaptureSessionOutputContainer, o: *const ACaptureSessionOutput) -> c_int;
-        fn ACameraOutputTarget_create(win: *mut ANativeWindow, out: *mut *mut ACameraOutputTarget) -> c_int;
-        fn ACameraOutputTarget_free(t: *mut ACameraOutputTarget);
-        fn ACaptureRequest_addTarget(req: *mut ACaptureRequest, t: *const ACameraOutputTarget) -> c_int;
-        fn ACaptureRequest_free(req: *mut ACaptureRequest);
-        fn ACameraCaptureSession_setRepeatingRequest(s: *mut ACameraCaptureSession,
-            cbs: *const c_void, num: c_int, reqs: *mut *mut ACaptureRequest, seq: *mut c_int) -> c_int;
-        fn ACameraCaptureSession_stopRepeating(s: *mut ACameraCaptureSession) -> c_int;
-        fn ACameraCaptureSession_close(s: *mut ACameraCaptureSession);
-    }
-
-    #[link(name = "mediandk")]
-    extern "C" {
-        fn AMediaCodec_createEncoderByType(mime: *const c_char) -> *mut AMediaCodec;
-        fn AMediaCodec_createCodecByName(name: *const c_char) -> *mut AMediaCodec;
-        fn AMediaCodec_configure(c: *mut AMediaCodec, fmt: *const AMediaFormat,
-            surface: *mut ANativeWindow, crypto: *mut c_void, flags: u32) -> c_int;
-        fn AMediaCodec_createInputSurface(c: *mut AMediaCodec, out: *mut *mut ANativeWindow) -> c_int;
-        fn AMediaCodec_start(c: *mut AMediaCodec) -> c_int;
-        fn AMediaCodec_stop(c: *mut AMediaCodec) -> c_int;
-        fn AMediaCodec_delete(c: *mut AMediaCodec) -> c_int;
-        fn AMediaCodec_signalEndOfInputStream(c: *mut AMediaCodec) -> c_int;
-        fn AMediaCodec_dequeueOutputBuffer(c: *mut AMediaCodec, info: *mut AMediaCodecBufferInfo, timeout_us: i64) -> isize;
-        fn AMediaCodec_releaseOutputBuffer(c: *mut AMediaCodec, idx: usize, render: bool) -> c_int;
-        // Decoder side (task-93 decode-path probe). Read encoder output bytes +
-        // feed them into a HW VP8 decoder via input buffers.
-        fn AMediaCodec_createDecoderByType(mime: *const c_char) -> *mut AMediaCodec;
-        fn AMediaCodec_getOutputBuffer(c: *mut AMediaCodec, idx: usize, out_size: *mut usize) -> *mut u8;
-        fn AMediaCodec_getInputBuffer(c: *mut AMediaCodec, idx: usize, out_size: *mut usize) -> *mut u8;
-        fn AMediaCodec_dequeueInputBuffer(c: *mut AMediaCodec, timeout_us: i64) -> isize;
-        fn AMediaCodec_queueInputBuffer(c: *mut AMediaCodec, idx: usize, offset: usize,
-            size: usize, time_us: u64, flags: u32) -> c_int;
-        fn AMediaFormat_new() -> *mut AMediaFormat;
-        fn AMediaFormat_delete(f: *mut AMediaFormat) -> c_int;
-        fn AMediaFormat_setString(f: *mut AMediaFormat, key: *const c_char, val: *const c_char);
-        fn AMediaFormat_setInt32(f: *mut AMediaFormat, key: *const c_char, val: i32);
-        // AImageReader (also in libmediandk) — a camera target with EXPLICIT
-        // dimensions, to prove the camera delivers frames under --no-art (decisive
-        // test, sidestepping the encoder input-surface's 0x0 geometry).
-        fn AImageReader_new(width: i32, height: i32, format: i32, max_images: i32,
-            out: *mut *mut AImageReader) -> c_int;
-        fn AImageReader_getWindow(r: *mut AImageReader, out: *mut *mut ANativeWindow) -> c_int;
-        fn AImageReader_acquireLatestImage(r: *mut AImageReader, out: *mut *mut AImage) -> c_int;
-        fn AImageReader_delete(r: *mut AImageReader);
-        fn AImage_getWidth(img: *mut AImage, out: *mut i32) -> c_int;
-        fn AImage_getHeight(img: *mut AImage, out: *mut i32) -> c_int;
-        fn AImage_delete(img: *mut AImage);
-    }
-
-    #[link(name = "android")]
-    extern "C" {
-        fn ANativeWindow_release(win: *mut ANativeWindow);
-        fn ANativeWindow_getFormat(win: *mut ANativeWindow) -> i32;
-        fn ANativeWindow_setBuffersGeometry(win: *mut ANativeWindow, w: i32, h: i32, format: i32) -> i32;
-    }
-
-    // The NDK Camera2 path talks to cameraserver over C++ libbinder and needs a
-    // running binder threadpool in OUR process to receive its callbacks + link-to-
-    // death (else "Thread Pool max thread count is 0" → camera ops hang). The NDK
-    // stub `libbinder_ndk` does NOT export `ABinderProcess_*`, and rsbinder's
-    // threadpool is a separate context that doesn't service C++ libbinder. So we
-    // start the C++ libbinder threadpool through the task-33 shim (which links the
-    // device's `libbinder`): `sf_start_binder_threadpool` → `ProcessState::self()
-    // ->startThreadPool()`. dlopen'd by name (resolved via LD_LIBRARY_PATH, same as
-    // the host's own shim load).
-    unsafe fn start_binder_threadpool() -> bool {
-        let lib = CString::new("libsf_surface.so").unwrap();
-        let h = libc::dlopen(lib.as_ptr(), libc::RTLD_NOW);
-        if h.is_null() {
-            p!("WARN: dlopen(libsf_surface.so) failed — binder threadpool not started");
-            return false;
-        }
-        let sym = CString::new("sf_start_binder_threadpool").unwrap();
-        let f = libc::dlsym(h, sym.as_ptr());
-        if f.is_null() {
-            p!("WARN: sf_start_binder_threadpool not found in shim (rebuild libsf_surface.so)");
-            return false;
-        }
-        let func: extern "C" fn() = std::mem::transmute(f);
-        func();
-        true
-    }
-
     static CAM_ERROR: AtomicBool = AtomicBool::new(false);
     static CAM_ERR_CODE: AtomicI32 = AtomicI32::new(0);
 
@@ -215,16 +58,6 @@ mod android {
         CAM_ERR_CODE.store(err, Relaxed);
     }
     extern "C" fn on_session_noop(_c: *mut c_void, _s: *mut ACameraCaptureSession) {}
-
-    unsafe fn fmt_set_str(f: *mut AMediaFormat, k: &str, v: &str) {
-        let ck = CString::new(k).unwrap();
-        let cv = CString::new(v).unwrap();
-        AMediaFormat_setString(f, ck.as_ptr(), cv.as_ptr());
-    }
-    unsafe fn fmt_set_i32(f: *mut AMediaFormat, k: &str, v: i32) {
-        let ck = CString::new(k).unwrap();
-        AMediaFormat_setInt32(f, ck.as_ptr(), v);
-    }
 
     pub fn run() {
         const W: i32 = 640;
@@ -258,13 +91,11 @@ mod android {
         unsafe { run_inner(W, H, VP8, codec_name.as_deref(), decode) }
     }
 
-    const AIMAGE_FORMAT_YUV_420_888: i32 = 0x23;
-
     // Decisive camera-delivery test: camera → AImageReader (explicit dims, no
     // encoder). If frames arrive, camera capture works end-to-end under --no-art
     // and the encoder-surface 0x0 was the only gap.
     unsafe fn run_imagereader(w: i32, h: i32) {
-        let tp = start_binder_threadpool();
+        let tp = crate::video::ensure_binder_threadpool();
         p!("binder threadpool started: {tp}");
         let mgr = ACameraManager_create();
         if mgr.is_null() { p!("FAIL: ACameraManager_create -> null"); return; }
@@ -366,7 +197,7 @@ mod android {
         //    — the NDK Camera2 client needs it to service cameraserver callbacks;
         //    without it open/createCaptureSession hang ("Thread Pool max thread
         //    count is 0").
-        let tp = start_binder_threadpool();
+        let tp = crate::video::ensure_binder_threadpool();
         p!("binder threadpool started: {tp}");
 
         // 1. Camera manager + enumerate.

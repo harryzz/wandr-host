@@ -34,6 +34,8 @@ mod task_manager_host_impl;
 mod connectivity_wifi_impl;
 pub mod crypto;
 mod crypto_host_impl;
+pub mod video;
+mod video_host_impl;
 mod events_host_impl;
 mod notify_host_impl;
 mod keyguard_host_impl;
@@ -165,6 +167,24 @@ mod crypto_host_bindings {
             "wandr:crypto/mac.mac-key": crate::crypto_host_impl::MacKeyState,
             "wandr:crypto/aead.aead-key": crate::crypto_host_impl::AeadKeyState,
             "wandr:crypto/cipher.cipher-key": crate::crypto_host_impl::CipherKeyState,
+        },
+    });
+}
+
+/// Task 93 Phase 1 — host-import side of `wandr:video` (host-side HW video
+/// codec for calls). The host implements `encoder` (camera capture + HW VP8
+/// encode, guest pulls `next-frame`) and `decoder` (guest pushes encoded
+/// frames, HW decode — to-buffer in Phase 1, to-surface/`Role::Video` in
+/// Phase 4); handles are host resources mapped to the backing structs in
+/// `video_host_impl` and stored in `HostState.table`. Backend = `video.rs`
+/// (NDK camera2/mediandk, promoted from the `--probe-video` spike).
+mod video_host_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/video.wit",
+        world: "video-host",
+        with: {
+            "wandr:video/encoder.video-encoder": crate::video_host_impl::EncoderState,
+            "wandr:video/decoder.video-decoder": crate::video_host_impl::DecoderState,
         },
     });
 }
