@@ -221,8 +221,8 @@ impl wit::aead::HostAeadKey for HostState {
     }
 }
 
-// Stateless one-shot AEAD (functions, no resource) — the wac-composable hot path
-// used by the Signal call engine for SRTP. Same backend as the `aead` resource.
+// Stateless one-shot AEAD (functions, no resource) — used by the Signal call engine
+// for SRTP. Same backend as the `aead` resource, measured equal at packet sizes.
 impl wit::aead_oneshot::Host for HostState {
     fn seal(&mut self, algo: wit::types::AeadAlgo, key: Vec<u8>, nonce: Vec<u8>, aad: Vec<u8>, plaintext: Vec<u8>) -> Result<Vec<u8>, wit::types::CryptoError> {
         let a = aead2c(algo);
