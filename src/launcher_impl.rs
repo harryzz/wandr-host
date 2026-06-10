@@ -57,36 +57,70 @@ fn forward(verb: &str, arg: &str) {
     }
 }
 
-/// Scan `<APPS_ROOT>/apps/*` (user apps only — system-apps are
-/// library/headless components, not launchable). For each app-id dir,
-/// read `[package].label` from the latest version's `package.toml`,
-/// falling back to the app-id. Returns `app-id\tlabel\n` lines, sorted.
+/// Build the launcher tile list. Every app under `<APPS_ROOT>/apps/*` (user apps)
+/// is launchable; under `system-apps/*` only the few that opt in with
+/// `show-in-launcher = true` (settings / hub apps — e.g. `wandr.settings.wifi`)
+/// appear, so the pure chrome (statusbar / taskbar / ime / keyguard) stays hidden.
+/// For each, read `label` from the latest version's `package.toml` (falling back
+/// to the app-id). Returns `app-id\tlabel\n` lines, sorted by app-id.
 fn scan_installed_apps() -> String {
-    let dir = crate::app_loader::apps_root().join("apps");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) => {
-            log::warn!("launcher: read_dir {} failed: {e}", dir.display());
-            return String::new();
-        }
-    };
-    let mut ids: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-    ids.sort();
+    let root = crate::app_loader::apps_root();
+    let mut entries: Vec<(String, String)> = Vec::new();
+    collect_apps(&root.join("apps"), false, &mut entries);
+    collect_apps(&root.join("system-apps"), true, &mut entries);
+    entries.sort();
 
     let mut out = String::new();
-    for app_id in &ids {
-        let label = read_label(&dir.join(app_id)).unwrap_or_else(|| app_id.clone());
+    for (app_id, label) in &entries {
         out.push_str(app_id);
         out.push('\t');
-        out.push_str(&label);
+        out.push_str(label);
         out.push('\n');
     }
-    log::info!("launcher: list-apps → {} app(s)", ids.len());
+    log::info!("launcher: list-apps → {} app(s)", entries.len());
     out
+}
+
+/// Append the launchable apps under `dir` to `out` as `(app_id, label)`. When
+/// `require_flag`, only include apps whose manifest sets `show-in-launcher = true`
+/// (the system-apps opt-in gate).
+fn collect_apps(dir: &Path, require_flag: bool, out: &mut Vec<(String, String)>) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            log::debug!("launcher: read_dir {} → {e} (none)", dir.display());
+            return;
+        }
+    };
+    for entry in rd.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Ok(app_id) = entry.file_name().into_string() else { continue };
+        let app_dir = dir.join(&app_id);
+        if require_flag && !read_bool_flag(&app_dir, "show-in-launcher") {
+            continue;
+        }
+        let label = read_label(&app_dir).unwrap_or_else(|| app_id.clone());
+        out.push((app_id, label));
+    }
+}
+
+/// Read a top-level boolean flag from the lexically-latest version dir's
+/// `package.toml` (the flat wandrpkg manifest). `false` if absent / unreadable.
+fn read_bool_flag(app_dir: &Path, key: &str) -> bool {
+    (|| {
+        let ver = std::fs::read_dir(app_dir)
+            .ok()?
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .max()?;
+        let body = std::fs::read_to_string(app_dir.join(&ver).join("package.toml")).ok()?;
+        let val: toml::Value = toml::from_str(&body).ok()?;
+        val.get(key)?.as_bool()
+    })()
+    .unwrap_or(false)
 }
 
 /// Read `[package].label` from the lexically-latest version dir's
