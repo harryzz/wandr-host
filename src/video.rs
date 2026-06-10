@@ -80,6 +80,10 @@ pub struct DecoderConfig {
     /// empty rect) = decode-to-buffer: frames are counted + dropped — the
     /// Phase-1 diagnostic mode.
     pub rect: Option<VideoRect>,
+    /// Degrees CW to rotate decoded frames for display (the peer's CVO value).
+    /// Applied via MediaCodec "rotation-degrees" in surface mode — fixed at
+    /// open; reopen the decoder if the peer's rotation changes mid-call.
+    pub rotation: u32,
 }
 
 pub struct EncodedFrame {
@@ -118,6 +122,9 @@ mod desktop {
         pub fn set_bitrate(&mut self, _bps: u32) {}
         pub fn set_preview_rect(&mut self, _rect: super::VideoRect) {}
         pub fn set_preview_visible(&mut self, _visible: bool) {}
+        pub fn display_rotation(&self) -> u32 {
+            0
+        }
     }
 
     pub struct VideoDecoder;
@@ -216,11 +223,13 @@ pub mod ndk {
     pub const INFO_OUTPUT_FORMAT_CHANGED: isize = -2;
     pub const INFO_OUTPUT_BUFFERS_CHANGED: isize = -3;
     pub const AIMAGE_FORMAT_YUV_420_888: i32 = 0x23;
-    // NdkCameraMetadataTags.h (value cross-checked against the vendored AOSP
-    // camera metadata AIDL: ANDROID_LENS_FACING = 524293).
+    // NdkCameraMetadataTags.h (values cross-checked against the vendored AOSP
+    // camera metadata AIDL: ANDROID_LENS_FACING = 524293,
+    // ANDROID_SENSOR_ORIENTATION = 917518).
     pub const ACAMERA_LENS_FACING: u32 = 524293; // (8 << 16) + 5
     pub const ACAMERA_LENS_FACING_FRONT: u8 = 0;
     pub const ACAMERA_LENS_FACING_BACK: u8 = 1;
+    pub const ACAMERA_SENSOR_ORIENTATION: u32 = 917518; // (14 << 16) + 14, i32 entry
 
     #[link(name = "camera2ndk")]
     extern "C" {
@@ -379,6 +388,7 @@ mod android {
             create: unsafe extern "C" fn(i32, i32, i32, *mut *mut std::ffi::c_void) -> i32,
             set_rect: unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32,
             set_visible: unsafe extern "C" fn(i32, i32) -> i32,
+            set_transform: unsafe extern "C" fn(i32, u32) -> i32,
             destroy: unsafe extern "C" fn(i32),
             set_opaque: unsafe extern "C" fn(i32) -> i32,
         }
@@ -404,20 +414,22 @@ mod android {
                     }
                     p
                 };
-                let (c, r, v, d, o) = (
+                let (c, r, v, t, d, o) = (
                     sym("sf_media_create"),
                     sym("sf_media_set_rect"),
                     sym("sf_media_set_visible"),
+                    sym("sf_media_set_transform"),
                     sym("sf_media_destroy"),
                     sym("sf_set_opaque"),
                 );
-                if c.is_null() || r.is_null() || v.is_null() || d.is_null() || o.is_null() {
+                if c.is_null() || r.is_null() || v.is_null() || t.is_null() || d.is_null() || o.is_null() {
                     return None;
                 }
                 Some(MediaFns {
                     create: std::mem::transmute(c),
                     set_rect: std::mem::transmute(r),
                     set_visible: std::mem::transmute(v),
+                    set_transform: std::mem::transmute(t),
                     destroy: std::mem::transmute(d),
                     set_opaque: std::mem::transmute(o),
                 })
@@ -448,6 +460,21 @@ mod android {
         pub fn set_visible(slot: i32, visible: bool) {
             if let Some(f) = fns() {
                 unsafe { (f.set_visible)(slot, visible as i32) };
+            }
+        }
+
+        /// Rotate the buffer at composition. `degrees` CW → HAL transform
+        /// (ROT_90=4, ROT_180=3, ROT_270=7); 90/270 swap the slot's logical
+        /// dims in the shim — call BEFORE `set_rect`.
+        pub fn set_transform(slot: i32, degrees: u32) {
+            let transform: u32 = match degrees % 360 {
+                90 => 4,  // NATIVE_WINDOW_TRANSFORM_ROT_90
+                180 => 3, // ROT_180 = FLIP_H | FLIP_V
+                270 => 7, // ROT_270 = ROT_90 | ROT_180
+                _ => 0,
+            };
+            if let Some(f) = fns() {
+                unsafe { (f.set_transform)(slot, transform) };
             }
         }
 
@@ -513,6 +540,10 @@ mod android {
         preview_slot: Option<i32>,
         preview_out: *mut ACaptureSessionOutput,
         preview_target: *mut ACameraOutputTarget,
+        /// Degrees CW a receiver must rotate our frames for upright display
+        /// (facing-adjusted sensor orientation — feeds the CVO extension; the
+        /// PiP preview applies the same value as an SF buffer transform).
+        display_rotation: u32,
     }
 
     // The NDK camera and AMediaCodec handles are documented thread-safe; all
@@ -548,6 +579,7 @@ mod android {
                 preview_slot: None,
                 preview_out: ptr::null_mut(),
                 preview_target: ptr::null_mut(),
+                display_rotation: 0,
             };
             // From here every early return goes through Drop, which tolerates
             // the partially-filled struct — the ordered-teardown guarantee.
@@ -561,7 +593,8 @@ mod android {
                 log::warn!("video: ACameraManager_create -> null");
                 return Err(VideoError::CodecInitFailed);
             }
-            let cam_id = pick_camera(self.mgr, config.facing_front)?;
+            let (cam_id, display_rotation) = pick_camera(self.mgr, config.facing_front)?;
+            self.display_rotation = display_rotation;
             log::info!("video: opening camera id={} (front={}) …", cam_id.to_string_lossy(), config.facing_front);
 
             let dev_cbs = ACameraDeviceStateCallbacks {
@@ -624,6 +657,10 @@ mod android {
                     Some((slot, win)) => {
                         self.preview_slot = Some(slot);
                         preview_win = win;
+                        // Camera buffers arrive sensor-rotated; SF applies the
+                        // display rotation at composition (before set_rect —
+                        // 90/270 swap the slot's logical dims).
+                        media::set_transform(slot, self.display_rotation);
                         media::set_rect(slot, rect);
                         media::set_visible(slot, true);
                         ACaptureSessionOutput_create(preview_win, &mut self.preview_out);
@@ -730,6 +767,12 @@ mod android {
             }
         }
 
+        /// Degrees CW a receiver must rotate our frames for upright display
+        /// (the outgoing CVO value).
+        pub fn display_rotation(&self) -> u32 {
+            self.display_rotation
+        }
+
         /// Move/resize the PiP self-view (no-op without a preview surface).
         pub fn set_preview_rect(&mut self, rect: super::VideoRect) {
             if let Some(slot) = self.preview_slot {
@@ -782,7 +825,12 @@ mod android {
 
     /// Pick the camera whose ACAMERA_LENS_FACING matches; fall back to the
     /// first enumerated id (the probe's behavior) if no match / query fails.
-    unsafe fn pick_camera(mgr: *mut ACameraManager, front: bool) -> Result<CString, VideoError> {
+    /// Also returns the **display rotation** for that camera: the degrees CW a
+    /// receiver/preview must rotate the sensor's buffers for upright display —
+    /// the classic Camera2 formula at device-rotation 0: back = sensor
+    /// orientation; front = (360 − sensor orientation) % 360 (mirror-adjusted;
+    /// the self-view is not horizontally flipped in v1).
+    unsafe fn pick_camera(mgr: *mut ACameraManager, front: bool) -> Result<(CString, u32), VideoError> {
         let mut id_list: *mut ACameraIdList = ptr::null_mut();
         if ACameraManager_getCameraIdList(mgr, &mut id_list) != ACAMERA_OK || id_list.is_null() {
             log::warn!("video: getCameraIdList failed");
@@ -795,33 +843,52 @@ mod android {
             return Err(VideoError::CodecInitFailed);
         }
         let want = if front { ACAMERA_LENS_FACING_FRONT } else { ACAMERA_LENS_FACING_BACK };
-        let mut chosen: Option<CString> = None;
+        let entry_u8 = |meta: *const ACameraMetadata, tag: u32| -> Option<u8> {
+            let mut e = ACameraMetadata_const_entry { tag: 0, r#type: 0, count: 0, data: ptr::null() };
+            (ACameraMetadata_getConstEntry(meta, tag, &mut e) == ACAMERA_OK
+                && e.count > 0
+                && !e.data.is_null())
+            .then(|| *e.data)
+        };
+        let entry_i32 = |meta: *const ACameraMetadata, tag: u32| -> Option<i32> {
+            let mut e = ACameraMetadata_const_entry { tag: 0, r#type: 0, count: 0, data: ptr::null() };
+            (ACameraMetadata_getConstEntry(meta, tag, &mut e) == ACAMERA_OK
+                && e.count > 0
+                && !e.data.is_null())
+            .then(|| *(e.data as *const i32))
+        };
+        let mut chosen: Option<(CString, u32)> = None;
+        let mut first_orientation = 0u32;
         for i in 0..n {
             let id_ptr = *(*id_list).camera_ids.add(i as usize);
             let mut meta: *mut ACameraMetadata = ptr::null_mut();
             if ACameraManager_getCameraCharacteristics(mgr, id_ptr, &mut meta) == ACAMERA_OK && !meta.is_null() {
-                let mut entry = ACameraMetadata_const_entry { tag: 0, r#type: 0, count: 0, data: ptr::null() };
-                let got = ACameraMetadata_getConstEntry(meta, ACAMERA_LENS_FACING, &mut entry);
-                let facing = if got == ACAMERA_OK && entry.count > 0 && !entry.data.is_null() {
-                    Some(*entry.data)
-                } else {
-                    None
-                };
+                let facing = entry_u8(meta, ACAMERA_LENS_FACING);
+                let sensor = entry_i32(meta, ACAMERA_SENSOR_ORIENTATION).unwrap_or(0) as u32 % 360;
                 ACameraMetadata_free(meta);
+                let display_rot = if facing == Some(ACAMERA_LENS_FACING_FRONT) {
+                    (360 - sensor) % 360
+                } else {
+                    sensor
+                };
+                if i == 0 {
+                    first_orientation = display_rot;
+                }
                 if facing == Some(want) {
-                    chosen = Some(CStr::from_ptr(id_ptr).to_owned());
+                    chosen = Some((CStr::from_ptr(id_ptr).to_owned(), display_rot));
                     break;
                 }
             }
         }
-        let id = chosen.unwrap_or_else(|| {
+        let (id, rot) = chosen.unwrap_or_else(|| {
             let first = CStr::from_ptr(*(*id_list).camera_ids.add(0)).to_owned();
             log::info!("video: no {} camera found — falling back to id={}",
                 if front { "front" } else { "back" }, first.to_string_lossy());
-            first
+            (first, first_orientation)
         });
         ACameraManager_deleteCameraIdList(id_list);
-        Ok(id)
+        log::info!("video: camera id={} display-rotation={}°", id.to_string_lossy(), rot);
+        Ok((id, rot))
     }
 
     // ── decoder: guest pushes encoded frames → HW decode ──────────────────
@@ -885,6 +952,11 @@ mod android {
                 fmt_set_str(dec.fmt, "mime", config.codec.mime());
                 fmt_set_i32(dec.fmt, "width", config.width.max(1) as i32);
                 fmt_set_i32(dec.fmt, "height", config.height.max(1) as i32);
+                // Surface mode honors "rotation-degrees": the framework sets
+                // the matching transform when rendering each output buffer.
+                if !surface.is_null() && config.rotation % 360 != 0 {
+                    fmt_set_i32(dec.fmt, "rotation-degrees", (config.rotation % 360) as i32);
+                }
                 let dcfg = AMediaCodec_configure(dec.codec, dec.fmt, surface, ptr::null_mut(), 0);
                 if dcfg != AMEDIA_OK {
                     log::warn!("video: decoder configure status={dcfg}");

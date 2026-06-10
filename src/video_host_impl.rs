@@ -115,6 +115,10 @@ impl wit::encoder::HostVideoEncoder for HostState {
         }
     }
 
+    fn display_rotation(&mut self, self_: Resource<EncoderState>) -> u32 {
+        self.table.get(&self_).map(|st| st.0.display_rotation()).unwrap_or(0)
+    }
+
     fn drop(&mut self, rep: Resource<EncoderState>) -> wasmtime::Result<()> {
         self.table.delete(rep)?; // VideoEncoder::drop = ordered camera/codec teardown
         Ok(())
@@ -133,6 +137,7 @@ impl wit::decoder::HostVideoDecoder for HostState {
             height: config.height,
             // An empty rect = decode-to-buffer (the backend filters it).
             rect: Some(rect2b(config.rect)),
+            rotation: config.rotation,
         };
         let dec = video::VideoDecoder::open(&cfg).map_err(err2w)?;
         self.table

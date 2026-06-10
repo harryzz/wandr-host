@@ -1059,8 +1059,12 @@ struct MediaSlot {
     sp<SurfaceControl>   child;
     sp<BLASTBufferQueue> bbq;
     sp<Surface>          surface;
+    // Current LOGICAL dims (post-transform; what set_rect scales from).
     int32_t              buf_w = 0;
     int32_t              buf_h = 0;
+    // The producer's true buffer dims, as created (transform-independent).
+    int32_t              producer_w = 0;
+    int32_t              producer_h = 0;
 };
 static MediaSlot g_media[4];
 
@@ -1144,8 +1148,10 @@ int32_t sf_media_create(int32_t buf_w, int32_t buf_h, int32_t z, void** out_wind
     g_media[slot].child     = child;
     g_media[slot].bbq       = bbq;
     g_media[slot].surface   = surface;
-    g_media[slot].buf_w     = buf_w;
-    g_media[slot].buf_h     = buf_h;
+    g_media[slot].buf_w      = buf_w;
+    g_media[slot].buf_h      = buf_h;
+    g_media[slot].producer_w = buf_w;
+    g_media[slot].producer_h = buf_h;
     // The explicit upcast matters: Surface's ANativeWindow base subobject is
     // at a non-zero offset, and assigning straight into a void* skips the
     // pointer adjustment — the consumer (camera2ndk) then SIGSEGVs on a
@@ -1185,6 +1191,37 @@ int32_t sf_media_set_visible(int32_t slot, int32_t visible) {
     return 0;
 }
 
+// Rotate the media surface's BUFFER at composition (task 93 Phase 5 — camera
+// sensor orientation for the PiP self-view; the decoder path rotates via
+// MediaCodec "rotation-degrees" instead). `transform` is a NATIVE_WINDOW /
+// HAL transform bitmask (ROT_90=4, ROT_180=3, ROT_270=7, 0=identity). For
+// 90°/270° the buffer's logical dims swap, so the BBQ destination + crop are
+// updated to the swapped size and the stored buf dims flip — `sf_media_set_rect`
+// scaling then keeps the on-screen rect undistorted. Call BEFORE set_rect.
+int32_t sf_media_set_transform(int32_t slot, uint32_t transform) {
+    if (slot < 0 || slot >= 4 || g_media[slot].container == nullptr) return -1;
+    // Logical (post-transform) dims derive from the producer's TRUE dims,
+    // recorded at create — buf_w/buf_h hold the current logical size (used by
+    // set_rect's scale math) and flip on a 90°/270° transform.
+    const bool swaps = (transform & NATIVE_WINDOW_TRANSFORM_ROT_90) != 0;
+    const int32_t pw = g_media[slot].producer_w;
+    const int32_t ph = g_media[slot].producer_h;
+    const int32_t nw = swaps ? ph : pw;
+    const int32_t nh = swaps ? pw : ph;
+    SurfaceComposerClient::Transaction t;
+    t.setTransform(g_media[slot].child, transform);
+    t.setCrop(g_media[slot].child, Rect(0, 0, nw, nh));
+    t.apply(/*synchronous=*/true);
+    g_media[slot].bbq->update(g_media[slot].child,
+                              static_cast<uint32_t>(nw),
+                              static_cast<uint32_t>(nh),
+                              PIXEL_FORMAT_RGBA_8888);
+    g_media[slot].buf_w = nw;
+    g_media[slot].buf_h = nh;
+    LOGI("[media] slot %d transform=%u logical=%dx%d", slot, transform, nw, nh);
+    return 0;
+}
+
 // Release one media slot: hide synchronously (so the codec/camera producer is
 // gone from the screen before its buffers die), then drop the refs — with no
 // owner left, SurfaceFlinger removes the layers.
@@ -1200,6 +1237,7 @@ void sf_media_destroy(int32_t slot) {
     g_media[slot].child.clear();
     g_media[slot].container.clear();
     g_media[slot].buf_w = g_media[slot].buf_h = 0;
+    g_media[slot].producer_w = g_media[slot].producer_h = 0;
     LOGI("[media] slot %d destroyed", slot);
 }
 

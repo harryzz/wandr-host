@@ -127,6 +127,9 @@ int32_t sf_media_create(int32_t buf_w, int32_t buf_h, int32_t z, void** out_wind
 // Rect in the parent surface's pixel space (panel pixels when top-level).
 int32_t sf_media_set_rect(int32_t slot, int32_t x, int32_t y, int32_t w, int32_t h);
 int32_t sf_media_set_visible(int32_t slot, int32_t visible);
+// Rotate the buffer at composition (NATIVE_WINDOW transform: ROT_90=4, 180=3,
+// 270=7). 90/270 swap the logical dims (BBQ + crop updated); call before set_rect.
+int32_t sf_media_set_transform(int32_t slot, uint32_t transform);
 void    sf_media_destroy(int32_t slot);
 // Toggle the main layer's eLayerOpaque flag (clear while a behind-the-UI video
 // surface is up so the guest's transparent hole blends; restore after).
