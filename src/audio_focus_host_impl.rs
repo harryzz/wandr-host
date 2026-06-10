@@ -97,6 +97,10 @@ impl Host for crate::HostState {
     fn call_end(&mut self) {
         forward("audio-call-end");
     }
+
+    fn call_video(&mut self, active: bool) {
+        forward(if active { "audio-call-video 1" } else { "audio-call-video 0" });
+    }
 }
 
 /// Fire-and-forget `<verb> <pid>` to the arbiter (the call/ring session commands).
