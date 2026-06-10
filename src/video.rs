@@ -58,6 +58,13 @@ impl VideoRect {
     }
 }
 
+/// Compositing layer relative to the app's UI buffer (guest policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZLayer {
+    BehindUi,
+    AboveUi,
+}
+
 pub struct EncoderConfig {
     pub codec: Codec,
     pub width: u32,
@@ -70,6 +77,7 @@ pub struct EncoderConfig {
     /// PiP self-view rect: the camera streams to a second (preview) surface
     /// composited at this rect. `None` = no self-view.
     pub preview: Option<VideoRect>,
+    pub preview_layer: ZLayer,
 }
 
 pub struct DecoderConfig {
@@ -84,6 +92,7 @@ pub struct DecoderConfig {
     /// Applied via MediaCodec "rotation-degrees" in surface mode — fixed at
     /// open; reopen the decoder if the peer's rotation changes mid-call.
     pub rotation: u32,
+    pub layer: ZLayer,
 }
 
 pub struct EncodedFrame {
@@ -368,11 +377,15 @@ mod android {
         OK.load(Relaxed)
     }
 
-    /// Child z-order for media surfaces relative to the app's own UI buffer
-    /// (the SurfaceView model — negative composites BELOW the buffer; the UI
-    /// punches a transparent hole). PiP self-view sits above remote video.
-    const Z_REMOTE_VIDEO: i32 = -2;
-    const Z_PIP_PREVIEW: i32 = -1;
+    /// Child z-order for media surfaces relative to the app's own UI buffer.
+    /// `behind-ui` (negative, the SurfaceView model — the UI punches a hole)
+    /// or `above-ui` (positive); the PiP always sits above the remote video.
+    fn z_remote(layer: super::ZLayer) -> i32 {
+        match layer { super::ZLayer::BehindUi => -2, super::ZLayer::AboveUi => 1 }
+    }
+    fn z_preview(layer: super::ZLayer) -> i32 {
+        match layer { super::ZLayer::BehindUi => -1, super::ZLayer::AboveUi => 2 }
+    }
 
     /// `sf_media_*` — the libgui shim's media-surface API (task 93 Phase 4):
     /// SurfaceControl subtrees whose producer `ANativeWindow*` feeds the
@@ -653,7 +666,7 @@ mod android {
             // supported camera config — the on-screen rect scales it).
             let mut preview_win: *mut ANativeWindow = ptr::null_mut();
             if let Some(rect) = config.preview.filter(|r| r.visible()) {
-                match media::create(config.width as i32, config.height as i32, Z_PIP_PREVIEW) {
+                match media::create(config.width as i32, config.height as i32, z_preview(config.preview_layer)) {
                     Some((slot, win)) => {
                         self.preview_slot = Some(slot);
                         preview_win = win;
@@ -931,15 +944,18 @@ mod android {
                 let (slot, win) = media::create(
                     config.width.max(1) as i32,
                     config.height.max(1) as i32,
-                    Z_REMOTE_VIDEO,
+                    z_remote(config.layer),
                 )
                 .ok_or(VideoError::SurfaceUnavailable)?;
                 dec.slot = Some(slot);
                 surface = win;
                 media::set_rect(slot, rect);
                 media::set_visible(slot, true);
-                // Let the guest's transparent hole blend (no-op headless).
-                dec.opaque_cleared = media::set_opaque(false);
+                // behind-ui only: let the guest's transparent hole blend
+                // (no-op headless / above-ui).
+                if config.layer == super::ZLayer::BehindUi {
+                    dec.opaque_cleared = media::set_opaque(false);
+                }
             }
             unsafe {
                 let dmime = CString::new(config.codec.mime()).unwrap();

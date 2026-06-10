@@ -32,6 +32,13 @@ fn codec2b(c: wit::types::Codec) -> Result<video::Codec, wit::types::VideoError>
     }
 }
 
+fn layer2b(l: wit::types::ZLayer) -> video::ZLayer {
+    match l {
+        wit::types::ZLayer::BehindUi => video::ZLayer::BehindUi,
+        wit::types::ZLayer::AboveUi => video::ZLayer::AboveUi,
+    }
+}
+
 fn rect2b(r: wit::types::VideoRect) -> video::VideoRect {
     video::VideoRect {
         x: r.x as i32,
@@ -71,6 +78,7 @@ impl wit::encoder::HostVideoEncoder for HostState {
             framerate: config.framerate,
             facing_front: matches!(config.facing, wit::types::CameraFacing::Front),
             preview: config.preview.map(rect2b),
+            preview_layer: layer2b(config.preview_layer),
         };
         if !config.source_camera {
             // Guest-supplied YUV (screen-share) is a future mode.
@@ -138,6 +146,7 @@ impl wit::decoder::HostVideoDecoder for HostState {
             // An empty rect = decode-to-buffer (the backend filters it).
             rect: Some(rect2b(config.rect)),
             rotation: config.rotation,
+            layer: layer2b(config.layer),
         };
         let dec = video::VideoDecoder::open(&cfg).map_err(err2w)?;
         self.table
