@@ -33,6 +33,7 @@ mod alarm_host_impl;
 mod task_manager_host_impl;
 mod connectivity_wifi_impl;
 pub mod crypto;
+mod crypto_host_impl;
 mod events_host_impl;
 mod notify_host_impl;
 mod keyguard_host_impl;
@@ -145,6 +146,26 @@ mod wifi_host_bindings {
     wasmtime::component::bindgen!({
         path: "../../wit/connectivity.wit",
         world: "wifi-host",
+    });
+}
+
+/// Task 93 Phase A — host-import side of `wandr:crypto` (the project's first
+/// resource-based WIT). The host implements the symmetric + asymmetric crypto
+/// interfaces (RustCrypto, HW AES/GHASH via `crypto.rs`); the keyed contexts
+/// (`aead-key`/`mac-key`/`cipher-key`/`hasher`) are host resources mapped to the
+/// backing structs in `crypto_host_impl` and stored in `HostState.table`. Linked
+/// onto every guest (crypto primitives carry no privilege — the guest supplies its
+/// own keys). See `crypto_host_impl.rs`.
+mod crypto_host_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/crypto.wit",
+        world: "crypto-host",
+        with: {
+            "wandr:crypto/hash.hasher": crate::crypto_host_impl::HasherState,
+            "wandr:crypto/mac.mac-key": crate::crypto_host_impl::MacKeyState,
+            "wandr:crypto/aead.aead-key": crate::crypto_host_impl::AeadKeyState,
+            "wandr:crypto/cipher.cipher-key": crate::crypto_host_impl::CipherKeyState,
+        },
     });
 }
 

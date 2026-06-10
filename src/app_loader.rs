@@ -277,6 +277,8 @@ impl LoadedApp {
         }
         crate::events_host_bindings::EventsHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("EventsHost::add_to_linker: {e:#}"))?; // task 90 event bus
+        crate::crypto_host_bindings::CryptoHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+            .map_err(|e| anyhow!("CryptoHost::add_to_linker: {e:#}"))?; // task 93 Phase A wandr:crypto
         crate::notify_host_bindings::NotifyHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("NotifyHost::add_to_linker: {e:#}"))?; // Signal bg-receipt M3
         crate::keyguard_host_bindings::KeyguardHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
@@ -378,6 +380,8 @@ impl LoadedApp {
         }
         crate::events_host_bindings::EventsHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("EventsHost::add_to_linker: {e:#}"))?; // task 90 event bus
+        crate::crypto_host_bindings::CryptoHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+            .map_err(|e| anyhow!("CryptoHost::add_to_linker: {e:#}"))?; // task 93 Phase A wandr:crypto
         crate::notify_host_bindings::NotifyHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("NotifyHost::add_to_linker: {e:#}"))?; // Signal bg-receipt M3
         crate::keyguard_host_bindings::KeyguardHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
