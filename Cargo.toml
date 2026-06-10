@@ -55,6 +55,25 @@ bytes              = "1"
 # App installer (task 35): cache-key hashing + package.toml / cache-key.toml
 # I/O. `toml` used without serde derive (toml::Value table API).
 sha2               = "0.10"
+# Task 93 Phase A — wandr:crypto host backend (RustCrypto symmetric core). All on the
+# 0.10 generation (digest 0.10 / cipher 0.4 / aead 0.5) already in the tree. On aarch64
+# the `aes`/`sha2` crates use the ARMv8 Crypto Extensions when built with `+aes,+sha2`
+# (set in .cargo/config.toml) — the in-process HW acceleration (no binder). See crypto.rs.
+sha1               = "0.10"
+hmac               = "0.12"
+aes                = "0.8"
+aes-gcm            = "0.10"
+ccm                = "0.5"
+ctr                = "0.9"
+cbc                = { version = "0.1", features = ["alloc"] }
+cmac               = "0.7"
+chacha20poly1305   = "0.10"
+poly1305           = "0.8"
+hkdf               = "0.12"
+pbkdf2             = { version = "0.12", default-features = false, features = ["hmac"] }
+digest             = "0.10"
+# Runtime HWCAP detection (aes/sha2/sha1) for the caps `hardware-accelerated` flag.
+cpufeatures        = "0.2"
 toml               = { version = "0.8", default-features = false, features = ["parse", "display"] }
 
 # skia-safe: GL backend only (no Vulkan needed — EGL gives us GLES)

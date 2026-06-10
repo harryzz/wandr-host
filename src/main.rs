@@ -119,6 +119,14 @@ fn main() {
         return;
     }
 
+    // Task 93 Phase A — `wandr:crypto` symmetric core: correctness vectors + per-
+    // algorithm throughput (HW AES/SHA via the ARMv8 extensions). Pure CPU, no
+    // device services needed → runs anywhere. `wandr-host --probe-crypto`.
+    if args.iter().any(|a| a == "--probe-crypto") {
+        wasm_android_host::crypto::probe();
+        return;
+    }
+
     // Task-76 P8 volume probe: read media volume range + speaker/earpiece index,
     // set speaker to max, read back, restore. Proves the write path.
     if args.iter().any(|a| a == "--probe-audio-volume") {

@@ -32,6 +32,7 @@ mod keyboard_host_impl;
 mod alarm_host_impl;
 mod task_manager_host_impl;
 mod connectivity_wifi_impl;
+pub mod crypto;
 mod events_host_impl;
 mod notify_host_impl;
 mod keyguard_host_impl;
