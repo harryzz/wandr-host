@@ -1232,6 +1232,11 @@ fn run_cwasm_loop(
                     inset_top, inset_bottom, keyboard_px, orient,
                 } => {
                     use crate::ime_inbound::{GEOM_INSET_KEEP, GEOM_ORIENT_KEEP};
+                    // Task 93 Phase 5 — the in-call video CVO follows the live
+                    // device rotation; the arbiter's orient push is its source.
+                    if orient != GEOM_ORIENT_KEEP {
+                        crate::video::set_device_orientation_code(orient);
+                    }
                     // True-dp: the inset fields ARE the arbiter-authored chrome
                     // heights (sb, tb). Cache them for `overlay_rect` (every
                     // overlay's anchoring math) on ALL surfaces…

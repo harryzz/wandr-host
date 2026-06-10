@@ -102,6 +102,27 @@ pub struct EncodedFrame {
     pub keyframe: bool,
 }
 
+/// Current device rotation in degrees CW from natural portrait — written by the
+/// standalone loop when the arbiter pushes a Geometry orient (the dihedral HAL
+/// codes 0/4/3/7 → 0/90/180/270°), read live by `VideoEncoder::display_rotation`
+/// so the outgoing CVO follows mid-call device rotation. If the 90↔270 sense
+/// ever proves inverted on a device, THIS mapping is the one knob to flip.
+static DEVICE_ROTATION_DEG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_device_orientation_code(code: u32) {
+    let deg = match code {
+        4 => 90,
+        3 => 180,
+        7 => 270,
+        _ => 0,
+    };
+    DEVICE_ROTATION_DEG.store(deg, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn device_rotation_deg() -> u32 {
+    DEVICE_ROTATION_DEG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(target_os = "android")]
 pub use android::{ensure_binder_threadpool, VideoDecoder, VideoEncoder};
 
@@ -553,10 +574,10 @@ mod android {
         preview_slot: Option<i32>,
         preview_out: *mut ACaptureSessionOutput,
         preview_target: *mut ACameraOutputTarget,
-        /// Degrees CW a receiver must rotate our frames for upright display
-        /// (facing-adjusted sensor orientation — feeds the CVO extension; the
-        /// PiP preview applies the same value as an SF buffer transform).
-        display_rotation: u32,
+        /// The camera's raw sensor orientation (degrees) + facing — inputs to
+        /// the live wire/display rotation formulas.
+        sensor_orientation: u32,
+        facing_front: bool,
     }
 
     // The NDK camera and AMediaCodec handles are documented thread-safe; all
@@ -592,7 +613,8 @@ mod android {
                 preview_slot: None,
                 preview_out: ptr::null_mut(),
                 preview_target: ptr::null_mut(),
-                display_rotation: 0,
+                sensor_orientation: 0,
+                facing_front: config.facing_front,
             };
             // From here every early return goes through Drop, which tolerates
             // the partially-filled struct — the ordered-teardown guarantee.
@@ -606,8 +628,8 @@ mod android {
                 log::warn!("video: ACameraManager_create -> null");
                 return Err(VideoError::CodecInitFailed);
             }
-            let (cam_id, display_rotation) = pick_camera(self.mgr, config.facing_front)?;
-            self.display_rotation = display_rotation;
+            let (cam_id, sensor_orientation) = pick_camera(self.mgr, config.facing_front)?;
+            self.sensor_orientation = sensor_orientation;
             log::info!("video: opening camera id={} (front={}) …", cam_id.to_string_lossy(), config.facing_front);
 
             let dev_cbs = ACameraDeviceStateCallbacks {
@@ -671,9 +693,17 @@ mod android {
                         self.preview_slot = Some(slot);
                         preview_win = win;
                         // Camera buffers arrive sensor-rotated; SF applies the
-                        // display rotation at composition (before set_rect —
-                        // 90/270 swap the slot's logical dims).
-                        media::set_transform(slot, self.display_rotation);
+                        // LOCAL display rotation at composition (before set_rect
+                        // — 90/270 swap the slot's logical dims). Classic
+                        // Camera2 preview formula at the rotation of open
+                        // (front mirrors, so the sense inverts vs the wire).
+                        let dev = super::device_rotation_deg();
+                        let local = if self.facing_front {
+                            (360 - (self.sensor_orientation + dev) % 360) % 360
+                        } else {
+                            (self.sensor_orientation + 360 - dev) % 360
+                        };
+                        media::set_transform(slot, local);
                         media::set_rect(slot, rect);
                         media::set_visible(slot, true);
                         ACaptureSessionOutput_create(preview_win, &mut self.preview_out);
@@ -780,10 +810,18 @@ mod android {
             }
         }
 
-        /// Degrees CW a receiver must rotate our frames for upright display
-        /// (the outgoing CVO value).
+        /// Degrees CW a RECEIVER must rotate our frames for upright display —
+        /// the outgoing CVO value, computed LIVE (libwebrtc Camera2Session
+        /// `getFrameOrientation`): front = (sensor + deviceRotation) % 360;
+        /// back = (sensor − deviceRotation + 360) % 360. Poll per tick — it
+        /// changes when the user rotates the device mid-call.
         pub fn display_rotation(&self) -> u32 {
-            self.display_rotation
+            let dev = super::device_rotation_deg();
+            if self.facing_front {
+                (self.sensor_orientation + dev) % 360
+            } else {
+                (self.sensor_orientation + 360 - dev) % 360
+            }
         }
 
         /// Move/resize the PiP self-view (no-op without a preview surface).
@@ -838,11 +876,9 @@ mod android {
 
     /// Pick the camera whose ACAMERA_LENS_FACING matches; fall back to the
     /// first enumerated id (the probe's behavior) if no match / query fails.
-    /// Also returns the **display rotation** for that camera: the degrees CW a
-    /// receiver/preview must rotate the sensor's buffers for upright display —
-    /// the classic Camera2 formula at device-rotation 0: back = sensor
-    /// orientation; front = (360 − sensor orientation) % 360 (mirror-adjusted;
-    /// the self-view is not horizontally flipped in v1).
+    /// Also returns the camera's RAW `ACAMERA_SENSOR_ORIENTATION` (degrees) —
+    /// the wire/display rotation formulas (which differ per facing AND fold in
+    /// the live device rotation) are applied by the encoder, not here.
     unsafe fn pick_camera(mgr: *mut ACameraManager, front: bool) -> Result<(CString, u32), VideoError> {
         let mut id_list: *mut ACameraIdList = ptr::null_mut();
         if ACameraManager_getCameraIdList(mgr, &mut id_list) != ACAMERA_OK || id_list.is_null() {
@@ -879,16 +915,11 @@ mod android {
                 let facing = entry_u8(meta, ACAMERA_LENS_FACING);
                 let sensor = entry_i32(meta, ACAMERA_SENSOR_ORIENTATION).unwrap_or(0) as u32 % 360;
                 ACameraMetadata_free(meta);
-                let display_rot = if facing == Some(ACAMERA_LENS_FACING_FRONT) {
-                    (360 - sensor) % 360
-                } else {
-                    sensor
-                };
                 if i == 0 {
-                    first_orientation = display_rot;
+                    first_orientation = sensor;
                 }
                 if facing == Some(want) {
-                    chosen = Some((CStr::from_ptr(id_ptr).to_owned(), display_rot));
+                    chosen = Some((CStr::from_ptr(id_ptr).to_owned(), sensor));
                     break;
                 }
             }
@@ -900,7 +931,7 @@ mod android {
             (first, first_orientation)
         });
         ACameraManager_deleteCameraIdList(id_list);
-        log::info!("video: camera id={} display-rotation={}°", id.to_string_lossy(), rot);
+        log::info!("video: camera id={} sensor-orientation={}°", id.to_string_lossy(), rot);
         Ok((id, rot))
     }
 
