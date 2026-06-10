@@ -508,14 +508,10 @@ mod android {
         /// producer buffer scales ONCE into the rect (no matrix games — the
         /// set_rect+set_transform pair double-scaled when dims swapped).
         pub fn set_geometry(slot: i32, r: VideoRect, degrees: u32) {
-            let transform: u32 = match degrees % 360 {
-                90 => 4,  // NATIVE_WINDOW_TRANSFORM_ROT_90
-                180 => 3, // ROT_180
-                270 => 7, // ROT_270
-                _ => 0,
-            };
+            // Degrees CW, applied via the container matrix in the shim (the
+            // one mechanism the codec producer can't override per-buffer).
             if let Some(f) = fns() {
-                unsafe { (f.set_geometry)(slot, r.x, r.y, r.w, r.h, transform) };
+                unsafe { (f.set_geometry)(slot, r.x, r.y, r.w, r.h, degrees % 360) };
             }
         }
 

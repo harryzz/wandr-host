@@ -1223,36 +1223,60 @@ int32_t sf_media_set_transform(int32_t slot, uint32_t transform) {
 }
 
 // One-shot geometry (task 93 Phase 5 — supersedes the set_rect+set_transform
-// pair for video): place the media surface at panel rect (x,y,w,h) with buffer
-// `transform` (HAL bitmask), in ONE transaction. The BBQ destination + child
-// crop become exactly (w,h) and the container matrix is identity, so the
-// (transformed) producer buffer is scaled ONCE into the final on-screen rect —
-// composing the old pair double-scaled when the transform swapped dims.
-// Producer buffer size is independent (codec/camera set their own dims).
+// pair for video): place the media surface at panel rect (x,y,w,h), with the
+// content rotated `rot_degrees` CLOCKWISE (0/90/180/270), in one transaction.
+//
+// Rotation is applied via the CONTAINER's transform matrix — the one mechanism
+// no producer can override: MediaCodec stamps its own (identity) transform on
+// every buffer it queues, which silently overwrites both a layer setTransform
+// and a producer-window buffers-transform (live-call bug: peer video never
+// rotated). The buffer scales into a pre-rotation crop box (dims swapped for
+// 90/270), and the matrix+position rotate that box into the final rect.
 int32_t sf_media_set_geometry(int32_t slot, int32_t x, int32_t y, int32_t w,
-                              int32_t h, uint32_t transform) {
+                              int32_t h, uint32_t rot_degrees) {
     if (slot < 0 || slot >= 4 || g_media[slot].container == nullptr) return -1;
     if (w <= 0 || h <= 0) return -1;
-    // The transform must be set on the PRODUCER window, not the layer: the
-    // BLASTBufferQueue re-applies each queued buffer's own transform, which
-    // OVERWRITES a layer-level setTransform on every frame (live-call bug:
-    // peer video never rotated). Producer-side, every subsequently queued
-    // buffer carries it — the same mechanism MediaCodec's rotation-degrees
-    // uses internally.
-    native_window_set_buffers_transform(g_media[slot].surface.get(),
-                                        static_cast<int>(transform));
+    const uint32_t rot = rot_degrees % 360;
+    const bool swap = (rot == 90 || rot == 270);
+    const int32_t bw = swap ? h : w;  // pre-rotation box (crop/BBQ dest)
+    const int32_t bh = swap ? w : h;
+    // Box-corner mapping for a CW rotation of the (bw × bh) box into (w × h)
+    // at (x, y): setMatrix(dsdx, dtdx, dtdy, dsdy) with x' = dsdx·u + dtdy·v,
+    // y' = dtdx·u + dsdy·v, plus the translation that brings the rotated box
+    // back into the rect.
+    float dsdx = 1.f, dtdx = 0.f, dtdy = 0.f, dsdy = 1.f;
+    float px = static_cast<float>(x), py = static_cast<float>(y);
+    switch (rot) {
+        case 90:  // (u,v) → (bh − v, u)
+            dsdx = 0.f; dtdx = 1.f; dtdy = -1.f; dsdy = 0.f;
+            px = static_cast<float>(x + w);
+            break;
+        case 180: // (u,v) → (bw − u, bh − v)
+            dsdx = -1.f; dtdx = 0.f; dtdy = 0.f; dsdy = -1.f;
+            px = static_cast<float>(x + w);
+            py = static_cast<float>(y + h);
+            break;
+        case 270: // (u,v) → (v, bw − u)
+            dsdx = 0.f; dtdx = -1.f; dtdy = 1.f; dsdy = 0.f;
+            py = static_cast<float>(y + h);
+            break;
+        default:
+            break;
+    }
     {
         SurfaceComposerClient::Transaction t;
-        t.setCrop(g_media[slot].child, Rect(0, 0, w, h));
-        t.setPosition(g_media[slot].container, static_cast<float>(x), static_cast<float>(y));
-        t.setMatrix(g_media[slot].container, 1.0f, 0.0f, 0.0f, 1.0f);
+        t.setCrop(g_media[slot].child, Rect(0, 0, bw, bh));
+        t.setMatrix(g_media[slot].container, dsdx, dtdx, dtdy, dsdy);
+        t.setPosition(g_media[slot].container, px, py);
         t.apply(/*synchronous=*/false);
     }
     g_media[slot].bbq->update(g_media[slot].child,
-                              static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+                              static_cast<uint32_t>(bw), static_cast<uint32_t>(bh),
                               PIXEL_FORMAT_RGBA_8888);
-    g_media[slot].buf_w = w;
-    g_media[slot].buf_h = h;
+    g_media[slot].buf_w = bw;
+    g_media[slot].buf_h = bh;
+    LOGI("[media] slot %d geometry rect=(%d,%d %dx%d) rot=%u box=%dx%d m=[%.0f %.0f %.0f %.0f] p=(%.0f,%.0f)",
+         slot, x, y, w, h, rot, bw, bh, dsdx, dtdx, dtdy, dsdy, px, py);
     return 0;
 }
 
