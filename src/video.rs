@@ -972,12 +972,12 @@ mod android {
             // the caller asked for on-screen video.
             let mut surface: *mut ANativeWindow = ptr::null_mut();
             if let Some(rect) = config.rect.filter(|r| r.visible()) {
-                let (slot, win) = media::create(
-                    config.width.max(1) as i32,
-                    config.height.max(1) as i32,
-                    z_remote(config.layer),
-                )
-                .ok_or(VideoError::SurfaceUnavailable)?;
+                // Destination buffer = the DISPLAY rect (not the coded size):
+                // the decoder's output buffers scale ONCE into it. Sizing it to
+                // the coded hint would crush a larger stream down to the hint
+                // and then stretch it to the rect — visible quality loss.
+                let (slot, win) = media::create(rect.w, rect.h, z_remote(config.layer))
+                    .ok_or(VideoError::SurfaceUnavailable)?;
                 dec.slot = Some(slot);
                 surface = win;
                 media::set_rect(slot, rect);
