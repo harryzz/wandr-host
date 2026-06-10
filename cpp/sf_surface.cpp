@@ -1233,9 +1233,16 @@ int32_t sf_media_set_geometry(int32_t slot, int32_t x, int32_t y, int32_t w,
                               int32_t h, uint32_t transform) {
     if (slot < 0 || slot >= 4 || g_media[slot].container == nullptr) return -1;
     if (w <= 0 || h <= 0) return -1;
+    // The transform must be set on the PRODUCER window, not the layer: the
+    // BLASTBufferQueue re-applies each queued buffer's own transform, which
+    // OVERWRITES a layer-level setTransform on every frame (live-call bug:
+    // peer video never rotated). Producer-side, every subsequently queued
+    // buffer carries it — the same mechanism MediaCodec's rotation-degrees
+    // uses internally.
+    native_window_set_buffers_transform(g_media[slot].surface.get(),
+                                        static_cast<int>(transform));
     {
         SurfaceComposerClient::Transaction t;
-        t.setTransform(g_media[slot].child, transform);
         t.setCrop(g_media[slot].child, Rect(0, 0, w, h));
         t.setPosition(g_media[slot].container, static_cast<float>(x), static_cast<float>(y));
         t.setMatrix(g_media[slot].container, 1.0f, 0.0f, 0.0f, 1.0f);
