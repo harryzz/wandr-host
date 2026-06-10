@@ -1809,7 +1809,20 @@ pub fn create_track_routed(cfg: TrackConfig, route: crate::audio_routing::Route)
 
 pub fn write_pcm_f32(track: u32, samples: &[f32]) -> u32 {
     #[cfg(target_os = "android")]
-    { if use_audioclient() { return audioclient_path::write_pcm_f32(track, samples); } return binder_path::write_pcm_f32(track, samples); }
+    {
+        // Output mute (controls set-mute): substitute SILENCE of the same
+        // length so playback timing/backpressure are preserved. Gated HERE so
+        // every backend honors it — the AudioFlinger-direct path (the call
+        // output) has no internal gate (only the AAudio path did; live-call
+        // bug: speaker-mute silenced nothing).
+        if app_output_muted() {
+            let silence = vec![0f32; samples.len()];
+            if use_audioclient() { return audioclient_path::write_pcm_f32(track, &silence); }
+            return binder_path::write_pcm_f32(track, &silence);
+        }
+        if use_audioclient() { return audioclient_path::write_pcm_f32(track, samples); }
+        return binder_path::write_pcm_f32(track, samples);
+    }
     #[cfg(not(target_os = "android"))]
     { let _ = (track, samples); 0 }
 }
