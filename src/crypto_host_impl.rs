@@ -221,6 +221,25 @@ impl wit::aead::HostAeadKey for HostState {
     }
 }
 
+// Stateless one-shot AEAD (functions, no resource) — the wac-composable hot path
+// used by the Signal call engine for SRTP. Same backend as the `aead` resource.
+impl wit::aead_oneshot::Host for HostState {
+    fn seal(&mut self, algo: wit::types::AeadAlgo, key: Vec<u8>, nonce: Vec<u8>, aad: Vec<u8>, plaintext: Vec<u8>) -> Result<Vec<u8>, wit::types::CryptoError> {
+        let a = aead2c(algo);
+        if key.len() != aead_key_len(a) {
+            return Err(wit::types::CryptoError::InvalidKeyLength);
+        }
+        crypto::aead_seal(a, &key, &nonce, &aad, &plaintext).map_err(err2w)
+    }
+    fn open(&mut self, algo: wit::types::AeadAlgo, key: Vec<u8>, nonce: Vec<u8>, aad: Vec<u8>, ciphertext: Vec<u8>) -> Result<Vec<u8>, wit::types::CryptoError> {
+        let a = aead2c(algo);
+        if key.len() != aead_key_len(a) {
+            return Err(wit::types::CryptoError::InvalidKeyLength);
+        }
+        crypto::aead_open(a, &key, &nonce, &aad, &ciphertext).map_err(err2w)
+    }
+}
+
 impl wit::cipher::Host for HostState {}
 impl wit::cipher::HostCipherKey for HostState {
     fn create(&mut self, algo: wit::types::CipherAlgo, key: Vec<u8>) -> Result<Resource<CipherKeyState>, wit::types::CryptoError> {
