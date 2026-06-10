@@ -178,6 +178,12 @@ impl wit::decoder::HostVideoDecoder for HostState {
         }
     }
 
+    fn set_rotation(&mut self, self_: Resource<DecoderState>, degrees: u32) {
+        if let Ok(st) = self.table.get_mut(&self_) {
+            st.0.set_rotation(degrees);
+        }
+    }
+
     fn ready(&mut self, self_: Resource<DecoderState>) -> bool {
         self.table
             .get(&self_)

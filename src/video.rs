@@ -171,6 +171,7 @@ mod desktop {
         }
         pub fn set_rect(&mut self, _rect: super::VideoRect) {}
         pub fn set_visible(&mut self, _visible: bool) {}
+        pub fn set_rotation(&mut self, _degrees: u32) {}
     }
 }
 
@@ -419,6 +420,7 @@ mod android {
         use std::sync::OnceLock;
 
         struct MediaFns {
+            panel_dims: unsafe extern "C" fn(*mut i32, *mut i32),
             create: unsafe extern "C" fn(i32, i32, i32, *mut *mut std::ffi::c_void) -> i32,
             set_rect: unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32,
             set_visible: unsafe extern "C" fn(i32, i32) -> i32,
@@ -448,7 +450,8 @@ mod android {
                     }
                     p
                 };
-                let (c, r, v, t, d, o) = (
+                let (pd, c, r, v, t, d, o) = (
+                    sym("sf_panel_dims"),
                     sym("sf_media_create"),
                     sym("sf_media_set_rect"),
                     sym("sf_media_set_visible"),
@@ -456,10 +459,11 @@ mod android {
                     sym("sf_media_destroy"),
                     sym("sf_set_opaque"),
                 );
-                if c.is_null() || r.is_null() || v.is_null() || t.is_null() || d.is_null() || o.is_null() {
+                if pd.is_null() || c.is_null() || r.is_null() || v.is_null() || t.is_null() || d.is_null() || o.is_null() {
                     return None;
                 }
                 Some(MediaFns {
+                    panel_dims: std::mem::transmute(pd),
                     create: std::mem::transmute(c),
                     set_rect: std::mem::transmute(r),
                     set_visible: std::mem::transmute(v),
@@ -469,6 +473,18 @@ mod android {
                 })
             })
             .as_ref()
+        }
+
+        /// The panel's native (portrait) dimensions in pixels.
+        pub fn panel_dims() -> (i32, i32) {
+            match fns() {
+                Some(f) => {
+                    let (mut w, mut h) = (0i32, 0i32);
+                    unsafe { (f.panel_dims)(&mut w, &mut h) };
+                    (w, h)
+                }
+                None => (0, 0),
+            }
         }
 
         /// Create a media surface for a `buf_w`×`buf_h` producer at child z
@@ -529,6 +545,25 @@ mod android {
         }
     }
 
+    /// Map a guest-LOGICAL rect (the guest's rotated coordinate space) into the
+    /// portrait parent-surface space, per the current device rotation. The app's
+    /// UI content is pre-rotated by the renderer; media child surfaces are not —
+    /// so their rects (and buffer transforms) must compensate the same way.
+    /// If rotation handling ever looks mirrored on some device, this mapping +
+    /// the `(content + dev)` transform composition are the knobs.
+    fn map_rect_to_panel(r: super::VideoRect, dev: u32) -> super::VideoRect {
+        let (pw, ph) = media::panel_dims();
+        if pw <= 0 || ph <= 0 {
+            return r;
+        }
+        match dev % 360 {
+            90 => super::VideoRect { x: pw - (r.y + r.h), y: r.x, w: r.h, h: r.w },
+            180 => super::VideoRect { x: pw - (r.x + r.w), y: ph - (r.y + r.h), w: r.w, h: r.h },
+            270 => super::VideoRect { x: r.y, y: ph - (r.x + r.w), w: r.h, h: r.w },
+            _ => r,
+        }
+    }
+
     /// Per-device camera error flags, written by the NDK state callbacks.
     /// Boxed so the context pointer stays stable for the device's lifetime.
     struct CamCbCtx {
@@ -578,6 +613,9 @@ mod android {
         /// the live wire/display rotation formulas.
         sensor_orientation: u32,
         facing_front: bool,
+        /// The guest's LOGICAL PiP rect (re-applied on rotation via
+        /// set_preview_rect; the UI re-pushes layout when it rotates).
+        preview_guest_rect: super::VideoRect,
     }
 
     // The NDK camera and AMediaCodec handles are documented thread-safe; all
@@ -615,6 +653,7 @@ mod android {
                 preview_target: ptr::null_mut(),
                 sensor_orientation: 0,
                 facing_front: config.facing_front,
+                preview_guest_rect: super::VideoRect { x: 0, y: 0, w: 0, h: 0 },
             };
             // From here every early return goes through Drop, which tolerates
             // the partially-filled struct — the ordered-teardown guarantee.
@@ -692,19 +731,8 @@ mod android {
                     Some((slot, win)) => {
                         self.preview_slot = Some(slot);
                         preview_win = win;
-                        // Camera buffers arrive sensor-rotated; SF applies the
-                        // LOCAL display rotation at composition (before set_rect
-                        // — 90/270 swap the slot's logical dims). Classic
-                        // Camera2 preview formula at the rotation of open
-                        // (front mirrors, so the sense inverts vs the wire).
-                        let dev = super::device_rotation_deg();
-                        let local = if self.facing_front {
-                            (360 - (self.sensor_orientation + dev) % 360) % 360
-                        } else {
-                            (self.sensor_orientation + 360 - dev) % 360
-                        };
-                        media::set_transform(slot, local);
-                        media::set_rect(slot, rect);
+                        self.preview_guest_rect = rect;
+                        self.apply_preview_geometry();
                         media::set_visible(slot, true);
                         ACaptureSessionOutput_create(preview_win, &mut self.preview_out);
                         ACaptureSessionOutputContainer_add(self.container, self.preview_out);
@@ -825,10 +853,26 @@ mod android {
         }
 
         /// Move/resize the PiP self-view (no-op without a preview surface).
+        /// `rect` is in the guest's LOGICAL (rotated) coordinates.
         pub fn set_preview_rect(&mut self, rect: super::VideoRect) {
-            if let Some(slot) = self.preview_slot {
-                media::set_rect(slot, rect);
-            }
+            self.preview_guest_rect = rect;
+            self.apply_preview_geometry();
+        }
+
+        /// Camera buffers are fixed to the device, so the panel-space upright
+        /// rotation is device-independent (front: (360−sensor)%360, mirror
+        /// sense; back: sensor); the viewer's device rotation adds on top.
+        /// Transform BEFORE rect (90/270 swap the slot's logical dims).
+        fn apply_preview_geometry(&mut self) {
+            let Some(slot) = self.preview_slot else { return };
+            let dev = super::device_rotation_deg();
+            let panel_upright = if self.facing_front {
+                (360 - self.sensor_orientation) % 360
+            } else {
+                self.sensor_orientation
+            };
+            media::set_transform(slot, (panel_upright + dev) % 360);
+            media::set_rect(slot, map_rect_to_panel(self.preview_guest_rect, dev));
         }
 
         /// Show/hide the PiP self-view (no-op without a preview surface).
@@ -950,6 +994,12 @@ mod android {
         /// True when this decoder cleared the app layer's opaque flag (so it
         /// must restore it on teardown).
         opaque_cleared: bool,
+        /// The peer's CVO rotation (live-updatable) + the guest's LOGICAL rect.
+        /// All rotation is applied at the SF layer: buffer transform =
+        /// (cvo + device-rotation), rect mapped logical→portrait — both
+        /// recomputed by `apply_geometry` (set-rect / set-rotation).
+        cvo: u32,
+        guest_rect: super::VideoRect,
     }
 
     // Same justification as VideoEncoder: AMediaCodec is thread-safe and
@@ -966,6 +1016,8 @@ mod android {
                 decoded: 0,
                 slot: None,
                 opaque_cleared: false,
+                cvo: config.rotation % 360,
+                guest_rect: super::VideoRect { x: 0, y: 0, w: 0, h: 0 },
             };
             // Decode-to-surface: allocate the compositing surface first (its
             // window is the codec's render target). Failure here is fatal —
@@ -980,7 +1032,8 @@ mod android {
                     .ok_or(VideoError::SurfaceUnavailable)?;
                 dec.slot = Some(slot);
                 surface = win;
-                media::set_rect(slot, rect);
+                dec.guest_rect = rect;
+                dec.apply_geometry();
                 media::set_visible(slot, true);
                 // behind-ui only: let the guest's transparent hole blend
                 // (no-op headless / above-ui).
@@ -999,11 +1052,6 @@ mod android {
                 fmt_set_str(dec.fmt, "mime", config.codec.mime());
                 fmt_set_i32(dec.fmt, "width", config.width.max(1) as i32);
                 fmt_set_i32(dec.fmt, "height", config.height.max(1) as i32);
-                // Surface mode honors "rotation-degrees": the framework sets
-                // the matching transform when rendering each output buffer.
-                if !surface.is_null() && config.rotation % 360 != 0 {
-                    fmt_set_i32(dec.fmt, "rotation-degrees", (config.rotation % 360) as i32);
-                }
                 let dcfg = AMediaCodec_configure(dec.codec, dec.fmt, surface, ptr::null_mut(), 0);
                 if dcfg != AMEDIA_OK {
                     log::warn!("video: decoder configure status={dcfg}");
@@ -1053,10 +1101,27 @@ mod android {
         }
 
         /// Move/resize the video surface (no-op in decode-to-buffer mode).
+        /// `rect` is in the guest's LOGICAL (rotated) coordinates.
         pub fn set_rect(&mut self, rect: super::VideoRect) {
-            if let Some(slot) = self.slot {
-                media::set_rect(slot, rect);
-            }
+            self.guest_rect = rect;
+            self.apply_geometry();
+        }
+
+        /// Update the peer's CVO rotation live (no codec reconfigure — rotation
+        /// is applied at the SF layer).
+        pub fn set_rotation(&mut self, degrees: u32) {
+            self.cvo = degrees % 360;
+            self.apply_geometry();
+        }
+
+        /// Recompute + apply the surface transform and panel-space rect from
+        /// (cvo, guest rect, current device rotation). Transform BEFORE rect —
+        /// 90/270 swap the slot's logical dims used by set_rect's scaling.
+        fn apply_geometry(&mut self) {
+            let Some(slot) = self.slot else { return };
+            let dev = super::device_rotation_deg();
+            media::set_transform(slot, (self.cvo + dev) % 360);
+            media::set_rect(slot, map_rect_to_panel(self.guest_rect, dev));
         }
 
         /// Show/hide the video surface (no-op in decode-to-buffer mode).
