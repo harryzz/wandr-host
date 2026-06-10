@@ -114,6 +114,24 @@ void sf_panel_dims(int32_t* out_w, int32_t* out_h);
 // No-op for the inputflinger path.
 void sf_set_input_rect(int32_t x, int32_t y, int32_t w, int32_t h);
 
+// ── Task 93 Phase 4: media surfaces (video decode-to-surface + PiP self-view) ──
+// A media surface = a SurfaceControl subtree whose producer ANativeWindow* is
+// handed to AMediaCodec (decode-to-surface) or the camera (self-view preview).
+// Child of this process's main surface when one exists (the SurfaceView model:
+// negative `z` composites BELOW the app's buffer — pair with sf_set_opaque(0)
+// and a transparent hole in the guest UI); top-level z=MAX in a surfaceless
+// (headless diagnostic) process. `buf_w/buf_h` = producer buffer size (must be
+// a real camera/codec size); the container scales it into the on-screen rect.
+// Returns slot id >=0 (4 slots) or -1; window valid until sf_media_destroy.
+int32_t sf_media_create(int32_t buf_w, int32_t buf_h, int32_t z, void** out_window);
+// Rect in the parent surface's pixel space (panel pixels when top-level).
+int32_t sf_media_set_rect(int32_t slot, int32_t x, int32_t y, int32_t w, int32_t h);
+int32_t sf_media_set_visible(int32_t slot, int32_t visible);
+void    sf_media_destroy(int32_t slot);
+// Toggle the main layer's eLayerOpaque flag (clear while a behind-the-UI video
+// surface is up so the guest's transparent hole blends; restore after).
+int32_t sf_set_opaque(int32_t opaque);
+
 // Release the surface/control/client and input plumbing.
 void sf_destroy_surface(void);
 

@@ -17,11 +17,7 @@ use crate::HostState;
 // ── resource backing structs (mapped via bindgen `with`) ─────────────────────
 
 pub struct EncoderState(pub video::VideoEncoder);
-pub struct DecoderState {
-    pub dec: video::VideoDecoder,
-    /// Display geometry for Phase 4 compositing; stored, not yet applied.
-    pub rect: wit::types::VideoRect,
-}
+pub struct DecoderState(pub video::VideoDecoder);
 
 // ── conversions (WIT bindgen ↔ video.rs) ─────────────────────────────────────
 
@@ -33,6 +29,15 @@ fn codec2b(c: wit::types::Codec) -> Result<video::Codec, wit::types::VideoError>
         wit::types::Codec::H264 | wit::types::Codec::H265 => {
             Err(wit::types::VideoError::UnsupportedCodec)
         }
+    }
+}
+
+fn rect2b(r: wit::types::VideoRect) -> video::VideoRect {
+    video::VideoRect {
+        x: r.x as i32,
+        y: r.y as i32,
+        w: r.width as i32,
+        h: r.height as i32,
     }
 }
 
@@ -65,6 +70,7 @@ impl wit::encoder::HostVideoEncoder for HostState {
             bitrate_bps: config.bitrate_bps,
             framerate: config.framerate,
             facing_front: matches!(config.facing, wit::types::CameraFacing::Front),
+            preview: config.preview.map(rect2b),
         };
         if !config.source_camera {
             // Guest-supplied YUV (screen-share) is a future mode.
@@ -97,6 +103,18 @@ impl wit::encoder::HostVideoEncoder for HostState {
         }
     }
 
+    fn set_preview_rect(&mut self, self_: Resource<EncoderState>, rect: wit::types::VideoRect) {
+        if let Ok(st) = self.table.get_mut(&self_) {
+            st.0.set_preview_rect(rect2b(rect));
+        }
+    }
+
+    fn set_preview_visible(&mut self, self_: Resource<EncoderState>, visible: bool) {
+        if let Ok(st) = self.table.get_mut(&self_) {
+            st.0.set_preview_visible(visible);
+        }
+    }
+
     fn drop(&mut self, rep: Resource<EncoderState>) -> wasmtime::Result<()> {
         self.table.delete(rep)?; // VideoEncoder::drop = ordered camera/codec teardown
         Ok(())
@@ -113,10 +131,12 @@ impl wit::decoder::HostVideoDecoder for HostState {
             codec: codec2b(config.codec)?,
             width: config.width,
             height: config.height,
+            // An empty rect = decode-to-buffer (the backend filters it).
+            rect: Some(rect2b(config.rect)),
         };
         let dec = video::VideoDecoder::open(&cfg).map_err(err2w)?;
         self.table
-            .push(DecoderState { dec, rect: config.rect })
+            .push(DecoderState(dec))
             .map_err(|_| wit::types::VideoError::CodecInitFailed)
     }
 
@@ -129,26 +149,32 @@ impl wit::decoder::HostVideoDecoder for HostState {
             .table
             .get_mut(&self_)
             .map_err(|_| wit::types::VideoError::BadFrame)?;
-        st.dec.submit(&frame.data, frame.timestamp).map_err(err2w)
+        st.0.submit(&frame.data, frame.timestamp).map_err(err2w)
     }
 
     fn set_rect(&mut self, self_: Resource<DecoderState>, rect: wit::types::VideoRect) {
         if let Ok(st) = self.table.get_mut(&self_) {
-            st.rect = rect;
+            st.0.set_rect(rect2b(rect));
+        }
+    }
+
+    fn set_visible(&mut self, self_: Resource<DecoderState>, visible: bool) {
+        if let Ok(st) = self.table.get_mut(&self_) {
+            st.0.set_visible(visible);
         }
     }
 
     fn ready(&mut self, self_: Resource<DecoderState>) -> bool {
         self.table
             .get(&self_)
-            .map(|st| st.dec.decoded_frames() > 0)
+            .map(|st| st.0.decoded_frames() > 0)
             .unwrap_or(false)
     }
 
     fn decoded_frames(&mut self, self_: Resource<DecoderState>) -> u64 {
         self.table
             .get(&self_)
-            .map(|st| st.dec.decoded_frames())
+            .map(|st| st.0.decoded_frames())
             .unwrap_or(0)
     }
 

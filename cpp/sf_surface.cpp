@@ -1037,8 +1037,189 @@ void sf_set_input_rect(int32_t x, int32_t y, int32_t w, int32_t h) {
     LOGI("input region set to (%d,%d)-(%d,%d)", x, y, x + w, y + h);
 }
 
+// ── Task 93 Phase 4: media surfaces (video decode-to-surface + PiP self-view) ──
+//
+// Up to 4 slots. Each slot = a container SurfaceControl (carries geometry:
+// position + scale matrix — the BlastInputSurface pattern, same reason as the
+// overlay parent: geometry on a buffer-state child does not stick) + a
+// buffer-state child + a BLASTBufferQueue sized to the PRODUCER's buffers
+// (codec coded size / a real camera stream size like 640x480 — the camera
+// derives its stream config from the consumer size, so this must be a
+// supported size; the container's matrix scales it into the on-screen rect).
+//
+// Parenting — the SurfaceView model: when this process owns a main surface
+// (g_control), the container is created as its CHILD, so it moves / hides /
+// z-orders WITH the app automatically (role transitions need no new plumbing)
+// and a NEGATIVE z composites below the app's own buffer — the app UI punches
+// a transparent hole (see sf_set_opaque) and draws its controls around/over
+// the video. In a surfaceless process (headless --run-once diagnostics) the
+// container is a top-level layer at z=INT32_MAX instead.
+struct MediaSlot {
+    sp<SurfaceControl>   container;
+    sp<SurfaceControl>   child;
+    sp<BLASTBufferQueue> bbq;
+    sp<Surface>          surface;
+    int32_t              buf_w = 0;
+    int32_t              buf_h = 0;
+};
+static MediaSlot g_media[4];
+
+// Lazily bring up a SurfaceComposerClient for a process that never created a
+// main/overlay surface (the headless diagnostic path). Idempotent.
+static bool ensure_media_client() {
+    if (g_client != nullptr) return true;
+    ProcessState::self()->startThreadPool();
+    sp<SurfaceComposerClient> client = new SurfaceComposerClient();
+    if (client->initCheck() != NO_ERROR) {
+        LOGE("[media] SurfaceComposerClient initCheck failed");
+        return false;
+    }
+    std::vector<PhysicalDisplayId> ids = SurfaceComposerClient::getPhysicalDisplayIds();
+    if (ids.empty()) {
+        LOGE("[media] no physical displays");
+        return false;
+    }
+    g_display = SurfaceComposerClient::getPhysicalDisplayToken(ids[0]);
+    if (g_display != nullptr) init_panel_dims(g_display);
+    g_client = client;
+    return true;
+}
+
+// Create a media surface. `buf_w`/`buf_h` = the producer's buffer size; `z` =
+// sibling z relative to the app's own buffer (negative = behind it — remote
+// video uses -2, the PiP self-view -1; ignored for the top-level fallback).
+// Returns the slot id (>=0) and the producer ANativeWindow* via `out_window`
+// (owned by the slot — valid until sf_media_destroy). Starts HIDDEN; call
+// sf_media_set_rect + sf_media_set_visible(1).
+int32_t sf_media_create(int32_t buf_w, int32_t buf_h, int32_t z, void** out_window) {
+    if (out_window == nullptr || buf_w <= 0 || buf_h <= 0) return -1;
+    if (!ensure_media_client()) return -1;
+    int32_t slot = -1;
+    for (int32_t i = 0; i < 4; i++) {
+        if (g_media[i].container == nullptr) { slot = i; break; }
+    }
+    if (slot < 0) {
+        LOGE("[media] no free media slot");
+        return -1;
+    }
+    const bool top_level = (g_control == nullptr);
+    char cname[40];
+    snprintf(cname, sizeof(cname), "wandr-media-%d", slot);
+
+    sp<SurfaceControl> container = g_client->createSurface(
+        String8(cname), 0, 0, PIXEL_FORMAT_RGBA_8888,
+        ISurfaceComposerClient::eFXSurfaceContainer,
+        top_level ? nullptr : g_control->getHandle());
+    if (container == nullptr || !container->isValid()) {
+        LOGE("[media] createSurface(container) failed");
+        return -1;
+    }
+    char bname[48];
+    snprintf(bname, sizeof(bname), "wandr-media-buf-%d", slot);
+    sp<SurfaceControl> child = g_client->createSurface(
+        String8(bname), buf_w, buf_h, PIXEL_FORMAT_RGBA_8888,
+        ISurfaceComposerClient::eFXSurfaceBufferState,
+        container->getHandle());
+    if (child == nullptr || !child->isValid()) {
+        LOGE("[media] createSurface(buffer child) failed");
+        return -1;
+    }
+    {
+        SurfaceComposerClient::Transaction t;
+        t.setLayer(container, top_level ? 0x7fffffff : z);
+        t.hide(container);
+        t.setCrop(child, Rect(0, 0, buf_w, buf_h));
+        t.show(child);
+        t.apply(/*synchronous=*/true);
+    }
+    sp<BLASTBufferQueue> bbq = sp<BLASTBufferQueue>::make(
+        bname, child, static_cast<uint32_t>(buf_w), static_cast<uint32_t>(buf_h),
+        PIXEL_FORMAT_RGBA_8888);
+    sp<Surface> surface = bbq->getSurface(/*includeSurfaceControlHandle=*/true);
+    if (surface == nullptr) {
+        LOGE("[media] BLASTBufferQueue getSurface returned null");
+        return -1;
+    }
+    g_media[slot].container = container;
+    g_media[slot].child     = child;
+    g_media[slot].bbq       = bbq;
+    g_media[slot].surface   = surface;
+    g_media[slot].buf_w     = buf_w;
+    g_media[slot].buf_h     = buf_h;
+    // The explicit upcast matters: Surface's ANativeWindow base subobject is
+    // at a non-zero offset, and assigning straight into a void* skips the
+    // pointer adjustment — the consumer (camera2ndk) then SIGSEGVs on a
+    // garbage vtable. (The fullscreen path gets this implicitly from its
+    // ANativeWindow* return type.)
+    *out_window = static_cast<ANativeWindow*>(surface.get());
+    LOGI("[media] slot %d created buf=%dx%d z=%d %s", slot, buf_w, buf_h, z,
+         top_level ? "(top-level)" : "(child of app surface)");
+    return slot;
+}
+
+// Position + size the media surface: `x,y,w,h` in the parent's coordinate
+// space (= the app's surface pixels; panel pixels for the top-level fallback).
+// The producer buffer (buf_w × buf_h) is scaled into the rect via the
+// container's matrix.
+int32_t sf_media_set_rect(int32_t slot, int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (slot < 0 || slot >= 4 || g_media[slot].container == nullptr) return -1;
+    if (w <= 0 || h <= 0) return -1;
+    const float sx = static_cast<float>(w) / static_cast<float>(g_media[slot].buf_w);
+    const float sy = static_cast<float>(h) / static_cast<float>(g_media[slot].buf_h);
+    SurfaceComposerClient::Transaction t;
+    t.setPosition(g_media[slot].container, static_cast<float>(x), static_cast<float>(y));
+    t.setMatrix(g_media[slot].container, sx, 0.0f, 0.0f, sy);
+    t.apply(/*synchronous=*/false);
+    return 0;
+}
+
+int32_t sf_media_set_visible(int32_t slot, int32_t visible) {
+    if (slot < 0 || slot >= 4 || g_media[slot].container == nullptr) return -1;
+    SurfaceComposerClient::Transaction t;
+    if (visible) {
+        t.show(g_media[slot].container);
+    } else {
+        t.hide(g_media[slot].container);
+    }
+    t.apply(/*synchronous=*/false);
+    return 0;
+}
+
+// Release one media slot: hide synchronously (so the codec/camera producer is
+// gone from the screen before its buffers die), then drop the refs — with no
+// owner left, SurfaceFlinger removes the layers.
+void sf_media_destroy(int32_t slot) {
+    if (slot < 0 || slot >= 4 || g_media[slot].container == nullptr) return;
+    {
+        SurfaceComposerClient::Transaction t;
+        t.hide(g_media[slot].container);
+        t.apply(/*synchronous=*/true);
+    }
+    g_media[slot].surface.clear();
+    g_media[slot].bbq.clear();
+    g_media[slot].child.clear();
+    g_media[slot].container.clear();
+    g_media[slot].buf_w = g_media[slot].buf_h = 0;
+    LOGI("[media] slot %d destroyed", slot);
+}
+
+// Toggle the main layer's eLayerOpaque flag. The fullscreen surface is created
+// opaque (SF skips blending). A behind-the-UI media surface (negative-z child)
+// only shows through pixels the guest leaves transparent, which requires the
+// layer to BLEND — so the host clears the flag while a decode-to-surface video
+// is up and restores it after. Returns -1 if there is no main surface.
+int32_t sf_set_opaque(int32_t opaque) {
+    if (g_control == nullptr) return -1;
+    SurfaceComposerClient::Transaction t;
+    t.setFlags(g_control, opaque ? layer_state_t::eLayerOpaque : 0,
+               layer_state_t::eLayerOpaque);
+    t.apply(/*synchronous=*/false);
+    return 0;
+}
+
 // Release the surface, control, client and input plumbing.
 void sf_destroy_surface() {
+    for (int32_t i = 0; i < 4; i++) sf_media_destroy(i);
     g_input_consumer.reset();
     g_input_channel.reset();
     g_window_info.clear();

@@ -42,6 +42,22 @@ impl Codec {
     }
 }
 
+/// An on-screen rect in the owning surface's pixel space (see wit/video.wit
+/// `video-rect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl VideoRect {
+    fn visible(&self) -> bool {
+        self.w > 0 && self.h > 0
+    }
+}
+
 pub struct EncoderConfig {
     pub codec: Codec,
     pub width: u32,
@@ -51,12 +67,19 @@ pub struct EncoderConfig {
     /// front camera (the call self-view) vs back; falls back to the first
     /// enumerated camera if the requested facing doesn't exist.
     pub facing_front: bool,
+    /// PiP self-view rect: the camera streams to a second (preview) surface
+    /// composited at this rect. `None` = no self-view.
+    pub preview: Option<VideoRect>,
 }
 
 pub struct DecoderConfig {
     pub codec: Codec,
     pub width: u32,
     pub height: u32,
+    /// Decode-to-surface compositing rect (task 93 Phase 4). `None` (or an
+    /// empty rect) = decode-to-buffer: frames are counted + dropped — the
+    /// Phase-1 diagnostic mode.
+    pub rect: Option<VideoRect>,
 }
 
 pub struct EncodedFrame {
@@ -93,6 +116,8 @@ mod desktop {
         }
         pub fn request_keyframe(&mut self) {}
         pub fn set_bitrate(&mut self, _bps: u32) {}
+        pub fn set_preview_rect(&mut self, _rect: super::VideoRect) {}
+        pub fn set_preview_visible(&mut self, _visible: bool) {}
     }
 
     pub struct VideoDecoder;
@@ -107,6 +132,8 @@ mod desktop {
         pub fn decoded_frames(&self) -> u64 {
             0
         }
+        pub fn set_rect(&mut self, _rect: super::VideoRect) {}
+        pub fn set_visible(&mut self, _visible: bool) {}
     }
 }
 
@@ -332,6 +359,115 @@ mod android {
         OK.load(Relaxed)
     }
 
+    /// Child z-order for media surfaces relative to the app's own UI buffer
+    /// (the SurfaceView model — negative composites BELOW the buffer; the UI
+    /// punches a transparent hole). PiP self-view sits above remote video.
+    const Z_REMOTE_VIDEO: i32 = -2;
+    const Z_PIP_PREVIEW: i32 = -1;
+
+    /// `sf_media_*` — the libgui shim's media-surface API (task 93 Phase 4):
+    /// SurfaceControl subtrees whose producer `ANativeWindow*` feeds the
+    /// decoder (decode-to-surface) or the camera (self-view preview). Child of
+    /// the app's surface when one exists; top-level in a headless process.
+    pub(super) mod media {
+        use super::super::ndk::ANativeWindow;
+        use super::super::VideoRect;
+        use std::ffi::CString;
+        use std::sync::OnceLock;
+
+        struct MediaFns {
+            create: unsafe extern "C" fn(i32, i32, i32, *mut *mut std::ffi::c_void) -> i32,
+            set_rect: unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32,
+            set_visible: unsafe extern "C" fn(i32, i32) -> i32,
+            destroy: unsafe extern "C" fn(i32),
+            set_opaque: unsafe extern "C" fn(i32) -> i32,
+        }
+        // Function pointers into libsf_surface.so, which is dlopen'd once and
+        // never unloaded — safe to share across threads.
+        unsafe impl Send for MediaFns {}
+        unsafe impl Sync for MediaFns {}
+
+        fn fns() -> Option<&'static MediaFns> {
+            static FNS: OnceLock<Option<MediaFns>> = OnceLock::new();
+            FNS.get_or_init(|| unsafe {
+                let lib = CString::new("libsf_surface.so").unwrap();
+                let h = libc::dlopen(lib.as_ptr(), libc::RTLD_NOW);
+                if h.is_null() {
+                    log::warn!("video: dlopen(libsf_surface.so) failed — no media surfaces");
+                    return None;
+                }
+                let sym = |name: &str| {
+                    let c = CString::new(name).unwrap();
+                    let p = libc::dlsym(h, c.as_ptr());
+                    if p.is_null() {
+                        log::warn!("video: {name} missing from shim (rebuild libsf_surface.so)");
+                    }
+                    p
+                };
+                let (c, r, v, d, o) = (
+                    sym("sf_media_create"),
+                    sym("sf_media_set_rect"),
+                    sym("sf_media_set_visible"),
+                    sym("sf_media_destroy"),
+                    sym("sf_set_opaque"),
+                );
+                if c.is_null() || r.is_null() || v.is_null() || d.is_null() || o.is_null() {
+                    return None;
+                }
+                Some(MediaFns {
+                    create: std::mem::transmute(c),
+                    set_rect: std::mem::transmute(r),
+                    set_visible: std::mem::transmute(v),
+                    destroy: std::mem::transmute(d),
+                    set_opaque: std::mem::transmute(o),
+                })
+            })
+            .as_ref()
+        }
+
+        /// Create a media surface for a `buf_w`×`buf_h` producer at child z
+        /// `z`. Returns `(slot, producer window)`; the window stays valid
+        /// until `destroy(slot)`.
+        pub fn create(buf_w: i32, buf_h: i32, z: i32) -> Option<(i32, *mut ANativeWindow)> {
+            let f = fns()?;
+            let mut win: *mut std::ffi::c_void = std::ptr::null_mut();
+            let slot = unsafe { (f.create)(buf_w, buf_h, z, &mut win) };
+            if slot < 0 || win.is_null() {
+                log::warn!("video: sf_media_create({buf_w}x{buf_h}, z={z}) failed");
+                return None;
+            }
+            Some((slot, win as *mut ANativeWindow))
+        }
+
+        pub fn set_rect(slot: i32, r: VideoRect) {
+            if let Some(f) = fns() {
+                unsafe { (f.set_rect)(slot, r.x, r.y, r.w, r.h) };
+            }
+        }
+
+        pub fn set_visible(slot: i32, visible: bool) {
+            if let Some(f) = fns() {
+                unsafe { (f.set_visible)(slot, visible as i32) };
+            }
+        }
+
+        pub fn destroy(slot: i32) {
+            if let Some(f) = fns() {
+                unsafe { (f.destroy)(slot) };
+            }
+        }
+
+        /// Toggle the app layer's opaque flag (cleared while a behind-the-UI
+        /// video surface is up so the guest's transparent hole blends).
+        /// Returns false when this process has no main surface (headless).
+        pub fn set_opaque(opaque: bool) -> bool {
+            match fns() {
+                Some(f) => unsafe { (f.set_opaque)(opaque as i32) == 0 },
+                None => false,
+            }
+        }
+    }
+
     /// Per-device camera error flags, written by the NDK state callbacks.
     /// Boxed so the context pointer stays stable for the device's lifetime.
     struct CamCbCtx {
@@ -372,6 +508,11 @@ mod android {
         fmt: *mut AMediaFormat,
         started: bool,
         cb_ctx: Box<CamCbCtx>,
+        // PiP self-view (task 93 Phase 4): the camera streams to a second
+        // (media-surface) output target; nothing crosses the WIT boundary.
+        preview_slot: Option<i32>,
+        preview_out: *mut ACaptureSessionOutput,
+        preview_target: *mut ACameraOutputTarget,
     }
 
     // The NDK camera and AMediaCodec handles are documented thread-safe; all
@@ -404,6 +545,9 @@ mod android {
                 fmt: ptr::null_mut(),
                 started: false,
                 cb_ctx: Box::new(CamCbCtx { error: AtomicBool::new(false), code: AtomicI32::new(0) }),
+                preview_slot: None,
+                preview_out: ptr::null_mut(),
+                preview_target: ptr::null_mut(),
             };
             // From here every early return goes through Drop, which tolerates
             // the partially-filled struct — the ordered-teardown guarantee.
@@ -471,6 +615,26 @@ mod android {
             ACaptureSessionOutput_create(self.win, &mut self.out);
             ACaptureSessionOutputContainer_create(&mut self.container);
             ACaptureSessionOutputContainer_add(self.container, self.out);
+            // PiP self-view: a second camera output target onto a media
+            // surface. Same stream size as the encode stream (a real,
+            // supported camera config — the on-screen rect scales it).
+            let mut preview_win: *mut ANativeWindow = ptr::null_mut();
+            if let Some(rect) = config.preview.filter(|r| r.visible()) {
+                match media::create(config.width as i32, config.height as i32, Z_PIP_PREVIEW) {
+                    Some((slot, win)) => {
+                        self.preview_slot = Some(slot);
+                        preview_win = win;
+                        media::set_rect(slot, rect);
+                        media::set_visible(slot, true);
+                        ACaptureSessionOutput_create(preview_win, &mut self.preview_out);
+                        ACaptureSessionOutputContainer_add(self.container, self.preview_out);
+                    }
+                    None => {
+                        // Self-view is cosmetic — log + carry on encoding.
+                        log::warn!("video: preview media surface unavailable — no self-view");
+                    }
+                }
+            }
             let sess_cbs = ACameraCaptureSessionStateCallbacks {
                 context: ptr::null_mut(),
                 on_closed: on_session_noop,
@@ -488,6 +652,10 @@ mod android {
             }
             ACameraOutputTarget_create(self.win, &mut self.target);
             ACaptureRequest_addTarget(self.req, self.target);
+            if !preview_win.is_null() {
+                ACameraOutputTarget_create(preview_win, &mut self.preview_target);
+                ACaptureRequest_addTarget(self.req, self.preview_target);
+            }
             let mut seq: c_int = 0;
             let rst = ACameraCaptureSession_setRepeatingRequest(self.session, ptr::null(), 1, &mut self.req, &mut seq);
             if rst != ACAMERA_OK {
@@ -561,6 +729,20 @@ mod android {
                 }
             }
         }
+
+        /// Move/resize the PiP self-view (no-op without a preview surface).
+        pub fn set_preview_rect(&mut self, rect: super::VideoRect) {
+            if let Some(slot) = self.preview_slot {
+                media::set_rect(slot, rect);
+            }
+        }
+
+        /// Show/hide the PiP self-view (no-op without a preview surface).
+        pub fn set_preview_visible(&mut self, visible: bool) {
+            if let Some(slot) = self.preview_slot {
+                media::set_visible(slot, visible);
+            }
+        }
     }
 
     impl Drop for VideoEncoder {
@@ -577,8 +759,10 @@ mod android {
                 }
                 if !self.req.is_null() { ACaptureRequest_free(self.req); }
                 if !self.target.is_null() { ACameraOutputTarget_free(self.target); }
+                if !self.preview_target.is_null() { ACameraOutputTarget_free(self.preview_target); }
                 if !self.container.is_null() { ACaptureSessionOutputContainer_free(self.container); }
                 if !self.out.is_null() { ACaptureSessionOutput_free(self.out); }
+                if !self.preview_out.is_null() { ACaptureSessionOutput_free(self.preview_out); }
                 if !self.device.is_null() { ACameraDevice_close(self.device); }
                 if !self.codec.is_null() {
                     if self.started { AMediaCodec_stop(self.codec); }
@@ -587,6 +771,10 @@ mod android {
                 if !self.fmt.is_null() { AMediaFormat_delete(self.fmt); }
                 if !self.win.is_null() { ANativeWindow_release(self.win); }
                 if !self.mgr.is_null() { ACameraManager_delete(self.mgr); }
+            }
+            // After the camera (producer) is closed — the surface can go.
+            if let Some(slot) = self.preview_slot.take() {
+                media::destroy(slot);
             }
             log::info!("video: encoder torn down");
         }
@@ -636,14 +824,21 @@ mod android {
         Ok(id)
     }
 
-    // ── decoder: guest pushes encoded frames → HW decode-to-buffer ────────
-    // (Phase 4 swaps the null surface for an arbiter Role::Video surface.)
+    // ── decoder: guest pushes encoded frames → HW decode ──────────────────
+    // Decode-to-SURFACE when the config carries a rect (task 93 Phase 4): the
+    // codec renders straight into a media surface composited below the app's
+    // (hole-punched) UI — decoded pixels never re-enter the guest. Without a
+    // rect it falls back to decode-to-buffer (count + drop; diagnostics).
 
     pub struct VideoDecoder {
         codec: *mut AMediaCodec,
         fmt: *mut AMediaFormat,
         started: bool,
         decoded: u64,
+        slot: Option<i32>,
+        /// True when this decoder cleared the app layer's opaque flag (so it
+        /// must restore it on teardown).
+        opaque_cleared: bool,
     }
 
     // Same justification as VideoEncoder: AMediaCodec is thread-safe and
@@ -653,7 +848,32 @@ mod android {
     impl VideoDecoder {
         pub fn open(config: &DecoderConfig) -> Result<Self, VideoError> {
             ensure_binder_threadpool();
-            let mut dec = VideoDecoder { codec: ptr::null_mut(), fmt: ptr::null_mut(), started: false, decoded: 0 };
+            let mut dec = VideoDecoder {
+                codec: ptr::null_mut(),
+                fmt: ptr::null_mut(),
+                started: false,
+                decoded: 0,
+                slot: None,
+                opaque_cleared: false,
+            };
+            // Decode-to-surface: allocate the compositing surface first (its
+            // window is the codec's render target). Failure here is fatal —
+            // the caller asked for on-screen video.
+            let mut surface: *mut ANativeWindow = ptr::null_mut();
+            if let Some(rect) = config.rect.filter(|r| r.visible()) {
+                let (slot, win) = media::create(
+                    config.width.max(1) as i32,
+                    config.height.max(1) as i32,
+                    Z_REMOTE_VIDEO,
+                )
+                .ok_or(VideoError::SurfaceUnavailable)?;
+                dec.slot = Some(slot);
+                surface = win;
+                media::set_rect(slot, rect);
+                media::set_visible(slot, true);
+                // Let the guest's transparent hole blend (no-op headless).
+                dec.opaque_cleared = media::set_opaque(false);
+            }
             unsafe {
                 let dmime = CString::new(config.codec.mime()).unwrap();
                 dec.codec = AMediaCodec_createDecoderByType(dmime.as_ptr());
@@ -665,7 +885,7 @@ mod android {
                 fmt_set_str(dec.fmt, "mime", config.codec.mime());
                 fmt_set_i32(dec.fmt, "width", config.width.max(1) as i32);
                 fmt_set_i32(dec.fmt, "height", config.height.max(1) as i32);
-                let dcfg = AMediaCodec_configure(dec.codec, dec.fmt, ptr::null_mut(), ptr::null_mut(), 0);
+                let dcfg = AMediaCodec_configure(dec.codec, dec.fmt, surface, ptr::null_mut(), 0);
                 if dcfg != AMEDIA_OK {
                     log::warn!("video: decoder configure status={dcfg}");
                     return Err(VideoError::CodecInitFailed);
@@ -676,8 +896,9 @@ mod android {
                 }
             }
             dec.started = true;
-            log::info!("video: decoder live — {} {}x{} (decode-to-buffer)",
-                config.codec.mime(), config.width, config.height);
+            log::info!("video: decoder live — {} {}x{} ({})",
+                config.codec.mime(), config.width, config.height,
+                if dec.slot.is_some() { "decode-to-surface" } else { "decode-to-buffer" });
             Ok(dec)
         }
 
@@ -712,13 +933,30 @@ mod android {
             self.decoded
         }
 
+        /// Move/resize the video surface (no-op in decode-to-buffer mode).
+        pub fn set_rect(&mut self, rect: super::VideoRect) {
+            if let Some(slot) = self.slot {
+                media::set_rect(slot, rect);
+            }
+        }
+
+        /// Show/hide the video surface (no-op in decode-to-buffer mode).
+        pub fn set_visible(&mut self, visible: bool) {
+            if let Some(slot) = self.slot {
+                media::set_visible(slot, visible);
+            }
+        }
+
         unsafe fn drain(&mut self) {
+            // render=true sends the decoded buffer to the media surface
+            // (decode-to-surface); with no surface it just recycles.
+            let render = self.slot.is_some();
             let mut info = AMediaCodecBufferInfo { offset: 0, size: 0, presentation_time_us: 0, flags: 0 };
             for _ in 0..16 {
                 let idx = AMediaCodec_dequeueOutputBuffer(self.codec, &mut info, 0);
                 if idx >= 0 {
                     self.decoded += 1;
-                    AMediaCodec_releaseOutputBuffer(self.codec, idx as usize, false);
+                    AMediaCodec_releaseOutputBuffer(self.codec, idx as usize, render);
                 } else if idx == INFO_OUTPUT_FORMAT_CHANGED || idx == INFO_OUTPUT_BUFFERS_CHANGED {
                     continue;
                 } else {
@@ -736,6 +974,14 @@ mod android {
                     AMediaCodec_delete(self.codec);
                 }
                 if !self.fmt.is_null() { AMediaFormat_delete(self.fmt); }
+            }
+            // After the codec (producer) is gone — release the surface and
+            // restore the app layer's opacity.
+            if let Some(slot) = self.slot.take() {
+                media::destroy(slot);
+            }
+            if self.opaque_cleared {
+                media::set_opaque(true);
             }
             log::info!("video: decoder torn down ({} frames decoded)", self.decoded);
         }
