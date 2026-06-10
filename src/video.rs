@@ -109,6 +109,11 @@ pub struct EncodedFrame {
 /// ever proves inverted on a device, THIS mapping is the one knob to flip.
 static DEVICE_ROTATION_DEG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Bumped whenever the device rotation changes — live media surfaces check it
+/// on their per-frame paths (`submit`/`next_frame`) and re-apply geometry, so
+/// video follows rotation even when nothing else re-pushes a layout.
+static GEOM_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub fn set_device_orientation_code(code: u32) {
     let deg = match code {
         4 => 90,
@@ -116,7 +121,13 @@ pub fn set_device_orientation_code(code: u32) {
         7 => 270,
         _ => 0,
     };
-    DEVICE_ROTATION_DEG.store(deg, std::sync::atomic::Ordering::Relaxed);
+    if DEVICE_ROTATION_DEG.swap(deg, std::sync::atomic::Ordering::Relaxed) != deg {
+        GEOM_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn geom_gen() -> u32 {
+    GEOM_GEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn device_rotation_deg() -> u32 {
@@ -630,6 +641,7 @@ mod android {
         /// The guest's LOGICAL PiP rect (re-applied on rotation via
         /// set_preview_rect; the UI re-pushes layout when it rotates).
         preview_guest_rect: super::VideoRect,
+        geom_gen: u32,
     }
 
     // The NDK camera and AMediaCodec handles are documented thread-safe; all
@@ -668,6 +680,7 @@ mod android {
                 sensor_orientation: 0,
                 facing_front: config.facing_front,
                 preview_guest_rect: super::VideoRect { x: 0, y: 0, w: 0, h: 0 },
+                geom_gen: 0,
             };
             // From here every early return goes through Drop, which tolerates
             // the partially-filled struct — the ordered-teardown guarantee.
@@ -792,6 +805,10 @@ mod android {
         /// Non-blocking pull of the next encoded frame (the guest polls at
         /// frame cadence; see the WIT note re a future callback alternative).
         pub fn next_frame(&mut self) -> Option<EncodedFrame> {
+            // Device rotated → re-apply the PiP geometry (see VideoDecoder).
+            if self.preview_slot.is_some() && self.geom_gen != super::geom_gen() {
+                self.apply_preview_geometry();
+            }
             if self.cb_ctx.error.swap(false, Relaxed) {
                 log::warn!("video: camera onError code={}", self.cb_ctx.code.load(Relaxed));
             }
@@ -878,6 +895,7 @@ mod android {
         /// sense; back: sensor); the viewer's device rotation adds on top.
         /// Transform BEFORE rect (90/270 swap the slot's logical dims).
         fn apply_preview_geometry(&mut self) {
+            self.geom_gen = super::geom_gen();
             let Some(slot) = self.preview_slot else { return };
             let dev = super::device_rotation_deg();
             let panel_upright = if self.facing_front {
@@ -1017,6 +1035,8 @@ mod android {
         /// recomputed by `apply_geometry` (set-rect / set-rotation).
         cvo: u32,
         guest_rect: super::VideoRect,
+        /// Device-rotation generation this surface's geometry was applied at.
+        geom_gen: u32,
     }
 
     // Same justification as VideoEncoder: AMediaCodec is thread-safe and
@@ -1035,6 +1055,7 @@ mod android {
                 opaque_cleared: false,
                 cvo: config.rotation % 360,
                 guest_rect: super::VideoRect { x: 0, y: 0, w: 0, h: 0 },
+                geom_gen: super::geom_gen(),
             };
             // Decode-to-surface: allocate the compositing surface first (its
             // window is the codec's render target). Failure here is fatal —
@@ -1093,6 +1114,11 @@ mod android {
             if data.is_empty() {
                 return Err(VideoError::BadFrame);
             }
+            // Device rotated since the last apply → re-map + re-rotate the
+            // surface (the UI's layout may not change, so nothing else fires).
+            if self.geom_gen != super::geom_gen() {
+                self.apply_geometry();
+            }
             unsafe {
                 self.drain();
                 let di = AMediaCodec_dequeueInputBuffer(self.codec, 10_000);
@@ -1142,6 +1168,7 @@ mod android {
                 map_rect_to_panel(self.guest_rect, dev),
                 (self.cvo + dev) % 360,
             );
+            self.geom_gen = super::geom_gen();
         }
 
         /// Show/hide the video surface (no-op in decode-to-buffer mode).
