@@ -1222,6 +1222,33 @@ int32_t sf_media_set_transform(int32_t slot, uint32_t transform) {
     return 0;
 }
 
+// One-shot geometry (task 93 Phase 5 — supersedes the set_rect+set_transform
+// pair for video): place the media surface at panel rect (x,y,w,h) with buffer
+// `transform` (HAL bitmask), in ONE transaction. The BBQ destination + child
+// crop become exactly (w,h) and the container matrix is identity, so the
+// (transformed) producer buffer is scaled ONCE into the final on-screen rect —
+// composing the old pair double-scaled when the transform swapped dims.
+// Producer buffer size is independent (codec/camera set their own dims).
+int32_t sf_media_set_geometry(int32_t slot, int32_t x, int32_t y, int32_t w,
+                              int32_t h, uint32_t transform) {
+    if (slot < 0 || slot >= 4 || g_media[slot].container == nullptr) return -1;
+    if (w <= 0 || h <= 0) return -1;
+    {
+        SurfaceComposerClient::Transaction t;
+        t.setTransform(g_media[slot].child, transform);
+        t.setCrop(g_media[slot].child, Rect(0, 0, w, h));
+        t.setPosition(g_media[slot].container, static_cast<float>(x), static_cast<float>(y));
+        t.setMatrix(g_media[slot].container, 1.0f, 0.0f, 0.0f, 1.0f);
+        t.apply(/*synchronous=*/false);
+    }
+    g_media[slot].bbq->update(g_media[slot].child,
+                              static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+                              PIXEL_FORMAT_RGBA_8888);
+    g_media[slot].buf_w = w;
+    g_media[slot].buf_h = h;
+    return 0;
+}
+
 // Release one media slot: hide synchronously (so the codec/camera producer is
 // gone from the screen before its buffers die), then drop the refs — with no
 // owner left, SurfaceFlinger removes the layers.

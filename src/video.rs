@@ -422,6 +422,7 @@ mod android {
         struct MediaFns {
             panel_dims: unsafe extern "C" fn(*mut i32, *mut i32),
             create: unsafe extern "C" fn(i32, i32, i32, *mut *mut std::ffi::c_void) -> i32,
+            set_geometry: unsafe extern "C" fn(i32, i32, i32, i32, i32, u32) -> i32,
             set_rect: unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32,
             set_visible: unsafe extern "C" fn(i32, i32) -> i32,
             set_transform: unsafe extern "C" fn(i32, u32) -> i32,
@@ -450,21 +451,23 @@ mod android {
                     }
                     p
                 };
-                let (pd, c, r, v, t, d, o) = (
+                let (pd, c, g, r, v, t, d, o) = (
                     sym("sf_panel_dims"),
                     sym("sf_media_create"),
+                    sym("sf_media_set_geometry"),
                     sym("sf_media_set_rect"),
                     sym("sf_media_set_visible"),
                     sym("sf_media_set_transform"),
                     sym("sf_media_destroy"),
                     sym("sf_set_opaque"),
                 );
-                if pd.is_null() || c.is_null() || r.is_null() || v.is_null() || t.is_null() || d.is_null() || o.is_null() {
+                if pd.is_null() || c.is_null() || g.is_null() || r.is_null() || v.is_null() || t.is_null() || d.is_null() || o.is_null() {
                     return None;
                 }
                 Some(MediaFns {
                     panel_dims: std::mem::transmute(pd),
                     create: std::mem::transmute(c),
+                    set_geometry: std::mem::transmute(g),
                     set_rect: std::mem::transmute(r),
                     set_visible: std::mem::transmute(v),
                     set_transform: std::mem::transmute(t),
@@ -499,6 +502,21 @@ mod android {
                 return None;
             }
             Some((slot, win as *mut ANativeWindow))
+        }
+
+        /// One-shot rect (panel px) + buffer transform: the transformed
+        /// producer buffer scales ONCE into the rect (no matrix games — the
+        /// set_rect+set_transform pair double-scaled when dims swapped).
+        pub fn set_geometry(slot: i32, r: VideoRect, degrees: u32) {
+            let transform: u32 = match degrees % 360 {
+                90 => 4,  // NATIVE_WINDOW_TRANSFORM_ROT_90
+                180 => 3, // ROT_180
+                270 => 7, // ROT_270
+                _ => 0,
+            };
+            if let Some(f) = fns() {
+                unsafe { (f.set_geometry)(slot, r.x, r.y, r.w, r.h, transform) };
+            }
         }
 
         pub fn set_rect(slot: i32, r: VideoRect) {
@@ -871,8 +889,11 @@ mod android {
             } else {
                 self.sensor_orientation
             };
-            media::set_transform(slot, (panel_upright + dev) % 360);
-            media::set_rect(slot, map_rect_to_panel(self.preview_guest_rect, dev));
+            media::set_geometry(
+                slot,
+                map_rect_to_panel(self.preview_guest_rect, dev),
+                (panel_upright + dev) % 360,
+            );
         }
 
         /// Show/hide the PiP self-view (no-op without a preview surface).
@@ -1120,8 +1141,11 @@ mod android {
         fn apply_geometry(&mut self) {
             let Some(slot) = self.slot else { return };
             let dev = super::device_rotation_deg();
-            media::set_transform(slot, (self.cvo + dev) % 360);
-            media::set_rect(slot, map_rect_to_panel(self.guest_rect, dev));
+            media::set_geometry(
+                slot,
+                map_rect_to_panel(self.guest_rect, dev),
+                (self.cvo + dev) % 360,
+            );
         }
 
         /// Show/hide the video surface (no-op in decode-to-buffer mode).
