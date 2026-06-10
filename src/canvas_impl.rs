@@ -284,6 +284,9 @@ pub struct SkiaRenderer {
     drawables:        HashMap<u32, WasiDrawable>,
     next_drawable_id: u32,
     typeface_cache:   HashMap<(String, bool, bool), Typeface>,
+    /// Guest-registered typefaces (create-typeface from raw font bytes) for
+    /// the guest-shaped glyph path (draw-glyphs). Ids share next_blob_id.
+    guest_typefaces:  HashMap<u32, Typeface>,
 
     text_image_cache: HashMap<(u64, u32), CachedTextImage>,
     text_image_keys:  std::collections::VecDeque<(u64, u32)>,
@@ -446,6 +449,7 @@ impl SkiaRenderer {
                 drawables:        HashMap::new(),
                 next_drawable_id: 1,
                 typeface_cache:   HashMap::new(),
+                guest_typefaces:  HashMap::new(),
                 text_image_cache: HashMap::new(),
                 text_image_keys:  std::collections::VecDeque::with_capacity(TEXT_IMAGE_CACHE_CAP),
                 para_builders:    HashMap::new(),
@@ -486,6 +490,7 @@ impl SkiaRenderer {
                 drawables:        HashMap::new(),
                 next_drawable_id: 1,
                 typeface_cache:   HashMap::new(),
+                guest_typefaces:  HashMap::new(),
                 text_image_cache: HashMap::new(),
                 text_image_keys:  std::collections::VecDeque::with_capacity(TEXT_IMAGE_CACHE_CAP),
                 para_builders:    HashMap::new(),
@@ -592,6 +597,7 @@ impl SkiaRenderer {
             drawables:        HashMap::new(),
             next_drawable_id: 1,
             typeface_cache:   HashMap::new(),
+            guest_typefaces:  HashMap::new(),
             text_image_cache: HashMap::new(),
             text_image_keys:  std::collections::VecDeque::with_capacity(TEXT_IMAGE_CACHE_CAP),
             para_builders:    HashMap::new(),
@@ -1939,11 +1945,106 @@ impl crate::bindings::my::skiko_gfx::canvas::Host for crate::HostState {
         // drawVertices is not used by the current widget set; no-op stub.
     }
 
+    // ── guest-shaped glyph text (docs/skia-wit-mapping.md) ────────────────
+
+    fn create_typeface(&mut self, data: Vec<u8>, index: u32) -> u32 {
+        let mgr = skia_safe::FontMgr::new();
+        let Some(tf) = mgr.new_from_data(&data, if index > 0 { Some(index as usize) } else { None })
+        else {
+            log::warn!("create_typeface: unparseable font data ({} bytes)", data.len());
+            return 0;
+        };
+        let id = self.renderer.next_blob_id;
+        self.renderer.next_blob_id = id.wrapping_add(1).max(1);
+        self.renderer.guest_typefaces.insert(id, tf);
+        id
+    }
+
+    fn drop_typeface(&mut self, id: u32) {
+        self.renderer.guest_typefaces.remove(&id);
+    }
+
+    fn draw_glyphs(&mut self, typeface_id: u32, size: f32,
+                   glyph_ids: Vec<u16>, positions: Vec<f32>,
+                   origin_x: f32, origin_y: f32, p: PaintAttrs) {
+        let Some((glyphs, points, font)) =
+            prep_glyph_run(&self.renderer, typeface_id, size, glyph_ids, &positions)
+        else { return };
+        let paint = make_paint_full(&p, &self.renderer);
+        self.renderer.canvas().draw_glyphs_at(
+            &glyphs, points.as_slice(), (origin_x, origin_y), &font, &paint);
+    }
+
+    fn bc_draw_glyphs(&mut self, id: u32, typeface_id: u32, size: f32,
+                      glyph_ids: Vec<u16>, positions: Vec<f32>,
+                      origin_x: f32, origin_y: f32, p: PaintAttrs) {
+        let Some((glyphs, points, font)) =
+            prep_glyph_run(&self.renderer, typeface_id, size, glyph_ids, &positions)
+        else { return };
+        let paint = make_paint_full(&p, &self.renderer);
+        if let Some(c) = bc_canvas_mut(&mut self.renderer, id) {
+            c.draw_glyphs_at(&glyphs, points.as_slice(), (origin_x, origin_y), &font, &paint);
+        }
+    }
+
+    fn draw_shadow_rrect(&mut self, x: f32, y: f32, w: f32, h: f32,
+                         radii: Vec<f32>, sigma: f32, color: u32) {
+        let (rr, paint) = make_shadow(x, y, w, h, &radii, sigma, color);
+        self.renderer.canvas().draw_rrect(rr, &paint);
+    }
+
+    fn bc_draw_shadow_rrect(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32,
+                            radii: Vec<f32>, sigma: f32, color: u32) {
+        let (rr, paint) = make_shadow(x, y, w, h, &radii, sigma, color);
+        if let Some(c) = bc_canvas_mut(&mut self.renderer, id) {
+            c.draw_rrect(rr, &paint);
+        }
+    }
+
     // ── debug log ─────────────────────────────────────────────────────────
 
     fn log_message(&mut self, msg: String) {
         log::info!("[wasm] {}", msg);
     }
+}
+
+/// Shared prep for draw-glyphs / bc-draw-glyphs: look up the guest typeface,
+/// pair glyph ids with their (x, y) positions (extra ids without a position
+/// are dropped), and build the sized Font. Subpixel positioning is on — the
+/// guest's shaper (parley) produces fractional advances.
+fn prep_glyph_run(r: &SkiaRenderer, typeface_id: u32, size: f32,
+                  glyph_ids: Vec<u16>, positions: &[f32])
+                  -> Option<(Vec<u16>, Vec<skia_safe::Point>, Font)> {
+    let tf = r.guest_typefaces.get(&typeface_id)?.clone();
+    let points = coords_to_points(positions);
+    let mut glyphs = glyph_ids;
+    glyphs.truncate(points.len());
+    if glyphs.is_empty() { return None; }
+    let mut font = Font::from_typeface(tf, size);
+    font.set_edging(skia_safe::font::Edging::AntiAlias);
+    font.set_subpixel(true);
+    Some((glyphs, points, font))
+}
+
+/// Shared prep for draw-shadow-rrect / bc-draw-shadow-rrect: the rrect plus
+/// a filled anti-aliased paint carrying the blur mask filter (Normal style,
+/// matching the Skia box-shadow idiom). sigma <= 0 degrades to a plain fill.
+fn make_shadow(x: f32, y: f32, w: f32, h: f32, radii: &[f32],
+               sigma: f32, color: u32) -> (RRect, Paint) {
+    let rr = make_rrect_with_radii(Rect::from_xywh(x, y, w, h), radii);
+    let mut paint = Paint::default();
+    paint.set_argb(
+        ((color >> 24) & 0xFF) as u8,
+        ((color >> 16) & 0xFF) as u8,
+        ((color >>  8) & 0xFF) as u8,
+        ( color        & 0xFF) as u8,
+    );
+    paint.set_anti_alias(true);
+    if sigma > 0.0 {
+        paint.set_mask_filter(skia_safe::MaskFilter::blur(
+            skia_safe::BlurStyle::Normal, sigma, None));
+    }
+    (rr, paint)
 }
 
 /// Look up the inner Canvas of a bitmap-canvas surface. Returns None for
