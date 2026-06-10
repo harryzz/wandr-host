@@ -5,8 +5,6 @@
 //! by the `wandr.statusbar` guest, which polls these ~1 Hz and draws the
 //! top-overlay strip.
 
-use std::process::Command;
-
 use crate::bindings::my::skiko_gfx::status::Host;
 
 /// Status-bar strip height in physical pixels. True-dp (Arbiter Inc. 3b): the
@@ -24,22 +22,19 @@ impl Host for crate::HostState {
     }
 
     fn clock_text(&mut self) -> String {
-        // Local wall-clock. Rust std has no localtime; `date` is a native
-        // toolbox/coreutils binary (not ART), so shelling out is ART-free.
-        // Called ~1 Hz by the status bar, so the per-call spawn is cheap.
-        match Command::new("date").arg("+%H:%M").output() {
-            Ok(o) if o.status.success() => {
-                String::from_utf8_lossy(&o.stdout).trim().to_string()
-            }
-            Ok(o) => {
-                log::warn!("status: `date` exited {}", o.status);
-                String::new()
-            }
-            Err(e) => {
-                log::warn!("status: spawn `date` failed: {e}");
-                String::new()
-            }
+        // Local wall-clock, in-process. Rust std has no localtime, but bionic's
+        // localtime_r does the timezone work (tzset reads $TZ, falling back to
+        // persist.sys.timezone) — still ART-free, no system_server. This used to
+        // shell out to `date`, but simpleperf showed each ~1 Hz call forking the
+        // whole wasmtime host (copy_page_range on a ~57 MB process) + exec'ing +
+        // relinking toybox ≈ 4% of a core, the statusbar's dominant idle cost.
+        let t = unsafe { libc::time(std::ptr::null_mut()) };
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            log::warn!("status: localtime_r failed");
+            return String::new();
         }
+        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
     }
 
     fn battery_text(&mut self) -> String {

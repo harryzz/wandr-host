@@ -713,6 +713,19 @@ fn run_cwasm_loop(
     // guest can sleep, so e.g. the status-bar clock still ticks ~1/sec.
     const IDLE_CAP_MS: u64 = 1000;
     const POLL_MS: u64 = 16;
+    // Idle-adaptive input poll. simpleperf (taskbar, idle) showed the 60 Hz loop
+    // ITSELF — InputConsumer::consume + sf_input_poll + scheduler drain + the kernel
+    // wakeup — is ~2-4% of a core per surface with zero events flowing, while a
+    // Background surface at 200 ms polling costs ~0%. So after IDLE_AFTER_MS with no
+    // event activity (`dirty` never set), stretch the poll to IDLE_POLL_MS; the first
+    // event that does arrive sets `dirty` and snaps the cadence back to POLL_MS.
+    // IDLE_POLL_MS = 3 frame periods: cuts the idle wake rate 3× while the worst-case
+    // added latency on the FIRST touch after idle (~paint two frames later) stays
+    // under the ~50 ms threshold where a tap starts feeling late; a gesture in
+    // progress keeps `dirty` set, so drag/scroll latency is unchanged at 60 Hz.
+    const IDLE_POLL_MS: u64 = 3 * POLL_MS;
+    const IDLE_AFTER_MS: u64 = 1000;
+    let mut last_activity = std::time::Instant::now();
     let mut next_render_at = std::time::Instant::now();
     // Render-INDEPENDENT engine-pump cadence (bg-tick). Separate from next_render_at
     // so a live call can pump the socket/executor/audio at ~60/s even in the
@@ -1414,12 +1427,17 @@ fn run_cwasm_loop(
         // every iteration). Overlays (taskbar/statusbar) are never Background, so
         // their tap latency is unchanged.
         const BG_POLL_MS: u64 = 200;
+        let now_nap = std::time::Instant::now();
+        if dirty {
+            last_activity = now_nap;
+        }
         let poll_cap = if matches!(cur_role, crate::app_role::AppRole::Background) {
             BG_POLL_MS
+        } else if now_nap.duration_since(last_activity).as_millis() as u64 >= IDLE_AFTER_MS {
+            IDLE_POLL_MS // idle-adaptive: no events for a while → slow the wake rate
         } else {
             POLL_MS
         };
-        let now_nap = std::time::Instant::now();
         let mut nap = std::time::Duration::from_millis(poll_cap);
         // The render deadline gates the nap ONLY when we actually render
         // (foreground). When backgrounded the render block is skipped, so
