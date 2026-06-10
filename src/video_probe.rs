@@ -147,6 +147,14 @@ mod android {
         fn AMediaCodec_signalEndOfInputStream(c: *mut AMediaCodec) -> c_int;
         fn AMediaCodec_dequeueOutputBuffer(c: *mut AMediaCodec, info: *mut AMediaCodecBufferInfo, timeout_us: i64) -> isize;
         fn AMediaCodec_releaseOutputBuffer(c: *mut AMediaCodec, idx: usize, render: bool) -> c_int;
+        // Decoder side (task-93 decode-path probe). Read encoder output bytes +
+        // feed them into a HW VP8 decoder via input buffers.
+        fn AMediaCodec_createDecoderByType(mime: *const c_char) -> *mut AMediaCodec;
+        fn AMediaCodec_getOutputBuffer(c: *mut AMediaCodec, idx: usize, out_size: *mut usize) -> *mut u8;
+        fn AMediaCodec_getInputBuffer(c: *mut AMediaCodec, idx: usize, out_size: *mut usize) -> *mut u8;
+        fn AMediaCodec_dequeueInputBuffer(c: *mut AMediaCodec, timeout_us: i64) -> isize;
+        fn AMediaCodec_queueInputBuffer(c: *mut AMediaCodec, idx: usize, offset: usize,
+            size: usize, time_us: u64, flags: u32) -> c_int;
         fn AMediaFormat_new() -> *mut AMediaFormat;
         fn AMediaFormat_delete(f: *mut AMediaFormat) -> c_int;
         fn AMediaFormat_setString(f: *mut AMediaFormat, key: *const c_char, val: *const c_char);
@@ -236,11 +244,18 @@ mod android {
             unsafe { run_imagereader(W, H) }
             return;
         }
-        match &codec_name {
-            Some(n) => p!("=== wandr-host --probe-video — camera → encode via '{n}' ({W}x{H}) ==="),
-            None => p!("=== wandr-host --probe-video — camera → HW VP8 encode ({W}x{H}) ==="),
+        // `--probe-video decode` → camera → HW VP8 ENCODE → HW VP8 DECODE loopback
+        // (task-93 decode-path probe: proves the HW decoder configures + emits frames
+        // under --no-art — the one piece the original encode spike never exercised).
+        let decode = codec_name.as_deref() == Some("decode");
+        // "decode" is a mode keyword, not an explicit encoder name.
+        let codec_name = if decode { None } else { codec_name };
+        match (decode, &codec_name) {
+            (true, _) => p!("=== wandr-host --probe-video — camera → HW VP8 ENCODE → HW VP8 DECODE loopback ({W}x{H}) ==="),
+            (false, Some(n)) => p!("=== wandr-host --probe-video — camera → encode via '{n}' ({W}x{H}) ==="),
+            (false, None) => p!("=== wandr-host --probe-video — camera → HW VP8 encode ({W}x{H}) ==="),
         }
-        unsafe { run_inner(W, H, VP8, codec_name.as_deref()) }
+        unsafe { run_inner(W, H, VP8, codec_name.as_deref(), decode) }
     }
 
     const AIMAGE_FORMAT_YUV_420_888: i32 = 0x23;
@@ -346,7 +361,7 @@ mod android {
         cleanup_mgr(mgr, id_list);
     }
 
-    unsafe fn run_inner(w: i32, h: i32, vp8: &str, codec_name: Option<&str>) {
+    unsafe fn run_inner(w: i32, h: i32, vp8: &str, codec_name: Option<&str>, decode: bool) {
         // 0. Start the (C++ libbinder) binder threadpool BEFORE touching the camera
         //    — the NDK Camera2 client needs it to service cameraserver callbacks;
         //    without it open/createCaptureSession hang ("Thread Pool max thread
@@ -448,6 +463,38 @@ mod android {
         }
         p!("VP8 encoder configured + started; input surface ready");
 
+        // 3b. (decode loopback) HW VP8 DECODER, decode-to-BUFFER (surface = null →
+        //     YUV output buffers we can count). The KEY task-93 unknown: does the HW
+        //     VP8 decoder `configure()` + emit frames under --no-art? VP8 needs no CSD
+        //     (keyframes are self-contained), so we feed encoder output straight in.
+        let mut dec: *mut AMediaCodec = ptr::null_mut();
+        let mut dec_fmt: *mut AMediaFormat = ptr::null_mut();
+        if decode {
+            p!("creating VP8 decoder by type …");
+            let dmime = CString::new(vp8).unwrap();
+            dec = AMediaCodec_createDecoderByType(dmime.as_ptr());
+            if dec.is_null() {
+                p!("FAIL: decoder create -> null (no VP8 decoder?)");
+            } else {
+                dec_fmt = AMediaFormat_new();
+                fmt_set_str(dec_fmt, "mime", vp8);
+                fmt_set_i32(dec_fmt, "width", w);
+                fmt_set_i32(dec_fmt, "height", h);
+                let dcfg = AMediaCodec_configure(dec, dec_fmt, ptr::null_mut(), ptr::null_mut(), 0);
+                if dcfg != AMEDIA_OK {
+                    p!("FAIL: decoder AMediaCodec_configure status={dcfg} (configure BLOCKED under --no-art?)");
+                    AMediaCodec_delete(dec); dec = ptr::null_mut();
+                    AMediaFormat_delete(dec_fmt); dec_fmt = ptr::null_mut();
+                } else if AMediaCodec_start(dec) != AMEDIA_OK {
+                    p!("FAIL: decoder AMediaCodec_start");
+                    AMediaCodec_delete(dec); dec = ptr::null_mut();
+                    AMediaFormat_delete(dec_fmt); dec_fmt = ptr::null_mut();
+                } else {
+                    p!("VP8 decoder configured + started (decode-to-buffer) ✓");
+                }
+            }
+        }
+
         // 4. Capture session → the encoder's input surface.
         let mut out: *mut ACaptureSessionOutput = ptr::null_mut();
         let mut container: *mut ACaptureSessionOutputContainer = ptr::null_mut();
@@ -488,6 +535,11 @@ mod android {
         let mut keyframes = 0u64;
         let mut first_ms: i128 = -1;
         let mut fmt_changed = false;
+        // Decode-loopback counters.
+        let mut dec_frames = 0u64;
+        let mut dec_first_ms: i128 = -1;
+        let mut dec_fmt_changed = false;
+        let mut dec_fed = 0u64;
         let mut info = AMediaCodecBufferInfo { offset: 0, size: 0, presentation_time_us: 0, flags: 0 };
         while start.elapsed().as_secs() < 5 {
             let idx = AMediaCodec_dequeueOutputBuffer(codec, &mut info, 100_000);
@@ -496,11 +548,46 @@ mod android {
                 frames += 1;
                 bytes += info.size.max(0) as u64;
                 if info.flags & BUFFER_FLAG_KEY_FRAME != 0 { keyframes += 1; }
+                // Feed this encoded frame into the decoder (read bytes BEFORE release).
+                if decode && !dec.is_null() && info.size > 0 {
+                    let mut osz: usize = 0;
+                    let obuf = AMediaCodec_getOutputBuffer(codec, idx as usize, &mut osz);
+                    if !obuf.is_null() {
+                        let di = AMediaCodec_dequeueInputBuffer(dec, 50_000);
+                        if di >= 0 {
+                            let mut isz: usize = 0;
+                            let ibuf = AMediaCodec_getInputBuffer(dec, di as usize, &mut isz);
+                            let n = (info.size as usize).min(isz);
+                            if !ibuf.is_null() && n > 0 {
+                                ptr::copy_nonoverlapping(obuf.add(info.offset.max(0) as usize), ibuf, n);
+                                AMediaCodec_queueInputBuffer(dec, di as usize, 0, n, info.presentation_time_us as u64, 0);
+                                dec_fed += 1;
+                            }
+                        }
+                    }
+                }
                 AMediaCodec_releaseOutputBuffer(codec, idx as usize, false);
             } else if idx == INFO_OUTPUT_FORMAT_CHANGED {
                 fmt_changed = true;
             }
             // -1 (try-again) / -3 (buffers-changed): keep polling.
+
+            // Drain whatever the decoder has produced (non-blocking).
+            if decode && !dec.is_null() {
+                let mut di = AMediaCodecBufferInfo { offset: 0, size: 0, presentation_time_us: 0, flags: 0 };
+                for _ in 0..16 {
+                    let didx = AMediaCodec_dequeueOutputBuffer(dec, &mut di, 0);
+                    if didx >= 0 {
+                        if dec_first_ms < 0 { dec_first_ms = start.elapsed().as_millis() as i128; }
+                        dec_frames += 1;
+                        AMediaCodec_releaseOutputBuffer(dec, didx as usize, false);
+                    } else if didx == INFO_OUTPUT_FORMAT_CHANGED {
+                        dec_fmt_changed = true;
+                    } else {
+                        break; // -1 try-again / -3 buffers-changed → nothing right now
+                    }
+                }
+            }
         }
         let secs = start.elapsed().as_secs_f64();
 
@@ -517,11 +604,34 @@ mod android {
         } else {
             p!("VERDICT: camera → HW VP8 encode WORKS under --no-art ✓");
         }
+        if decode {
+            p!("──────── DECODE ────────");
+            p!("decoder          : {}", if dec.is_null() { "NOT created/configured (see FAIL above)" } else { "configured + started" });
+            p!("frames fed→dec   : {dec_fed}");
+            p!("decoded frames   : {dec_frames} in {secs:.1}s = {:.1} fps", dec_frames as f64 / secs);
+            p!("first-decoded    : {dec_first_ms} ms");
+            p!("dec-format-set   : {dec_fmt_changed}");
+            if !dec.is_null() && dec_frames > 0 {
+                p!("VERDICT(decode): HW VP8 DECODE WORKS under --no-art ✓ — full round-trip proven");
+            } else if !dec.is_null() {
+                p!("VERDICT(decode): decoder configured but 0 frames out — fed={dec_fed} \
+                    (decode stalled; check whether the first fed frame was a keyframe)");
+            } else {
+                p!("VERDICT(decode): decoder FAILED to configure/start under --no-art (the blocker)");
+            }
+        }
         if CAM_ERROR.load(Relaxed) {
             p!("camera onError fired: code={}", CAM_ERR_CODE.load(Relaxed));
         }
 
         // 7. Best-effort teardown.
+        if !dec.is_null() {
+            AMediaCodec_stop(dec);
+            AMediaCodec_delete(dec);
+        }
+        if !dec_fmt.is_null() {
+            AMediaFormat_delete(dec_fmt);
+        }
         let _ = AMediaCodec_signalEndOfInputStream(codec);
         ACameraCaptureSession_stopRepeating(session);
         ACameraCaptureSession_close(session);
