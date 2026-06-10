@@ -57,12 +57,14 @@ fn forward(verb: &str, arg: &str) {
     }
 }
 
-/// Build the launcher tile list. Every app under `<APPS_ROOT>/apps/*` (user apps)
-/// is launchable; under `system-apps/*` only the few that opt in with
-/// `show-in-launcher = true` (settings / hub apps — e.g. `wandr.settings.wifi`)
-/// appear, so the pure chrome (statusbar / taskbar / ime / keyguard) stays hidden.
-/// For each, read `label` from the latest version's `package.toml` (falling back
-/// to the app-id). Returns `app-id\tlabel\n` lines, sorted by app-id.
+/// Build the launcher tile list. User apps under `<APPS_ROOT>/apps/*` are launchable
+/// unless they opt out with `show-in-launcher = false`; under `system-apps/*` only the
+/// few that opt in with `show-in-launcher = true` (settings / hub apps — e.g.
+/// `wandr.settings.wifi`) appear, so the pure chrome (statusbar / taskbar / ime /
+/// keyguard) stays hidden. In BOTH roots a `wasi:cli/command` (console) guest is never
+/// listed — it has no renderer, so it can't draw a tile. For each, read `label` from
+/// the latest version's `package.toml` (falling back to the app-id). Returns
+/// `app-id\tlabel\n` lines, sorted by app-id.
 fn scan_installed_apps() -> String {
     let root = crate::app_loader::apps_root();
     let mut entries: Vec<(String, String)> = Vec::new();
@@ -98,34 +100,33 @@ fn collect_apps(dir: &Path, require_flag: bool, out: &mut Vec<(String, String)>)
         }
         let Ok(app_id) = entry.file_name().into_string() else { continue };
         let app_dir = dir.join(&app_id);
-        if require_flag && !read_bool_flag(&app_dir, "show-in-launcher") {
+
+        // A `wasi:cli/command` guest is a console / diagnostic tool — it exports no
+        // renderer, so it can't draw a launcher tile and tapping it does nothing.
+        // Never list it, whether installed under apps/ or system-apps/ (derived from
+        // the declared world, so no per-app flag to remember). A GUI app can still
+        // opt out explicitly with `show-in-launcher = false`.
+        if read_pkg_str(&app_dir, "world").as_deref() == Some("wasi:cli/command") {
             continue;
         }
+        let opt = read_pkg_bool(&app_dir, "show-in-launcher");
+        let listed = if require_flag {
+            opt == Some(true) // system-apps: hidden unless they opt in
+        } else {
+            opt != Some(false) // user apps: shown unless they opt out
+        };
+        if !listed {
+            continue;
+        }
+
         let label = read_label(&app_dir).unwrap_or_else(|| app_id.clone());
         out.push((app_id, label));
     }
 }
 
-/// Read a top-level boolean flag from the lexically-latest version dir's
-/// `package.toml` (the flat wandrpkg manifest). `false` if absent / unreadable.
-fn read_bool_flag(app_dir: &Path, key: &str) -> bool {
-    (|| {
-        let ver = std::fs::read_dir(app_dir)
-            .ok()?
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| e.file_name().into_string().ok())
-            .max()?;
-        let body = std::fs::read_to_string(app_dir.join(&ver).join("package.toml")).ok()?;
-        let val: toml::Value = toml::from_str(&body).ok()?;
-        val.get(key)?.as_bool()
-    })()
-    .unwrap_or(false)
-}
-
-/// Read `[package].label` from the lexically-latest version dir's
-/// `package.toml`. None if absent (caller falls back to the app-id).
-fn read_label(app_dir: &Path) -> Option<String> {
+/// Parse the lexically-latest version dir's flat `package.toml` manifest. None if
+/// the app dir has no version / no readable manifest.
+fn latest_manifest(app_dir: &Path) -> Option<toml::Value> {
     let ver = std::fs::read_dir(app_dir)
         .ok()?
         .flatten()
@@ -133,10 +134,24 @@ fn read_label(app_dir: &Path) -> Option<String> {
         .filter_map(|e| e.file_name().into_string().ok())
         .max()?;
     let body = std::fs::read_to_string(app_dir.join(&ver).join("package.toml")).ok()?;
-    let val: toml::Value = toml::from_str(&body).ok()?;
-    // The wandrpkg manifest is flat (top-level `app_id`/`version`/… keys),
-    // so `label` is a top-level key — not under a `[package]` table.
-    val.get("label")?.as_str().map(|s| s.to_string())
+    toml::from_str(&body).ok()
+}
+
+/// A top-level boolean key from the manifest — `None` if absent / not a bool (so
+/// callers can distinguish "unset" from an explicit `true`/`false`).
+fn read_pkg_bool(app_dir: &Path, key: &str) -> Option<bool> {
+    latest_manifest(app_dir)?.get(key)?.as_bool()
+}
+
+/// A top-level string key from the manifest (e.g. `world`, `label`).
+fn read_pkg_str(app_dir: &Path, key: &str) -> Option<String> {
+    latest_manifest(app_dir)?.get(key)?.as_str().map(|s| s.to_string())
+}
+
+/// Read the flat manifest's top-level `label`. None if absent (caller falls back to
+/// the app-id).
+fn read_label(app_dir: &Path) -> Option<String> {
+    read_pkg_str(app_dir, "label")
 }
 
 /// Connect, write one line, drain + drop the reply, close. Matches the
