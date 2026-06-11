@@ -263,7 +263,7 @@ pub struct SkiaRenderer {
     pub current_orient: u32,
 
     #[cfg(target_os = "android")]
-    egl:        crate::egl::android::EglContext,
+    pub(crate) egl: crate::egl::android::EglContext,
 
     // Each blob carries a content hash (text + font params) so the text-image
     // cache key can distinguish "Count: 5" from "Count: 0" — same bounds,
