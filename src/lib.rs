@@ -709,6 +709,23 @@ impl ApplicationHandler for App {
                         if n < 5 {
                             log::info!("render_frame #{n}: {:?} ok={}", elapsed, result.is_ok());
                         }
+                        // Debug: WANDR_DEBUG_SYNTH_KEY=<text> fires one synthetic
+                        // key-handler event at frame 120 (Compose fully booted) —
+                        // reproduces the device ime-inbound key path without GUI
+                        // input, with the wasm backtrace visible on stderr.
+                        if n == 120 {
+                            if let Ok(t) = std::env::var("WANDR_DEBUG_SYNTH_KEY") {
+                                let ev4 = input::KeyEventV4 {
+                                    down: true, repeat: false,
+                                    code: "KeyZ".to_string(), text: t,
+                                    alt: false, ctrl: false, meta: false, shift: false,
+                                };
+                                match input::dispatch_key_routed(&self.guest_input, s, &ev4) {
+                                    Ok(b) => log::info!("synth-key: dispatched routed={b}"),
+                                    Err(e) => log::error!("synth-key FAILED: {e:?}"),
+                                }
+                            }
+                        }
                         // Always extract Kotlin exception message on error
                         // so late-firing throws are visible in logcat, not
                         // just suppressed past frame 5.
