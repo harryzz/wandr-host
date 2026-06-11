@@ -964,15 +964,33 @@ impl wit_layout::HostParagraph for HostState {
 
 // ─── embedding interface (the wandr reactor-model handoff) ───────────────────
 
+/// The canvas-flavored graphics context (wasi-gfx graphics-context idiom).
+/// One per surface; reactor guests have exactly one, so this is a unit —
+/// the surface binding is implicit (the renderer's presented target).
+pub struct CanvasContextRes;
+
 impl wit_embedding::Host for HostState {
-    fn get_graphics(&mut self) -> wasmtime::Result<Resource<GraphicsRes>> {
+    fn get_context(&mut self) -> wasmtime::Result<Resource<CanvasContextRes>> {
+        Ok(self.table.push(CanvasContextRes)?)
+    }
+}
+
+impl wit_embedding::HostCanvasContext for HostState {
+    fn graphics(
+        &mut self,
+        _self_: Resource<CanvasContextRes>,
+    ) -> wasmtime::Result<Resource<GraphicsRes>> {
         Ok(self.table.push(GraphicsRes)?)
     }
 
     /// Mirror of the skiko-gfx begin-frame policy: make the GL context
     /// current (android), clear to opaque black, re-apply the base
-    /// transform — then hand the guest the Main canvas handle.
-    fn begin_frame(&mut self) -> wasmtime::Result<Resource<CanvasRes>> {
+    /// transform — then hand the guest the Main canvas handle (the
+    /// "current buffer" of this swapchain-shaped context).
+    fn get_current_buffer(
+        &mut self,
+        _self_: Resource<CanvasContextRes>,
+    ) -> wasmtime::Result<Resource<CanvasRes>> {
         #[cfg(target_os = "android")]
         self.renderer.egl.make_current();
         let base = self.renderer.base_matrix;
@@ -983,8 +1001,13 @@ impl wit_embedding::Host for HostState {
         Ok(self.table.push(CanvasRes::Main)?)
     }
 
-    fn end_frame(&mut self) -> wasmtime::Result<()> {
+    fn present(&mut self, _self_: Resource<CanvasContextRes>) -> wasmtime::Result<()> {
         self.renderer.flush_and_swap();
+        Ok(())
+    }
+
+    fn drop(&mut self, rep: Resource<CanvasContextRes>) -> wasmtime::Result<()> {
+        self.table.delete(rep)?;
         Ok(())
     }
 }

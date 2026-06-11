@@ -132,6 +132,7 @@ mod wasi_canvas_bindings {
             "wasi:canvas/types.image": crate::wasi_canvas_impl::ImageRes,
             "wasi:canvas/draw.canvas": crate::wasi_canvas_impl::CanvasRes,
             "wasi:canvas/draw.graphics": crate::wasi_canvas_impl::GraphicsRes,
+            "wasi:canvas/embedding.canvas-context": crate::wasi_canvas_impl::CanvasContextRes,
             "wasi:canvas/draw.picture": crate::wasi_canvas_impl::PictureRes,
             "wasi:canvas/glyphs.typeface": crate::wasi_canvas_impl::TypefaceRes,
             "wasi:canvas/layout.paragraph": crate::wasi_canvas_impl::ParagraphRes,
@@ -715,9 +716,17 @@ impl ApplicationHandler for App {
                         // input, with the wasm backtrace visible on stderr.
                         if n == 120 {
                             if let Ok(t) = std::env::var("WANDR_DEBUG_SYNTH_KEY") {
+                                // payload variants for bisecting the lowering:
+                                // "empty" = both strings empty (skips realloc?),
+                                // "codeonly" = code only, else code+text.
+                                let (code, text) = match t.as_str() {
+                                    "empty" => (String::new(), String::new()),
+                                    "codeonly" => ("KeyZ".to_string(), String::new()),
+                                    _ => ("KeyZ".to_string(), t),
+                                };
                                 let ev4 = input::KeyEventV4 {
                                     down: true, repeat: false,
-                                    code: "KeyZ".to_string(), text: t,
+                                    code, text,
                                     alt: false, ctrl: false, meta: false, shift: false,
                                 };
                                 match input::dispatch_key_routed(&self.guest_input, s, &ev4) {
