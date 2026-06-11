@@ -140,6 +140,33 @@ mod wasi_canvas_bindings {
 #[cfg(feature = "wasi-canvas")]
 mod wasi_canvas_impl;
 
+/// wasi:input-handlers draft (proposals/wasi-input-handlers) — push-model
+/// input EXPORTED by new-style guests. Three independent probe-only
+/// worlds (the frame-pacing pattern); per input type the host routes
+/// EXCLUSIVELY to a bound handler, legacy renderer events only when
+/// unbound. Not feature-gated: probing costs nothing for guests that
+/// don't export them.
+pub mod input_handlers_bindings {
+    pub mod pointer {
+        wasmtime::component::bindgen!({
+            path: "../../proposals/wasi-input-handlers/wit",
+            world: "pointer-handler-world",
+        });
+    }
+    pub mod key {
+        wasmtime::component::bindgen!({
+            path: "../../proposals/wasi-input-handlers/wit",
+            world: "key-handler-world",
+        });
+    }
+    pub mod frame {
+        wasmtime::component::bindgen!({
+            path: "../../proposals/wasi-input-handlers/wit",
+            world: "frame-handler-world",
+        });
+    }
+}
+
 /// Typed bindings for the OPTIONAL `my:skiko-gfx/key-input` export — the
 /// W3C-UIEvents key model (code token + modifiers + text) for guests that
 /// want desktop-grade keyboards (see the interface doc in skiko-gfx.wit).
@@ -381,6 +408,8 @@ pub struct App {
     // Some(...) only if the guest exports my:skiko-gfx/key-input (the W3C
     // key model — this winit path IS the desktop host it exists for).
     key_input:       Option<key_input_bindings::KeyInputWorld>,
+    // wasi:input-handlers probes — exclusive routing per input type.
+    guest_input:     input::GuestInput,
     // Renderer owned directly when running without a WASM component.
     test_renderer:   Option<canvas_impl::SkiaRenderer>,
     last_cursor:     (f32, f32),
@@ -423,6 +452,7 @@ impl App {
             store: None,
             bindings: None,
             key_input: None,
+            guest_input: input::GuestInput::default(),
             test_renderer: None,
             last_cursor: (0.0, 0.0),
             modifiers: winit::keyboard::ModifiersState::default(),
@@ -576,6 +606,7 @@ impl ApplicationHandler for App {
             self.store    = Some(store);
             self.bindings = Some(inst.skiko);
             self.key_input = inst.key_input;
+            self.guest_input = inst.guest_input;
         } else {
             log::info!("no WASM component — running in renderer-test mode");
             self.test_renderer = Some(renderer);
@@ -626,7 +657,7 @@ impl ApplicationHandler for App {
                     }
 
                     let t0 = std::time::Instant::now();
-                    let result = b.my_skiko_gfx_renderer().call_render_frame(&mut *s, nanos);
+                    let result = input::dispatch_frame(b, &mut *s, &self.guest_input, nanos);
 
                     // Fire any pending lifecycle transition AFTER the first
                     // render_frame succeeds (gives appMain a chance to register
@@ -755,7 +786,7 @@ impl ApplicationHandler for App {
                 // laid out for the stale size — found via Slint on WSLg:
                 // the ListView collapsed to the pre-resize zero leftover).
                 if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
-                    let _ = input::dispatch_resize(b, s, size.width, size.height);
+                    let _ = input::dispatch_resize_routed(b, s, &self.guest_input, size.width, size.height);
                 }
                 if let Some(w) = &self.window { w.request_redraw(); }
             }
@@ -780,10 +811,10 @@ impl ApplicationHandler for App {
                 };
                 let pointer_id: u32 = (t.id & 0xFFFF_FFFF) as u32;
                 if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
-                    let _ = input::dispatch_pointer_v2(
-                        b, s, kind, pointer_id,
+                    let _ = input::dispatch_pointer_routed(
+                        b, s, &self.guest_input, kind, pointer_id,
                         t.location.x as f32, t.location.y as f32,
-                        pressure,
+                        pressure, [false; 4],
                     );
                 }
                 if let Some(w) = &self.window { w.request_redraw(); }
@@ -791,11 +822,15 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_cursor = (position.x as f32, position.y as f32);
+                let mods = [
+                    self.modifiers.alt_key(), self.modifiers.control_key(),
+                    self.modifiers.super_key(), self.modifiers.shift_key(),
+                ];
                 if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
-                    let _ = input::dispatch_pointer_v2(
-                        b, s, 2, 0,
+                    let _ = input::dispatch_pointer_routed(
+                        b, s, &self.guest_input, 2, 0,
                         self.last_cursor.0, self.last_cursor.1,
-                        0.0,
+                        0.0, mods,
                     );
                 }
             }
@@ -803,8 +838,12 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, .. } => {
                 let kind: u8 = if state == ElementState::Pressed { 0 } else { 1 };
                 let (cx, cy) = self.last_cursor;
+                let mods = [
+                    self.modifiers.alt_key(), self.modifiers.control_key(),
+                    self.modifiers.super_key(), self.modifiers.shift_key(),
+                ];
                 if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
-                    let _ = input::dispatch_pointer_v2(b, s, kind, 0, cx, cy, 1.0);
+                    let _ = input::dispatch_pointer_routed(b, s, &self.guest_input, kind, 0, cx, cy, 1.0, mods);
                 }
                 if let Some(w) = &self.window { w.request_redraw(); }
             }
@@ -848,19 +887,34 @@ impl ApplicationHandler for App {
                     _ => 0,  // Unknown — guest falls back to code-point if non-zero
                 };
                 if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                    // winit's KeyCode variants are NAMED after the W3C
+                    // UIEvents code tokens — the Debug name IS the token.
+                    let w3c_code = match event.physical_key {
+                        PhysicalKey::Code(c) => format!("{c:?}"),
+                        _ => String::new(),
+                    };
+                    let text = event.text.as_ref().map(|t| t.to_string()).unwrap_or_default();
+                    // wasi:input-handlers key-handler supersedes everything.
+                    let ev4 = input::KeyEventV4 {
+                        down: kind == 0,
+                        repeat: event.repeat,
+                        code: w3c_code.clone(),
+                        text: text.clone(),
+                        alt: self.modifiers.alt_key(),
+                        ctrl: self.modifiers.control_key(),
+                        meta: self.modifiers.super_key(),
+                        shift: self.modifiers.shift_key(),
+                    };
+                    if matches!(input::dispatch_key_routed(&self.guest_input, s, &ev4), Ok(true)) {
+                        return;
+                    }
                     let _ = input::dispatch_key(b, s, kind, code);
                     let _ = input::dispatch_key_v2(b, s, kind, code_point, key_id);
-                    // v3 (optional): the W3C model. winit's KeyCode variants
-                    // are NAMED after the W3C UIEvents code tokens, so the
-                    // Debug name IS the token ("KeyA", "ArrowLeft", …).
                     let ev3 = key_input_bindings::exports::my::skiko_gfx::key_input::KeyEvent {
                         down: kind == 0,
                         repeat: event.repeat,
-                        code: match event.physical_key {
-                            PhysicalKey::Code(c) => format!("{c:?}"),
-                            _ => String::new(),
-                        },
-                        text: event.text.as_ref().map(|t| t.to_string()).unwrap_or_default(),
+                        code: w3c_code,
+                        text,
                         alt: self.modifiers.alt_key(),
                         ctrl: self.modifiers.control_key(),
                         meta: self.modifiers.super_key(),

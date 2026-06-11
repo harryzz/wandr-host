@@ -3,6 +3,22 @@ use wasmtime::Store;
 use crate::HostState;
 use crate::bindings::SkikoUi;
 use crate::bindings::exports::my::skiko_gfx::renderer::{KeyKind, PointerKind};
+use crate::input_handlers_bindings as ih;
+
+/// Per-guest wasi:input-handlers probes (proposals/wasi-input-handlers).
+/// Per input type, dispatch routes EXCLUSIVELY to a bound handler — a
+/// guest that exports the new model never also receives the legacy
+/// renderer events, so no guest-side de-dup is needed.
+#[derive(Default)]
+pub struct GuestInput {
+    pub pointer: Option<ih::pointer::PointerHandlerWorld>,
+    pub key: Option<ih::key::KeyHandlerWorld>,
+    pub frame: Option<ih::frame::FrameHandlerWorld>,
+}
+
+pub type PointerEventV4 = ih::pointer::exports::wasi::input_handlers::pointer_handler::PointerEvent;
+pub type PointerKindV4 = ih::pointer::exports::wasi::input_handlers::pointer_handler::Kind;
+pub type KeyEventV4 = ih::key::exports::wasi::input_handlers::key_handler::KeyEvent;
 
 /// Touch-suppression gate (task 79). When set, all pointer dispatch is dropped
 /// — used during a proximity screen-off (call at the ear) so a cheek/ear touch
@@ -70,8 +86,44 @@ pub fn dispatch_pointer_v2(
     x: f32, y: f32,
     pressure: f32,
 ) -> anyhow::Result<()> {
+    dispatch_pointer_routed(bindings, store, &GuestInput::default(), kind, pointer_id, x, y, pressure, [false; 4])
+}
+
+/// Pointer dispatch with wasi:input-handlers routing: a bound
+/// pointer-handler receives the event EXCLUSIVELY (kind=cancel and
+/// scroll deltas only exist on this path); otherwise legacy v1+v2.
+/// `mods` = [alt, ctrl, meta, shift] (desktop; touch passes false).
+pub fn dispatch_pointer_routed(
+    bindings: &SkikoUi,
+    store: &mut Store<HostState>,
+    guest_input: &GuestInput,
+    kind: u8,
+    pointer_id: u32,
+    x: f32, y: f32,
+    pressure: f32,
+    mods: [bool; 4],
+) -> anyhow::Result<()> {
     // Task 79 — drop touch while the panel is blanked for proximity.
     if touch_suppressed() {
+        return Ok(());
+    }
+    if let Some(ph) = &guest_input.pointer {
+        let ev = PointerEventV4 {
+            id: pointer_id,
+            kind: match kind {
+                0 => PointerKindV4::Down,
+                1 => PointerKindV4::Up,
+                2 => PointerKindV4::Move,
+                4 => PointerKindV4::Cancel,
+                _ => PointerKindV4::Scroll,
+            },
+            x, y,
+            pressure,
+            scroll_dx: 0.0,
+            scroll_dy: 0.0,
+            alt: mods[0], ctrl: mods[1], meta: mods[2], shift: mods[3],
+        };
+        ph.wasi_input_handlers_pointer_handler().call_on_pointer(store, ev)?;
         return Ok(());
     }
     let pk = match kind {
@@ -83,6 +135,52 @@ pub fn dispatch_pointer_v2(
     let r = bindings.my_skiko_gfx_renderer();
     r.call_on_pointer_event(&mut *store, pk, x, y)?;
     r.call_on_pointer_event_v2(store, pointer_id, pk, x, y, pressure)?;
+    Ok(())
+}
+
+/// Key dispatch with wasi:input-handlers routing: a bound key-handler
+/// receives the W3C-model event EXCLUSIVELY; otherwise legacy v1+v2 (+
+/// my:skiko-gfx key-input when that probe bound).
+pub fn dispatch_key_routed(
+    guest_input: &GuestInput,
+    store: &mut Store<HostState>,
+    ev: &KeyEventV4,
+) -> anyhow::Result<bool> {
+    if let Some(kh) = &guest_input.key {
+        kh.wasi_input_handlers_key_handler().call_on_key(store, ev)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Frame dispatch: a bound frame-handler owns render driving; else the
+/// legacy renderer.render-frame. Returns the call result either way.
+pub fn dispatch_frame(
+    bindings: &SkikoUi,
+    store: &mut Store<HostState>,
+    guest_input: &GuestInput,
+    nanos: u64,
+) -> anyhow::Result<()> {
+    if let Some(fh) = &guest_input.frame {
+        fh.wasi_input_handlers_frame_handler().call_on_frame(store, nanos)?;
+    } else {
+        bindings.my_skiko_gfx_renderer().call_render_frame(store, nanos)?;
+    }
+    Ok(())
+}
+
+/// Resize dispatch: a bound frame-handler receives it EXCLUSIVELY.
+pub fn dispatch_resize_routed(
+    bindings: &SkikoUi,
+    store: &mut Store<HostState>,
+    guest_input: &GuestInput,
+    w: u32, h: u32,
+) -> anyhow::Result<()> {
+    if let Some(fh) = &guest_input.frame {
+        fh.wasi_input_handlers_frame_handler().call_on_resize(store, w, h)?;
+    } else {
+        bindings.my_skiko_gfx_renderer().call_on_resize(store, w, h)?;
+    }
     Ok(())
 }
 
@@ -124,11 +222,27 @@ pub fn dispatch_key_v2(
 pub fn dispatch_android_key(
     bindings: &SkikoUi,
     store: &mut Store<HostState>,
+    guest_input: &GuestInput,
     key_input: Option<&crate::key_input_bindings::KeyInputWorld>,
     kind: u8, key_code: i32, meta_state: i32,
 ) -> anyhow::Result<()> {
     let shift = (meta_state & AMETA_SHIFT_ON) != 0;
     let (code_point, key_id) = map_android_keycode(key_code, shift);
+    // wasi:input-handlers key-handler supersedes every legacy path.
+    let ev4 = KeyEventV4 {
+        down: kind == 0,
+        repeat: false,
+        code: android_keycode_to_w3c(key_code),
+        text: char::from_u32(code_point).filter(|c| *c != '\0').map(String::from)
+            .unwrap_or_default(),
+        alt: (meta_state & AMETA_ALT_ON) != 0,
+        ctrl: (meta_state & AMETA_CTRL_ON) != 0,
+        meta: (meta_state & AMETA_META_ON) != 0,
+        shift,
+    };
+    if dispatch_key_routed(guest_input, store, &ev4)? {
+        return Ok(());
+    }
     let r = bindings.my_skiko_gfx_renderer();
     // v1 carries the raw AKEYCODE so callers that wired against it still work.
     let kk = if kind == 0 { KeyKind::Down } else { KeyKind::Up };

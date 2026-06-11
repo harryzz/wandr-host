@@ -579,6 +579,8 @@ fn run_cwasm_loop(
     let frame_pacing = inst.frame_pacing;
     // Some(...) only if the guest exports my:skiko-gfx/key-input (W3C key model).
     let key_input = inst.key_input;
+    // wasi:input-handlers probes — exclusive routing per input type.
+    let guest_input = inst.guest_input;
     // Signal bg-receipt (M2) — a background-service keeps pumping its engine
     // (`bg-tick`) while backgrounded instead of freezing. `bg_service` is the
     // manifest opt-in; `bg_tick` is the typed export (both required to pump).
@@ -608,9 +610,7 @@ fn run_cwasm_loop(
 
     // Tell the guest the surface size before the first frame, so Compose lays
     // out to the full panel (no winit `Resized` event to do this for us).
-    if let Err(e) = skiko
-        .my_skiko_gfx_renderer()
-        .call_on_resize(&mut store, logical_w, logical_h)
+    if let Err(e) = crate::input::dispatch_resize_routed(&skiko, &mut store, &guest_input, logical_w, logical_h)
     {
         log::warn!("standalone: on_resize({logical_w}x{logical_h}) failed: {e:#}");
     }
@@ -860,9 +860,7 @@ fn run_cwasm_loop(
                         let r = &store.data().renderer;
                         (r.logical_width, r.logical_height)
                     };
-                    if let Err(e) = skiko
-                        .my_skiko_gfx_renderer()
-                        .call_on_resize(&mut store, lw, lh)
+                    if let Err(e) = crate::input::dispatch_resize_routed(&skiko, &mut store, &guest_input, lw, lh)
                     {
                         log::warn!("standalone: overlay-resize on_resize({lw}x{lh}) failed: {e:#}");
                     }
@@ -910,9 +908,7 @@ fn run_cwasm_loop(
                     (r.logical_width, r.logical_height)
                 };
                 log::info!("standalone: orient change → {target_orient} logical {lw}x{lh}");
-                if let Err(e) = skiko
-                    .my_skiko_gfx_renderer()
-                    .call_on_resize(&mut store, lw, lh)
+                if let Err(e) = crate::input::dispatch_resize_routed(&skiko, &mut store, &guest_input, lw, lh)
                 {
                     log::warn!("standalone: rotation on_resize({lw}x{lh}) failed: {e:#}");
                 }
@@ -947,9 +943,9 @@ fn run_cwasm_loop(
                         None => (ev.x, ev.y),
                     }
                 };
-                if let Err(e) = crate::input::dispatch_pointer_v2(
-                    &skiko, &mut store, ev.kind as u8,
-                    ev.pointer_id as u32, lx, ly, ev.pressure,
+                if let Err(e) = crate::input::dispatch_pointer_routed(
+                    &skiko, &mut store, &guest_input, ev.kind as u8,
+                    ev.pointer_id as u32, lx, ly, ev.pressure, [false; 4],
                 ) {
                     log::warn!("standalone: dispatch_pointer_v2 failed: {e:#}");
                 }
@@ -978,7 +974,7 @@ fn run_cwasm_loop(
                 } else {
                     let action = if ev.kind == 10 { 0u8 } else { 1u8 };
                     if let Err(e) = crate::input::dispatch_android_key(
-                        &skiko, &mut store, key_input.as_ref(), action, ev.key_code, ev.meta_state,
+                        &skiko, &mut store, &guest_input, key_input.as_ref(), action, ev.key_code, ev.meta_state,
                     ) {
                         log::warn!("standalone: dispatch_android_key failed: {e:#}");
                     }
@@ -993,6 +989,23 @@ fn run_cwasm_loop(
             dirty = true; // task 64 — IME key/editor event wants a frame
             match ev {
                 crate::ime_inbound::InboundEvent::KeyEvent { code_point, key_id, action } => {
+                    // wasi:input-handlers key-handler supersedes legacy.
+                    let ev4 = crate::input::KeyEventV4 {
+                        down: action == 0,
+                        repeat: false,
+                        code: crate::input::key_id_to_w3c(key_id).to_string(),
+                        text: char::from_u32(code_point).filter(|c| *c != '\0')
+                            .map(String::from).unwrap_or_default(),
+                        alt: false, ctrl: false, meta: false, shift: false,
+                    };
+                    match crate::input::dispatch_key_routed(&guest_input, &mut store, &ev4) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(e) => {
+                            log::warn!("standalone: key-handler (ime-inbound) failed: {e:#}");
+                            continue;
+                        }
+                    }
                     if let Err(e) = crate::input::dispatch_key_v2(
                         &skiko, &mut store, action, code_point, key_id,
                     ) {
@@ -1228,9 +1241,7 @@ fn run_cwasm_loop(
                         let r = &store.data().renderer;
                         (r.logical_width, r.logical_height)
                     };
-                    if let Err(e) = skiko
-                        .my_skiko_gfx_renderer()
-                        .call_on_resize(&mut store, lw, lh)
+                    if let Err(e) = crate::input::dispatch_resize_routed(&skiko, &mut store, &guest_input, lw, lh)
                     {
                         log::warn!("standalone: keyboard-inset on_resize({lw}x{lh}) failed: {e:#}");
                     }
@@ -1297,9 +1308,7 @@ fn run_cwasm_loop(
                         let r = &store.data().renderer;
                         (r.logical_width, r.logical_height)
                     };
-                    if let Err(e) = skiko
-                        .my_skiko_gfx_renderer()
-                        .call_on_resize(&mut store, lw, lh)
+                    if let Err(e) = crate::input::dispatch_resize_routed(&skiko, &mut store, &guest_input, lw, lh)
                     {
                         log::warn!("standalone: geometry on_resize({lw}x{lh}) failed: {e:#}");
                     }
@@ -1371,9 +1380,7 @@ fn run_cwasm_loop(
         // skip the expensive render_frame + buffer swap; bg-tick keeps it alive).
         let backgrounded = matches!(cur_role, crate::app_role::AppRole::Background);
         if !backgrounded && (frame < 3 || std::time::Instant::now() >= next_render_at || dirty) {
-            let result = skiko
-                .my_skiko_gfx_renderer()
-                .call_render_frame(&mut store, nanos);
+            let result = crate::input::dispatch_frame(&skiko, &mut store, &guest_input, nanos);
 
             // Fire the pending lifecycle transition after the first successful
             // frame (gives appMain a chance to register its observer first).
@@ -1497,9 +1504,7 @@ fn run_cwasm_loop(
         .unwrap_or_default()
         .as_nanos() as u64;
     for _ in 0..3 {
-        if let Err(e) = skiko
-            .my_skiko_gfx_renderer()
-            .call_render_frame(&mut store, drain_nanos)
+        if let Err(e) = crate::input::dispatch_frame(&skiko, &mut store, &guest_input, drain_nanos)
         {
             log::warn!("standalone: drain render_frame failed: {e:#}");
             break;

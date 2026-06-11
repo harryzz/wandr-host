@@ -233,6 +233,9 @@ pub struct InstantiatedApp {
     /// token + modifiers + text). Key dispatch emits v1 + v2 always and
     /// additionally `on-key` on these; `None` = mobile-shaped v2 only.
     pub key_input: Option<crate::key_input_bindings::KeyInputWorld>,
+    /// wasi:input-handlers probes (push-model input; new-style guests).
+    /// Per input type, dispatch routes EXCLUSIVELY to a bound handler.
+    pub guest_input: crate::input::GuestInput,
     /// Arbiter Inc. 3c — `Some(...)` if the component exports
     /// `wandr:alarm/alarm-handler`. `ime_inbound`'s `alarm-fired` drain calls
     /// `on-alarm(id)` on these; `None` for guests that don't use alarms.
@@ -330,6 +333,18 @@ impl LoadedApp {
         if key_input.is_some() {
             log::info!("loader: app exports my:skiko-gfx/key-input — desktop key events enabled");
         }
+        // wasi:input-handlers probes (each interface independently).
+        let guest_input = crate::input::GuestInput {
+            pointer: crate::input_handlers_bindings::pointer::PointerHandlerWorld::new(&mut *store, &instance).ok(),
+            key: crate::input_handlers_bindings::key::KeyHandlerWorld::new(&mut *store, &instance).ok(),
+            frame: crate::input_handlers_bindings::frame::FrameHandlerWorld::new(&mut *store, &instance).ok(),
+        };
+        if guest_input.pointer.is_some() || guest_input.key.is_some() || guest_input.frame.is_some() {
+            log::info!(
+                "loader: app exports wasi:input-handlers (pointer={} key={} frame={})",
+                guest_input.pointer.is_some(), guest_input.key.is_some(), guest_input.frame.is_some(),
+            );
+        }
         // Arbiter Inc. 3c — optional alarm handler (same .ok() probe).
         let alarm_events =
             crate::alarm_events_bindings::AlarmEvents::new(&mut *store, &instance).ok();
@@ -361,8 +376,8 @@ impl LoadedApp {
             log::info!("loader: app exports wandr:events/incoming-handler — event-bus delivery enabled");
         }
         Ok(InstantiatedApp {
-            skiko, ime_events, frame_pacing, key_input, alarm_events, bg_tick, notify_events,
-            audio_focus_events, events_incoming,
+            skiko, ime_events, frame_pacing, key_input, guest_input, alarm_events, bg_tick,
+            notify_events, audio_focus_events, events_incoming,
         })
     }
 
