@@ -124,6 +124,7 @@ pub fn dispatch_key_v2(
 pub fn dispatch_android_key(
     bindings: &SkikoUi,
     store: &mut Store<HostState>,
+    key_input: Option<&crate::key_input_bindings::KeyInputWorld>,
     kind: u8, key_code: i32, meta_state: i32,
 ) -> anyhow::Result<()> {
     let shift = (meta_state & AMETA_SHIFT_ON) != 0;
@@ -132,12 +133,123 @@ pub fn dispatch_android_key(
     // v1 carries the raw AKEYCODE so callers that wired against it still work.
     let kk = if kind == 0 { KeyKind::Down } else { KeyKind::Up };
     r.call_on_key_event(&mut *store, kk, key_code.max(0) as u32)?;
-    r.call_on_key_event_v2(store, kk, code_point, key_id)?;
+    r.call_on_key_event_v2(&mut *store, kk, code_point, key_id)?;
+    // v3 (optional): the W3C model — physical code token + full meta bits.
+    let ev = crate::key_input_bindings::exports::my::skiko_gfx::key_input::KeyEvent {
+        down: kind == 0,
+        repeat: false, // InputFlinger repeat events arrive as fresh downs here
+        code: android_keycode_to_w3c(key_code),
+        text: char::from_u32(code_point).filter(|c| *c != '\0').map(String::from)
+            .unwrap_or_default(),
+        alt: (meta_state & AMETA_ALT_ON) != 0,
+        ctrl: (meta_state & AMETA_CTRL_ON) != 0,
+        meta: (meta_state & AMETA_META_ON) != 0,
+        shift,
+    };
+    dispatch_key_v3(key_input, store, &ev)?;
     Ok(())
 }
 
 // AMETA_* bits from <android/input.h>.
 const AMETA_SHIFT_ON: i32 = 0x01;
+const AMETA_ALT_ON: i32 = 0x02;
+const AMETA_CTRL_ON: i32 = 0x1000;
+const AMETA_META_ON: i32 = 0x10000;
+
+/// The optional v3 key dispatch — the W3C UIEvents model (`key-input`
+/// interface: code token + modifiers + text). No-op when the guest
+/// doesn't export it; emitted IN ADDITION to v1/v2 by every key path.
+pub fn dispatch_key_v3(
+    key_input: Option<&crate::key_input_bindings::KeyInputWorld>,
+    store: &mut Store<HostState>,
+    ev: &crate::key_input_bindings::exports::my::skiko_gfx::key_input::KeyEvent,
+) -> anyhow::Result<()> {
+    if let Some(ki) = key_input {
+        ki.my_skiko_gfx_key_input().call_on_key(store, ev)?;
+    }
+    Ok(())
+}
+
+/// W3C UIEvents `code` token for an Android `AKEYCODE_*`
+/// (https://w3c.github.io/uievents-code/). "" = unidentified.
+fn android_keycode_to_w3c(code: i32) -> String {
+    // Letters: AKEYCODE_A=29 .. AKEYCODE_Z=54 → "KeyA".."KeyZ"
+    if (29..=54).contains(&code) {
+        return format!("Key{}", (b'A' + (code as u8 - 29)) as char);
+    }
+    // Digits: AKEYCODE_0=7 .. AKEYCODE_9=16 → "Digit0".."Digit9"
+    if (7..=16).contains(&code) {
+        return format!("Digit{}", (b'0' + (code as u8 - 7)) as char);
+    }
+    match code {
+        62 => "Space",
+        67 => "Backspace",
+        66 => "Enter",
+        160 => "NumpadEnter", // AKEYCODE_NUMPAD_ENTER
+        61 => "Tab",
+        111 => "Escape",
+        21 => "ArrowLeft",
+        19 => "ArrowUp",
+        22 => "ArrowRight",
+        20 => "ArrowDown",
+        92 => "PageUp",
+        93 => "PageDown",
+        122 => "Home",
+        123 => "End",
+        124 => "Insert",
+        112 => "Delete",
+        55 => "Comma",
+        56 => "Period",
+        74 => "Semicolon",
+        75 => "Quote",
+        76 => "Slash",
+        73 => "Backslash",
+        69 => "Minus",
+        70 => "Equal",
+        68 => "Backquote",
+        71 => "BracketLeft",
+        72 => "BracketRight",
+        115 => "CapsLock",
+        59 => "ShiftLeft",
+        60 => "ShiftRight",
+        57 => "AltLeft",
+        58 => "AltRight",
+        113 => "ControlLeft",
+        114 => "ControlRight",
+        117 => "MetaLeft",
+        118 => "MetaRight",
+        24 => "AudioVolumeUp",
+        25 => "AudioVolumeDown",
+        164 => "AudioVolumeMute",
+        26 => "Power",
+        _ => "",
+    }
+    .to_string()
+}
+
+/// W3C UIEvents `code` token for a Compose-webMain `key-id` (the soft-
+/// keyboard / IME wire format — no physical key, so only the named keys
+/// map; printable text rides the code-point instead).
+pub fn key_id_to_w3c(key_id: u32) -> &'static str {
+    match key_id {
+        8 => "Backspace",
+        9 => "Tab",
+        13 => "Enter",
+        27 => "Escape",
+        32 => "Space",
+        33 => "PageUp",
+        34 => "PageDown",
+        35 => "End",
+        36 => "Home",
+        37 => "ArrowLeft",
+        38 => "ArrowUp",
+        39 => "ArrowRight",
+        40 => "ArrowDown",
+        45 => "Insert",
+        46 => "Delete",
+        _ => "",
+    }
+}
 
 /// Translate Android `AKEYCODE_*` into (code-point, key-id) for the guest's
 /// `on-key-event-v2`. Mirrors the winit `KeyboardInput` branch in

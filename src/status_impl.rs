@@ -13,7 +13,15 @@ use crate::bindings::my::skiko_gfx::status::Host;
 /// Delegates to the standalone chrome-height cache (dp×density fallback if the
 /// arbiter hasn't provided one yet).
 pub fn status_bar_height_px() -> u32 {
-    crate::standalone::status_bar_height_px()
+    #[cfg(target_os = "android")]
+    {
+        crate::standalone::status_bar_height_px()
+    }
+    // Desktop (winit dev host): no arbiter chrome — no status-bar inset.
+    #[cfg(not(target_os = "android"))]
+    {
+        0
+    }
 }
 
 impl Host for crate::HostState {

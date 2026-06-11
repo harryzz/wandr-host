@@ -42,15 +42,28 @@ pub enum CryptoError {
 }
 
 // ── HW capability detection (HWCAP via cpufeatures) ──────────────────────────
+// The "aes"/"sha2" tokens are aarch64-only in cpufeatures — gate so the
+// x86_64 DESKTOP host (the winit/Wayland dev path) builds again; off-device
+// the RustCrypto software paths serve, so capability queries report false.
 
-cpufeatures::new!(cpu_aes, "aes");
-cpufeatures::new!(cpu_sha2, "sha2");
+#[cfg(target_arch = "aarch64")]
+mod hwcap {
+    cpufeatures::new!(cpu_aes, "aes");
+    cpufeatures::new!(cpu_sha2, "sha2");
+    pub fn hw_aes() -> bool { cpu_aes::get() }
+    pub fn hw_sha2() -> bool { cpu_sha2::get() }
+}
+#[cfg(not(target_arch = "aarch64"))]
+mod hwcap {
+    pub fn hw_aes() -> bool { false }
+    pub fn hw_sha2() -> bool { false }
+}
 
-pub fn hw_aes() -> bool { cpu_aes::get() }
-pub fn hw_sha2() -> bool { cpu_sha2::get() }
+pub fn hw_aes() -> bool { hwcap::hw_aes() }
+pub fn hw_sha2() -> bool { hwcap::hw_sha2() }
 /// ARMv8-A SHA-1 and SHA-2 ship as one crypto-extension group; `cpufeatures` only
 /// exposes a `sha2` aarch64 token, so we report SHA-1 HW by the same flag.
-pub fn hw_sha1() -> bool { cpu_sha2::get() }
+pub fn hw_sha1() -> bool { hwcap::hw_sha2() }
 
 /// Constant-time byte compare (length leak only — acceptable for MAC tags).
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {

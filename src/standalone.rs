@@ -577,6 +577,8 @@ fn run_cwasm_loop(
     let events_incoming = inst.events_incoming;
     // Task 64 — Some(...) only if the guest exports my:skiko-gfx/frame-pacing.
     let frame_pacing = inst.frame_pacing;
+    // Some(...) only if the guest exports my:skiko-gfx/key-input (W3C key model).
+    let key_input = inst.key_input;
     // Signal bg-receipt (M2) — a background-service keeps pumping its engine
     // (`bg-tick`) while backgrounded instead of freezing. `bg_service` is the
     // manifest opt-in; `bg_tick` is the typed export (both required to pump).
@@ -976,7 +978,7 @@ fn run_cwasm_loop(
                 } else {
                     let action = if ev.kind == 10 { 0u8 } else { 1u8 };
                     if let Err(e) = crate::input::dispatch_android_key(
-                        &skiko, &mut store, action, ev.key_code, ev.meta_state,
+                        &skiko, &mut store, key_input.as_ref(), action, ev.key_code, ev.meta_state,
                     ) {
                         log::warn!("standalone: dispatch_android_key failed: {e:#}");
                     }
@@ -995,6 +997,19 @@ fn run_cwasm_loop(
                         &skiko, &mut store, action, code_point, key_id,
                     ) {
                         log::warn!("standalone: dispatch_key_v2 (ime-inbound) failed: {e:#}");
+                    }
+                    // v3 (optional): soft-keyboard keys have no physical
+                    // code; named keys map via key-id, text via code-point.
+                    let ev3 = crate::key_input_bindings::exports::my::skiko_gfx::key_input::KeyEvent {
+                        down: action == 0,
+                        repeat: false,
+                        code: crate::input::key_id_to_w3c(key_id).to_string(),
+                        text: char::from_u32(code_point).filter(|c| *c != '\0')
+                            .map(String::from).unwrap_or_default(),
+                        alt: false, ctrl: false, meta: false, shift: false,
+                    };
+                    if let Err(e) = crate::input::dispatch_key_v3(key_input.as_ref(), &mut store, &ev3) {
+                        log::warn!("standalone: dispatch_key_v3 (ime-inbound) failed: {e:#}");
                     }
                 }
                 // Task 49 step 1a — IME-bound events. Only meaningful

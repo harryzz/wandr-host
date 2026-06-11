@@ -228,6 +228,11 @@ pub struct InstantiatedApp {
     /// calls `next-frame-delay` after each frame to gate on-demand
     /// rendering; `None` keeps the legacy unconditional 60 fps path.
     pub frame_pacing: Option<crate::frame_pacing_bindings::FramePacingWorld>,
+    /// `Some(...)` if the component exports the optional
+    /// `my:skiko-gfx/key-input` interface (W3C-UIEvents key model: code
+    /// token + modifiers + text). Key dispatch emits v1 + v2 always and
+    /// additionally `on-key` on these; `None` = mobile-shaped v2 only.
+    pub key_input: Option<crate::key_input_bindings::KeyInputWorld>,
     /// Arbiter Inc. 3c — `Some(...)` if the component exports
     /// `wandr:alarm/alarm-handler`. `ime_inbound`'s `alarm-fired` drain calls
     /// `on-alarm(id)` on these; `None` for guests that don't use alarms.
@@ -316,6 +321,12 @@ impl LoadedApp {
         if frame_pacing.is_some() {
             log::info!("loader: app exports my:skiko-gfx/frame-pacing — on-demand rendering enabled");
         }
+        // Optional W3C-UIEvents key model (same .ok() probe).
+        let key_input =
+            crate::key_input_bindings::KeyInputWorld::new(&mut *store, &instance).ok();
+        if key_input.is_some() {
+            log::info!("loader: app exports my:skiko-gfx/key-input — desktop key events enabled");
+        }
         // Arbiter Inc. 3c — optional alarm handler (same .ok() probe).
         let alarm_events =
             crate::alarm_events_bindings::AlarmEvents::new(&mut *store, &instance).ok();
@@ -347,8 +358,8 @@ impl LoadedApp {
             log::info!("loader: app exports wandr:events/incoming-handler — event-bus delivery enabled");
         }
         Ok(InstantiatedApp {
-            skiko, ime_events, frame_pacing, alarm_events, bg_tick, notify_events, audio_focus_events,
-            events_incoming,
+            skiko, ime_events, frame_pacing, key_input, alarm_events, bg_tick, notify_events,
+            audio_focus_events, events_incoming,
         })
     }
 

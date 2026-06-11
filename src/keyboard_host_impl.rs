@@ -57,6 +57,7 @@ impl Host for crate::HostState {
         log::debug!(
             "keyboard-host: request-overlay-height({height_px}) queued"
         );
+        #[cfg(target_os = "android")]
         crate::sf_surface::request_overlay_resize(height_px as i32);
         // Task 68 — make the IME the source of truth for the keyboard inset: tell
         // the arbiter our portrait-reference height so it pushes the matching

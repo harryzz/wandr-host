@@ -116,6 +116,18 @@ mod frame_pacing_bindings {
     });
 }
 
+/// Typed bindings for the OPTIONAL `my:skiko-gfx/key-input` export — the
+/// W3C-UIEvents key model (code token + modifiers + text) for guests that
+/// want desktop-grade keyboards (see the interface doc in skiko-gfx.wit).
+/// Probed after instantiation like `frame_pacing_bindings`; hosts emit
+/// v1 + v2 + (v3 when bound) for every keystroke.
+pub mod key_input_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/skiko-gfx.wit",
+        world: "key-input-world",
+    });
+}
+
 /// Arbiter Inc. 3c — host-import side of `wandr:alarm`. The host implements
 /// `scheduler` (schedule/cancel → forwarded to the arbiter; see
 /// `alarm_host_impl.rs`) and `add_to_linker`s it onto every guest's linker.
@@ -342,9 +354,14 @@ pub struct App {
     loaded:          Option<LoadedApp>,
     store:           Option<Store<HostState>>,
     bindings:        Option<bindings::SkikoUi>,
+    // Some(...) only if the guest exports my:skiko-gfx/key-input (the W3C
+    // key model — this winit path IS the desktop host it exists for).
+    key_input:       Option<key_input_bindings::KeyInputWorld>,
     // Renderer owned directly when running without a WASM component.
     test_renderer:   Option<canvas_impl::SkiaRenderer>,
     last_cursor:     (f32, f32),
+    // Live modifier state (winit reports it as a separate event stream).
+    modifiers:       winit::keyboard::ModifiersState,
 }
 
 impl App {
@@ -381,8 +398,10 @@ impl App {
             loaded,
             store: None,
             bindings: None,
+            key_input: None,
             test_renderer: None,
             last_cursor: (0.0, 0.0),
+            modifiers: winit::keyboard::ModifiersState::default(),
         }
     }
 
@@ -508,6 +527,7 @@ impl ApplicationHandler for App {
 
             self.store    = Some(store);
             self.bindings = Some(inst.skiko);
+            self.key_input = inst.key_input;
         } else {
             log::info!("no WASM component — running in renderer-test mode");
             self.test_renderer = Some(renderer);
@@ -775,7 +795,28 @@ impl ApplicationHandler for App {
                 if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
                     let _ = input::dispatch_key(b, s, kind, code);
                     let _ = input::dispatch_key_v2(b, s, kind, code_point, key_id);
+                    // v3 (optional): the W3C model. winit's KeyCode variants
+                    // are NAMED after the W3C UIEvents code tokens, so the
+                    // Debug name IS the token ("KeyA", "ArrowLeft", …).
+                    let ev3 = key_input_bindings::exports::my::skiko_gfx::key_input::KeyEvent {
+                        down: kind == 0,
+                        repeat: event.repeat,
+                        code: match event.physical_key {
+                            PhysicalKey::Code(c) => format!("{c:?}"),
+                            _ => String::new(),
+                        },
+                        text: event.text.as_ref().map(|t| t.to_string()).unwrap_or_default(),
+                        alt: self.modifiers.alt_key(),
+                        ctrl: self.modifiers.control_key(),
+                        meta: self.modifiers.super_key(),
+                        shift: self.modifiers.shift_key(),
+                    };
+                    let _ = input::dispatch_key_v3(self.key_input.as_ref(), s, &ev3);
                 }
+            }
+
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
             }
 
             // winit collapses Activity.onResume/onPause/onStart/onStop down to
