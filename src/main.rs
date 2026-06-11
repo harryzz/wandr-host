@@ -2,6 +2,29 @@ extern crate wasm_android_host;
 
 #[cfg(not(target_os = "android"))]
 fn main() {
+    // Desktop `--install <wandrpkg-dir>`: same task-35 installer as on
+    // device, into WANDR_APPS_ROOT — pairs with the desktop `--app <id>`
+    // run mode so cross-app deps resolve in the dev loop.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--install") {
+        let Some(wandrpkg) = args.get(i + 1) else {
+            eprintln!("wandr-host --install: requires a <wandrpkg-dir> path");
+            std::process::exit(2);
+        };
+        match wasm_android_host::install_wandrpkg(std::path::Path::new(wandrpkg)) {
+            Ok(installed) => {
+                println!(
+                    "installed: {} v{} → {}",
+                    installed.app_id, installed.version, installed.install_dir.display(),
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("wandr-host --install: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     wasm_android_host::run();
 }
 

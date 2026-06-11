@@ -1002,7 +1002,8 @@ fn run_cwasm_loop(
                         Ok(true) => continue,
                         Ok(false) => {}
                         Err(e) => {
-                            log::warn!("standalone: key-handler (ime-inbound) failed: {e:#}");
+                            // {:?} includes the wasm backtrace for guest traps.
+                            log::warn!("standalone: key-handler (ime-inbound) failed: {e:?}");
                             continue;
                         }
                     }

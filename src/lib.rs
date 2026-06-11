@@ -1068,10 +1068,22 @@ pub fn run() {
     let loader = app_loader::default_for_target();
     let argv1 = std::env::args().nth(1)
         .unwrap_or_else(|| "skiko-component.cwasm".to_string());
-    let argv_path = Path::new(&argv1);
-    let loaded = match loader.load(&engine, AppRef::DevCwasm { candidates: &[argv_path] }) {
-        Ok(l) => { log::info!("loaded: {}", l.source_label); Some(l) }
-        Err(e) => { log::warn!("no component at {argv1}: {e:#}"); None }
+    // `--app <id>` loads an INSTALLED app from WANDR_APPS_ROOT — the path
+    // that resolves same-store deps (cross-app imports like
+    // wandr:markdown/renderer), which the bare-path DevCwasm mode can't.
+    // Pairs with desktop `--install` into a sandbox root.
+    let loaded = if argv1 == "--app" {
+        let app_id = std::env::args().nth(2).expect("--app <app-id>");
+        match loader.load(&engine, AppRef::Installed { app_id: &app_id, version: None }) {
+            Ok(l) => { log::info!("loaded: {}", l.source_label); Some(l) }
+            Err(e) => { log::warn!("no installed app {app_id}: {e:#}"); None }
+        }
+    } else {
+        let argv_path = Path::new(&argv1);
+        match loader.load(&engine, AppRef::DevCwasm { candidates: &[argv_path] }) {
+            Ok(l) => { log::info!("loaded: {}", l.source_label); Some(l) }
+            Err(e) => { log::warn!("no component at {argv1}: {e:#}"); None }
+        }
     };
 
     let event_loop = EventLoop::new().unwrap();
