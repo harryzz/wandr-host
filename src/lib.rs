@@ -134,6 +134,8 @@ mod wasi_canvas_bindings {
             "wasi:canvas/draw.graphics": crate::wasi_canvas_impl::GraphicsRes,
             "wasi:canvas/draw.picture": crate::wasi_canvas_impl::PictureRes,
             "wasi:canvas/glyphs.typeface": crate::wasi_canvas_impl::TypefaceRes,
+            "wasi:canvas/layout.paragraph": crate::wasi_canvas_impl::ParagraphRes,
+            "wasi:canvas/layout.paragraph-builder": crate::wasi_canvas_impl::ParagraphBuilderRes,
         },
     });
 }

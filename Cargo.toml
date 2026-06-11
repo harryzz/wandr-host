@@ -130,7 +130,10 @@ rsbinder      = { path = "../../external/rsbinder/rsbinder" }
 rsbinder-aidl = { path = "../../external/rsbinder/rsbinder-aidl" }
 
 [features]
-default = []
+# wasi-canvas default-on since the dioxus-canvas migration (stage 1):
+# additive linker entries, nothing else notices. Disable with
+# --no-default-features (profile must then be re-added explicitly).
+default = ["wasi-canvas"]
 # Task 23 — enable per-frame profiling hooks: ResourceLimiter on memory.grow,
 # Store::data_size() snapshot, Store::call_hook host-call counter, and
 # wasmtime::GuestProfiler firefox-profiler-JSON dump. Off by default so

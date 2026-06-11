@@ -18,6 +18,7 @@ use crate::HostState;
 use crate::wasi_canvas_bindings::wasi::canvas::draw as wit_draw;
 use crate::wasi_canvas_bindings::wasi::canvas::embedding as wit_embedding;
 use crate::wasi_canvas_bindings::wasi::canvas::glyphs as wit_glyphs;
+use crate::wasi_canvas_bindings::wasi::canvas::layout as wit_layout;
 use crate::wasi_canvas_bindings::wasi::canvas::types as wit_types;
 // (module path note: bindgen nests generated modules under wasi::canvas::*)
 
@@ -27,6 +28,15 @@ pub struct ShaderRes(pub skia_safe::Shader);
 pub struct ImageRes(pub skia_safe::Image);
 pub struct PictureRes(pub skia_safe::Picture);
 pub struct TypefaceRes(pub skia_safe::Typeface);
+/// `Rc<RefCell<…>>` so paint can hold the paragraph while `with_canvas`
+/// re-borrows the table for the target canvas (two table entries can't be
+/// borrowed simultaneously through the safe ResourceTable API).
+pub struct ParagraphRes(pub std::rc::Rc<std::cell::RefCell<skia_safe::textlayout::Paragraph>>);
+pub struct ParagraphBuilderRes(pub skia_safe::textlayout::ParagraphBuilder);
+
+// SAFETY: same single-threaded-store justification as CanvasRes below.
+unsafe impl Send for ParagraphRes {}
+unsafe impl Send for ParagraphBuilderRes {}
 /// The creation capability is the handle itself; no state behind it (an
 /// attenuating embedder would interpose, not parameterize this).
 pub struct GraphicsRes;
@@ -735,6 +745,220 @@ impl wit_glyphs::Host for HostState {
                 c.draw_glyphs_at(&ids, points.as_slice(), (origin.x, origin.y), &font, &sp);
             }
         })
+    }
+}
+
+// ─── layout interface (host-shaped paragraphs; skparagraph-backed) ───────────
+
+/// wit text-style → skia textlayout TextStyle, reusing the renderer's
+/// family-alias typeface resolution (task 41: FontCollection alone can't
+/// resolve /system/fonts names on this device).
+fn layout_text_style(
+    renderer: &mut crate::canvas_impl::SkiaRenderer,
+    s: &wit_layout::TextStyle,
+) -> skia_safe::textlayout::TextStyle {
+    let mut ts = skia_safe::textlayout::TextStyle::new();
+    ts.set_font_size(s.size);
+    ts.set_color(color(s.color));
+    let weight = skia_safe::font_style::Weight::from(s.weight.clamp(1, 1000) as i32);
+    let slant = if s.italic {
+        skia_safe::font_style::Slant::Italic
+    } else {
+        skia_safe::font_style::Slant::Upright
+    };
+    ts.set_font_style(skia_safe::FontStyle::new(
+        weight,
+        skia_safe::font_style::Width::NORMAL,
+        slant,
+    ));
+    if s.letter_spacing != 0.0 {
+        ts.set_letter_spacing(s.letter_spacing);
+    }
+    if s.line_height > 0.0 {
+        ts.set_height(s.line_height);
+        ts.set_height_override(true);
+    }
+    if !s.family.is_empty() {
+        ts.set_font_families(&[s.family.as_str()]);
+        // Known aliases / absolute paths: resolve via the renderer's
+        // typeface cache (FontMgr-by-name is broken on-device).
+        if s.family.starts_with('/')
+            || matches!(
+                s.family.as_str(),
+                "Noto Serif" | "NotoSerif" | "DejaVu Serif" | "Times New Roman"
+                    | "Noto Sans Mono" | "NotoSansMono" | "DejaVu Sans Mono"
+                    | "Consolas" | "Roboto Mono" | "RobotoMono"
+            )
+        {
+            let tf = renderer.get_typeface(&s.family, s.weight >= 600, s.italic);
+            ts.set_typeface(Some(tf));
+        }
+    }
+    ts
+}
+
+impl wit_layout::Host for HostState {}
+
+impl wit_layout::HostParagraphBuilder for HostState {
+    fn new(
+        &mut self,
+        default_style: wit_layout::TextStyle,
+        align: wit_layout::Align,
+    ) -> wasmtime::Result<Resource<ParagraphBuilderRes>> {
+        let ts = layout_text_style(&mut self.renderer, &default_style);
+        let mut style = skia_safe::textlayout::ParagraphStyle::new();
+        style.set_text_style(&ts);
+        style.set_text_align(match align {
+            wit_layout::Align::Start => skia_safe::textlayout::TextAlign::Start,
+            wit_layout::Align::Center => skia_safe::textlayout::TextAlign::Center,
+            wit_layout::Align::End => skia_safe::textlayout::TextAlign::End,
+            wit_layout::Align::Justify => skia_safe::textlayout::TextAlign::Justify,
+        });
+        let fc = self.renderer.font_collection.clone();
+        let builder = skia_safe::textlayout::ParagraphBuilder::new(&style, fc);
+        Ok(self.table.push(ParagraphBuilderRes(builder))?)
+    }
+
+    fn push_style(
+        &mut self,
+        self_: Resource<ParagraphBuilderRes>,
+        style: wit_layout::TextStyle,
+    ) -> wasmtime::Result<()> {
+        let ts = layout_text_style(&mut self.renderer, &style);
+        self.table.get_mut(&self_)?.0.push_style(&ts);
+        Ok(())
+    }
+
+    fn pop_style(&mut self, self_: Resource<ParagraphBuilderRes>) -> wasmtime::Result<()> {
+        self.table.get_mut(&self_)?.0.pop();
+        Ok(())
+    }
+
+    fn add_text(
+        &mut self,
+        self_: Resource<ParagraphBuilderRes>,
+        text: String,
+    ) -> wasmtime::Result<()> {
+        self.table.get_mut(&self_)?.0.add_text(&text);
+        Ok(())
+    }
+
+    fn build(
+        &mut self,
+        b: Resource<ParagraphBuilderRes>,
+    ) -> wasmtime::Result<Resource<ParagraphRes>> {
+        let mut builder = self.table.delete(b)?;
+        let para = builder.0.build();
+        Ok(self
+            .table
+            .push(ParagraphRes(std::rc::Rc::new(std::cell::RefCell::new(para))))?)
+    }
+
+    fn drop(&mut self, rep: Resource<ParagraphBuilderRes>) -> wasmtime::Result<()> {
+        self.table.delete(rep)?;
+        Ok(())
+    }
+}
+
+impl wit_layout::HostParagraph for HostState {
+    fn layout(&mut self, self_: Resource<ParagraphRes>, width: f32) -> wasmtime::Result<()> {
+        self.table.get(&self_)?.0.borrow_mut().layout(width);
+        Ok(())
+    }
+
+    fn paint(
+        &mut self,
+        self_: Resource<ParagraphRes>,
+        canvas: Resource<CanvasRes>,
+        at: wit_types::Point,
+    ) -> wasmtime::Result<()> {
+        let para = self.table.get(&self_)?.0.clone();
+        with_canvas(self, &canvas, |c| {
+            para.borrow().paint(c, (at.x, at.y));
+        })
+    }
+
+    fn height(&mut self, self_: Resource<ParagraphRes>) -> wasmtime::Result<f32> {
+        Ok(self.table.get(&self_)?.0.borrow().height())
+    }
+    fn max_intrinsic_width(&mut self, self_: Resource<ParagraphRes>) -> wasmtime::Result<f32> {
+        Ok(self.table.get(&self_)?.0.borrow().max_intrinsic_width())
+    }
+    fn min_intrinsic_width(&mut self, self_: Resource<ParagraphRes>) -> wasmtime::Result<f32> {
+        Ok(self.table.get(&self_)?.0.borrow().min_intrinsic_width())
+    }
+    fn alphabetic_baseline(&mut self, self_: Resource<ParagraphRes>) -> wasmtime::Result<f32> {
+        Ok(self.table.get(&self_)?.0.borrow().alphabetic_baseline())
+    }
+
+    fn lines(
+        &mut self,
+        self_: Resource<ParagraphRes>,
+    ) -> wasmtime::Result<Vec<wit_layout::LineMetrics>> {
+        let para = self.table.get(&self_)?.0.clone();
+        let para = para.borrow();
+        Ok(para
+            .get_line_metrics()
+            .iter()
+            .map(|lm| wit_layout::LineMetrics {
+                start_offset: lm.start_index as u32,
+                end_offset: lm.end_index as u32,
+                baseline: lm.baseline as f32,
+                ascent: lm.ascent as f32,
+                descent: lm.descent as f32,
+                left: lm.left as f32,
+                width: lm.width as f32,
+            })
+            .collect())
+    }
+
+    fn rects_for_range(
+        &mut self,
+        self_: Resource<ParagraphRes>,
+        start: u32,
+        end: u32,
+    ) -> wasmtime::Result<Vec<wit_types::Rect>> {
+        let para = self.table.get(&self_)?.0.clone();
+        let para = para.borrow();
+        Ok(para
+            .get_rects_for_range(
+                start as usize..end as usize,
+                skia_safe::textlayout::RectHeightStyle::Tight,
+                skia_safe::textlayout::RectWidthStyle::Tight,
+            )
+            .iter()
+            .map(|tb| wit_types::Rect {
+                x: tb.rect.left,
+                y: tb.rect.top,
+                width: tb.rect.width(),
+                height: tb.rect.height(),
+            })
+            .collect())
+    }
+
+    fn offset_at(
+        &mut self,
+        self_: Resource<ParagraphRes>,
+        at: wit_types::Point,
+    ) -> wasmtime::Result<u32> {
+        let para = self.table.get(&self_)?.0.clone();
+        let pos = para.borrow().get_glyph_position_at_coordinate((at.x, at.y));
+        Ok(pos.position.max(0) as u32)
+    }
+
+    fn word_boundary(
+        &mut self,
+        self_: Resource<ParagraphRes>,
+        offset: u32,
+    ) -> wasmtime::Result<(u32, u32)> {
+        let para = self.table.get(&self_)?.0.clone();
+        let range = para.borrow().get_word_boundary(offset);
+        Ok((range.start as u32, range.end as u32))
+    }
+
+    fn drop(&mut self, rep: Resource<ParagraphRes>) -> wasmtime::Result<()> {
+        self.table.delete(rep)?;
+        Ok(())
     }
 }
 
