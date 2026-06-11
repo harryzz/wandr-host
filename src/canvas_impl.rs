@@ -219,6 +219,15 @@ pub struct SkiaRenderer {
     #[cfg(target_os = "android")]
     gr_context: skia_safe::gpu::DirectContext,
 
+    /// Desktop present path: blits the CPU raster `surface` to the winit
+    /// window each flush_and_swap (no GL — see Cargo.toml softbuffer note).
+    /// None in window-less constructions (tests / --run-once).
+    #[cfg(not(target_os = "android"))]
+    sb_surface: Option<softbuffer::Surface<
+        std::sync::Arc<winit::window::Window>,
+        std::sync::Arc<winit::window::Window>,
+    >>,
+
     surface:    Surface,
     /// Physical GL surface size (the EGL surface dimensions).
     pub width:  u32,
@@ -469,7 +478,15 @@ impl SkiaRenderer {
             let surface = skia_safe::surfaces::raster_n32_premul(
                 (size.width as i32, size.height as i32)
             ).ok_or_else(|| anyhow::anyhow!("raster surface failed"))?;
+            let sb_surface = match softbuffer::Context::new(window.clone()) {
+                Ok(ctx) => match softbuffer::Surface::new(&ctx, window.clone()) {
+                    Ok(s) => Some(s),
+                    Err(e) => { log::warn!("softbuffer surface failed: {e}"); None }
+                },
+                Err(e) => { log::warn!("softbuffer context failed: {e}"); None }
+            };
             Ok(Self {
+                sb_surface,
                 surface, width: size.width, height: size.height,
                 logical_width: size.width, logical_height: size.height,
                 inset_top: 0, inset_bottom: 0, keyboard_base_px: 0,
@@ -824,6 +841,35 @@ impl SkiaRenderer {
                 skia_safe::gpu::PurgeResourceOptions::AllResources,
             );
         }
+        #[cfg(not(target_os = "android"))]
+        self.present_softbuffer();
+    }
+
+    /// Desktop present: copy the skia raster surface into the softbuffer
+    /// window buffer. Skia N32-premul on little-endian is BGRA bytes;
+    /// softbuffer wants 0RGB u32 — `from_le_bytes([b,g,r,a])` lands each
+    /// pixel as 0xAARRGGBB with the alpha byte ignored by softbuffer.
+    #[cfg(not(target_os = "android"))]
+    fn present_softbuffer(&mut self) {
+        use std::num::NonZeroU32;
+        let (w, h) = (self.width, self.height);
+        let (Some(nw), Some(nh)) = (NonZeroU32::new(w), NonZeroU32::new(h)) else { return };
+        let Some(sb) = self.sb_surface.as_mut() else { return };
+        if sb.resize(nw, nh).is_err() {
+            return;
+        }
+        let Some(pixmap) = self.surface.peek_pixels() else { return };
+        let Some(bytes) = pixmap.bytes() else { return };
+        let row_bytes = pixmap.row_bytes();
+        let Ok(mut buf) = sb.buffer_mut() else { return };
+        for y in 0..h as usize {
+            let row = &bytes[y * row_bytes..y * row_bytes + (w as usize) * 4];
+            let out = &mut buf[y * w as usize..(y + 1) * w as usize];
+            for (dst, px) in out.iter_mut().zip(row.chunks_exact(4)) {
+                *dst = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+            }
+        }
+        let _ = buf.present();
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {

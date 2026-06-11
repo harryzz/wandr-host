@@ -110,6 +110,10 @@ audioclient      = { package = "audioclient-rs", path = "../../external/audiocli
 [target.'cfg(not(target_os = "android"))'.dependencies]
 env_logger = "0.11"
 winit      = { version = "0.30", features = [] }
+# Desktop present path: the renderer draws into a skia CPU raster surface;
+# softbuffer blits it to the winit window (no GL - reliable under
+# WSLg/Wayland/X11). Android presents via EGL instead.
+softbuffer = "0.4.8"
 
 [build-dependencies]
 cc = "1"
