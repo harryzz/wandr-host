@@ -16,6 +16,7 @@ use wasmtime::component::{Resource, ResourceTable};
 
 use crate::HostState;
 use crate::wasi_canvas_bindings::wasi::canvas::draw as wit_draw;
+use crate::wasi_canvas_bindings::wasi::canvas::embedding as wit_embedding;
 use crate::wasi_canvas_bindings::wasi::canvas::glyphs as wit_glyphs;
 use crate::wasi_canvas_bindings::wasi::canvas::types as wit_types;
 // (module path note: bindgen nests generated modules under wasi::canvas::*)
@@ -734,6 +735,33 @@ impl wit_glyphs::Host for HostState {
                 c.draw_glyphs_at(&ids, points.as_slice(), (origin.x, origin.y), &font, &sp);
             }
         })
+    }
+}
+
+// ─── embedding interface (the wandr reactor-model handoff) ───────────────────
+
+impl wit_embedding::Host for HostState {
+    fn get_graphics(&mut self) -> wasmtime::Result<Resource<GraphicsRes>> {
+        Ok(self.table.push(GraphicsRes)?)
+    }
+
+    /// Mirror of the skiko-gfx begin-frame policy: make the GL context
+    /// current (android), clear to opaque black, re-apply the base
+    /// transform — then hand the guest the Main canvas handle.
+    fn begin_frame(&mut self) -> wasmtime::Result<Resource<CanvasRes>> {
+        #[cfg(target_os = "android")]
+        self.renderer.egl.make_current();
+        let base = self.renderer.base_matrix;
+        let c = self.renderer.canvas();
+        c.reset_matrix();
+        c.clear(skia_safe::Color::BLACK);
+        c.concat(&base);
+        Ok(self.table.push(CanvasRes::Main)?)
+    }
+
+    fn end_frame(&mut self) -> wasmtime::Result<()> {
+        self.renderer.flush_and_swap();
+        Ok(())
     }
 }
 
