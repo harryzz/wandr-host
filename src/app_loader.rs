@@ -292,6 +292,9 @@ impl LoadedApp {
             .map_err(|e| anyhow!("KeyguardHost::add_to_linker: {e:#}"))?; // keyguard M3
         crate::audio_focus_host_bindings::AudioFocusHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("AudioFocusHost::add_to_linker: {e:#}"))?; // wandr-arbiter-audio M2
+        #[cfg(feature = "wasi-canvas")]
+        crate::wasi_canvas_impl::add_to_linker(&mut linker)
+            .map_err(|e| anyhow!("wasi-canvas add_to_linker: {e:#}"))?; // proposals/wasi-canvas draft
 
         for dep in &self.deps {
             wire_dep_into_linker(&mut linker, store, dep)?;
@@ -403,6 +406,9 @@ impl LoadedApp {
             .map_err(|e| anyhow!("KeyguardHost::add_to_linker: {e:#}"))?; // keyguard M3
         crate::audio_focus_host_bindings::AudioFocusHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("AudioFocusHost::add_to_linker: {e:#}"))?; // wandr-arbiter-audio M2
+        #[cfg(feature = "wasi-canvas")]
+        crate::wasi_canvas_impl::add_to_linker(&mut linker)
+            .map_err(|e| anyhow!("wasi-canvas add_to_linker: {e:#}"))?; // proposals/wasi-canvas draft
 
         for dep in &self.deps {
             wire_dep_into_linker(&mut linker, store, dep)?;

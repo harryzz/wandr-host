@@ -116,6 +116,30 @@ mod frame_pacing_bindings {
     });
 }
 
+/// wasi:canvas draft (proposals/wasi-canvas) host bindings — feature-gated
+/// (`wasi-canvas`). A SECOND canvas package over the same SkiaRenderer,
+/// coexisting with my:skiko-gfx (see proposals/wasi-canvas/COMPATIBILITY.md).
+/// Resources map onto host types in `wasi_canvas_impl`.
+#[cfg(feature = "wasi-canvas")]
+mod wasi_canvas_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../proposals/wasi-canvas/wit",
+        world: "canvas-host",
+        // All methods return wasmtime::Result so table lookups can trap.
+        imports: { default: trappable },
+        with: {
+            "wasi:canvas/types.shader": crate::wasi_canvas_impl::ShaderRes,
+            "wasi:canvas/types.image": crate::wasi_canvas_impl::ImageRes,
+            "wasi:canvas/draw.canvas": crate::wasi_canvas_impl::CanvasRes,
+            "wasi:canvas/draw.graphics": crate::wasi_canvas_impl::GraphicsRes,
+            "wasi:canvas/draw.picture": crate::wasi_canvas_impl::PictureRes,
+            "wasi:canvas/glyphs.typeface": crate::wasi_canvas_impl::TypefaceRes,
+        },
+    });
+}
+#[cfg(feature = "wasi-canvas")]
+mod wasi_canvas_impl;
+
 /// Typed bindings for the OPTIONAL `my:skiko-gfx/key-input` export — the
 /// W3C-UIEvents key model (code token + modifiers + text) for guests that
 /// want desktop-grade keyboards (see the interface doc in skiko-gfx.wit).

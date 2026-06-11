@@ -136,6 +136,10 @@ default = []
 # wasmtime::GuestProfiler firefox-profiler-JSON dump. Off by default so
 # production APK builds stay unaffected.
 profile = ["wasmtime/call-hook"]
+# wasi:canvas draft host implementation (proposals/wasi-canvas) — a second
+# canvas package over the same SkiaRenderer, coexisting with my:skiko-gfx.
+# Off by default until the proving consumer (slint-wandr port) lands.
+wasi-canvas = []
 
 [package.metadata.android]
 package = "com.example.wasmruntime"
