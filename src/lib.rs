@@ -425,10 +425,20 @@ impl ApplicationHandler for App {
         if self.store.is_none() {
             display_impl::probe();
         }
+        // Desktop dev window size: `WANDR_DESKTOP_SIZE=WxH` (e.g. 480x960
+        // for a phone-shaped viewport). winit/WM default otherwise.
+        let mut attrs = Window::default_attributes().with_title("WASM Android Runtime");
+        #[cfg(not(target_os = "android"))]
+        if let Ok(spec) = std::env::var("WANDR_DESKTOP_SIZE") {
+            if let Some((w, h)) = spec.split_once('x') {
+                if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                    attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                }
+            }
+        }
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes()
-                    .with_title("WASM Android Runtime"))
+                .create_window(attrs)
                 .expect("window creation failed"),
         );
 
@@ -479,6 +489,20 @@ impl ApplicationHandler for App {
                 match wasi_builder.preopened_dir(&state, "/state", DirPerms::all(), FilePerms::all()) {
                     Ok(_)  => log::info!("preopened {} → /state (read-write)", state.display()),
                     Err(e) => log::warn!("preopen {} failed: {e:#}", state.display()),
+                }
+            }
+            // Desktop parity with the device's /system/fonts preopen (the
+            // standalone path exposes it as /system-fonts; guests read e.g.
+            // NotoColorEmoji.ttf for emoji fallback). Map the host's Noto
+            // dir when present (Debian/Ubuntu layout); best-effort.
+            #[cfg(not(target_os = "android"))]
+            {
+                let noto = std::path::Path::new("/usr/share/fonts/truetype/noto");
+                if noto.is_dir() {
+                    match wasi_builder.preopened_dir(noto, "/system-fonts", DirPerms::READ, FilePerms::READ) {
+                        Ok(_)  => log::info!("preopened {} → /system-fonts (read-only)", noto.display()),
+                        Err(e) => log::warn!("preopen {} failed: {e:#}", noto.display()),
+                    }
                 }
             }
             let wasi = wasi_builder.build();
@@ -701,6 +725,13 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(r) = self.renderer_mut() {
                     r.resize(size.width, size.height);
+                }
+                // Tell the GUEST too (the standalone path does this via
+                // geometry pushes; without it a WM resize leaves the guest
+                // laid out for the stale size — found via Slint on WSLg:
+                // the ListView collapsed to the pre-resize zero leftover).
+                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                    let _ = input::dispatch_resize(b, s, size.width, size.height);
                 }
                 if let Some(w) = &self.window { w.request_redraw(); }
             }
