@@ -180,6 +180,25 @@ fn paint(table: &ResourceTable, p: &wit_types::Paint) -> skia_safe::Paint {
         };
         sp.set_mask_filter(skia_safe::MaskFilter::blur(style, b.sigma, None));
     }
+    match &p.filter {
+        Some(wit_types::ColorFilter::Blend(cb)) => {
+            if let Some(cf) =
+                skia_safe::color_filters::blend(color(cb.color), blend_mode(cb.mode))
+            {
+                sp.set_color_filter(cf);
+            }
+        }
+        Some(wit_types::ColorFilter::Invert) => {
+            let matrix = [
+                -1f32,  0f32,  0f32, 0f32, 1f32,
+                 0f32, -1f32,  0f32, 0f32, 1f32,
+                 0f32,  0f32, -1f32, 0f32, 1f32,
+                 0f32,  0f32,  0f32, 1f32, 0f32,
+            ];
+            sp.set_color_filter(skia_safe::color_filters::matrix_row_major(&matrix, None));
+        }
+        None => {}
+    }
     // Alpha multiplies AFTER color/shader, like paint-attrs in skiko-gfx.
     let a = ((sp.alpha() as u32 * p.alpha as u32) / 255) as u8;
     sp.set_alpha(a);
@@ -890,6 +909,12 @@ impl wit_layout::HostParagraph for HostState {
     fn alphabetic_baseline(&mut self, self_: Resource<ParagraphRes>) -> wasmtime::Result<f32> {
         Ok(self.table.get(&self_)?.0.borrow().alphabetic_baseline())
     }
+    fn ideographic_baseline(&mut self, self_: Resource<ParagraphRes>) -> wasmtime::Result<f32> {
+        Ok(self.table.get(&self_)?.0.borrow().ideographic_baseline())
+    }
+    fn line_count(&mut self, self_: Resource<ParagraphRes>) -> wasmtime::Result<u32> {
+        Ok(self.table.get(&self_)?.0.borrow().line_number() as u32)
+    }
 
     fn lines(
         &mut self,
@@ -903,35 +928,64 @@ impl wit_layout::HostParagraph for HostState {
             .map(|lm| wit_layout::LineMetrics {
                 start_offset: lm.start_index as u32,
                 end_offset: lm.end_index as u32,
-                baseline: lm.baseline as f32,
+                end_excluding_whitespace: lm.end_excluding_whitespaces as u32,
+                end_including_newline: lm.end_including_newline as u32,
+                hard_break: lm.hard_break,
                 ascent: lm.ascent as f32,
                 descent: lm.descent as f32,
-                left: lm.left as f32,
+                unscaled_ascent: lm.unscaled_ascent as f32,
+                height: lm.height as f32,
                 width: lm.width as f32,
+                left: lm.left as f32,
+                baseline: lm.baseline as f32,
+                line_number: lm.line_number as u32,
             })
             .collect())
     }
 
-    fn rects_for_range(
+    fn selection_boxes(
         &mut self,
         self_: Resource<ParagraphRes>,
         start: u32,
         end: u32,
-    ) -> wasmtime::Result<Vec<wit_types::Rect>> {
+        height: wit_layout::RectHeightStyle,
+        width: wit_layout::RectWidthStyle,
+    ) -> wasmtime::Result<Vec<wit_layout::TextBox>> {
+        use skia_safe::textlayout::{RectHeightStyle, RectWidthStyle, TextDirection};
+        let height_style = match height {
+            wit_layout::RectHeightStyle::Tight => RectHeightStyle::Tight,
+            wit_layout::RectHeightStyle::Max => RectHeightStyle::Max,
+            wit_layout::RectHeightStyle::IncludeLineSpacingMiddle => {
+                RectHeightStyle::IncludeLineSpacingMiddle
+            }
+            wit_layout::RectHeightStyle::IncludeLineSpacingTop => {
+                RectHeightStyle::IncludeLineSpacingTop
+            }
+            wit_layout::RectHeightStyle::IncludeLineSpacingBottom => {
+                RectHeightStyle::IncludeLineSpacingBottom
+            }
+            wit_layout::RectHeightStyle::Strut => RectHeightStyle::Strut,
+        };
+        let width_style = match width {
+            wit_layout::RectWidthStyle::Tight => RectWidthStyle::Tight,
+            wit_layout::RectWidthStyle::Max => RectWidthStyle::Max,
+        };
         let para = self.table.get(&self_)?.0.clone();
         let para = para.borrow();
         Ok(para
-            .get_rects_for_range(
-                start as usize..end as usize,
-                skia_safe::textlayout::RectHeightStyle::Tight,
-                skia_safe::textlayout::RectWidthStyle::Tight,
-            )
+            .get_rects_for_range(start as usize..end as usize, height_style, width_style)
             .iter()
-            .map(|tb| wit_types::Rect {
-                x: tb.rect.left,
-                y: tb.rect.top,
-                width: tb.rect.width(),
-                height: tb.rect.height(),
+            .map(|tb| wit_layout::TextBox {
+                rect: wit_types::Rect {
+                    x: tb.rect.left,
+                    y: tb.rect.top,
+                    width: tb.rect.width(),
+                    height: tb.rect.height(),
+                },
+                direction: match tb.direct {
+                    TextDirection::LTR => wit_layout::TextDirection::Ltr,
+                    TextDirection::RTL => wit_layout::TextDirection::Rtl,
+                },
             })
             .collect())
     }
