@@ -97,7 +97,7 @@ mod ime_bindings {
 #[cfg(feature = "wasi-canvas")]
 mod wasi_canvas_impl;
 
-/// wasi:canvas@0.0.2 (proposals/wasi-canvas/wit-0.0.2) — served
+/// wasi:canvas@0.0.2 (proposals/wasi-canvas/wit) — served
 /// SIDE-BY-SIDE with 0.0.1 over the same SkiaRenderer (the R3
 /// version-coexistence rule; REDESIGN-0.0.2.md). Heavy resources map
 /// onto the SAME backing types as 0.0.1; only the buffered
@@ -105,7 +105,7 @@ mod wasi_canvas_impl;
 #[cfg(feature = "wasi-canvas")]
 mod wasi_canvas_002_bindings {
     wasmtime::component::bindgen!({
-        path: "../../proposals/wasi-canvas/wit-0.0.2",
+        path: "../../proposals/wasi-canvas/wit",
         world: "canvas-host",
         imports: { default: trappable },
         with: {
@@ -200,32 +200,32 @@ mod wasi_audio_bindings {
 }
 mod wasi_audio_impl;
 
-/// wasi:input-handlers@0.0.2 (wit-0.0.2) — the six-consumer-union event
+/// wasi:input-handlers@0.0.2 (wit) — the six-consumer-union event
 /// records (buttons/device/tilt + enter/leave + the optional
 /// gesture-handler), probed SIDE-BY-SIDE with 0.0.1; per input type the
 /// dispatch prefers 0.0.2 > 0.0.1 > legacy, exclusively.
 pub mod input_handlers_002_bindings {
     pub mod pointer {
         wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit-0.0.2",
+            path: "../../proposals/wasi-input-handlers/wit",
             world: "pointer-handler-world",
         });
     }
     pub mod key {
         wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit-0.0.2",
+            path: "../../proposals/wasi-input-handlers/wit",
             world: "key-handler-world",
         });
     }
     pub mod frame {
         wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit-0.0.2",
+            path: "../../proposals/wasi-input-handlers/wit",
             world: "frame-handler-world",
         });
     }
     pub mod gesture {
         wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit-0.0.2",
+            path: "../../proposals/wasi-input-handlers/wit",
             world: "gesture-handler-world",
         });
     }
