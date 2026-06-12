@@ -11,7 +11,7 @@
 
 use std::process::Command;
 
-use crate::bindings::my::skiko_gfx::theme::{Host, NightMode};
+use crate::ui_shell_bindings::wandr::ui_shell::theme::{Host, NightMode};
 
 impl Host for crate::HostState {
     fn get_night_mode(&mut self) -> NightMode {

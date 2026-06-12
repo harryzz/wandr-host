@@ -1,4 +1,4 @@
-use crate::bindings::my::skiko_gfx::window::Host;
+use crate::ui_shell_bindings::wandr::ui_shell::metrics::Host;
 
 #[cfg(target_os = "android")]
 pub fn read_dpi() -> u32 {

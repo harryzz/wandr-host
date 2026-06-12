@@ -5,7 +5,7 @@
 //! by the `wandr.statusbar` guest, which polls these ~1 Hz and draws the
 //! top-overlay strip.
 
-use crate::bindings::my::skiko_gfx::status::Host;
+use crate::chrome_bindings::wandr::chrome::status::Host;
 
 /// Status-bar strip height in physical pixels. True-dp (Arbiter Inc. 3b): the
 /// arbiter authors it (dp×density) and the host caches it, so `bar_height()` +

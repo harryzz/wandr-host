@@ -1,4 +1,4 @@
-use crate::bindings::my::skiko_gfx::thermal::{Host, Kind, Temperature, Throttle};
+use crate::device_bindings::wandr::device::thermal::{Host, Kind, Temperature, Throttle};
 
 // ── Binder path (Android, stable AIDL HAL) ───────────────────────────────────
 //

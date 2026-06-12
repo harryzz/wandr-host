@@ -1,4 +1,4 @@
-use crate::bindings::my::skiko_gfx::locale::{Host, LayoutDirection};
+use crate::ui_shell_bindings::wandr::ui_shell::locale::{Host, LayoutDirection};
 
 #[cfg(target_os = "android")]
 fn read_prop(name: &str) -> Option<String> {
@@ -30,7 +30,7 @@ impl Host for crate::HostState {
         primary_locale_tag()
     }
 
-    fn is_24_hour_format(&mut self) -> bool {
+    fn is_twenty_four_hour_format(&mut self) -> bool {
         // Explicit user override wins.
         match read_prop("persist.sys.timeFormat").as_deref() {
             Some("24") => return true,

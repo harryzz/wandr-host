@@ -24,7 +24,6 @@ use wasmtime::{Engine, Store};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 use crate::app_loader::{self, AppLoader, AppRef};
-use crate::bindings;
 use crate::{App, HostState};
 
 /// Where the `libsf_surface` shim is deployed on the device. Mirrors the
@@ -112,7 +111,7 @@ pub fn run_with_engine(engine: &Engine, app_id: &str) -> Result<()> {
         renderer,
         scheduler: crate::scheduler_impl::SchedulerState::default(),
         lifecycle: crate::lifecycle_impl::LifecycleState {
-            current: bindings::my::skiko_gfx::lifecycle::State::Resumed,
+            current: crate::ui_shell_bindings::wandr::ui_shell::lifecycle::State::Resumed,
             pending: None,
         },
         clipboard: None,

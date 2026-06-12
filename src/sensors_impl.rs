@@ -1,4 +1,4 @@
-use crate::bindings::my::skiko_gfx::sensors::{Host, Kind, SensorInfo, SensorSample};
+use crate::device_bindings::wandr::device::sensors::{Host, Kind, SensorInfo, SensorSample};
 use wandr_hal_sensors::{HalSample, HalSensor};
 
 // ── Sensor WIT impl ──────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-use crate::bindings::my::skiko_gfx::lifecycle::{Host, State};
+use crate::ui_shell_bindings::wandr::ui_shell::lifecycle::{Host, State};
 
 #[derive(Default)]
 pub struct LifecycleState {

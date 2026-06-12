@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::bindings::my::skiko_gfx::audio::{ChannelLayout, Format, StreamClass, TrackConfig};
+use crate::audio_impl::{ChannelLayout, Format, StreamClass, TrackConfig};
 
 const SAMPLE_RATE: u32 = 48_000;
 /// Write granularity — 20 ms of stereo frames (matches the AAudio burst pacing).

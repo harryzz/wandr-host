@@ -1,4 +1,4 @@
-use crate::bindings::my::skiko_gfx::clipboard::Host;
+use crate::ui_shell_bindings::wandr::ui_shell::clipboard::Host;
 
 impl Host for crate::HostState {
     fn get_text(&mut self) -> String {

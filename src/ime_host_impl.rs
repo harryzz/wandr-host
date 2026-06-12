@@ -15,7 +15,7 @@
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 
-use crate::bindings::my::skiko_gfx::ime::Host;
+use crate::ui_shell_bindings::wandr::ui_shell::ime::Host;
 
 // Where the arbiter listens — resolved via crate::arbiter_sock::arbiter_sock_path()
 // ($WANDR_ARBITER_SOCK, else the canonical default). A production

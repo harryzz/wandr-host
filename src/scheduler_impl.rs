@@ -1,4 +1,4 @@
-use crate::bindings::my::skiko_gfx::scheduler::Host;
+use crate::ui_shell_bindings::wandr::ui_shell::scheduler::Host;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::{Duration, Instant};

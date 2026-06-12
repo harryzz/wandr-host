@@ -1,7 +1,6 @@
 pub mod arbiter_sock;
 mod egl;
 mod canvas_impl;
-mod paragraph_impl;
 mod window_impl;
 mod scheduler_impl;
 mod text_segmentation_impl;
@@ -76,13 +75,6 @@ pub mod standalone;
 #[cfg(target_os = "android")]
 pub mod run_once;
 
-mod bindings {
-    wasmtime::component::bindgen!({
-        path: "../../wit/skiko-gfx.wit",
-        world: "skiko-ui",
-    });
-}
-
 /// Task 49 step 1b — typed bindings for the IME-events export side of
 /// the IME-client contract (`wandr:ime/ime.on-editor-attached(info)` /
 /// `on-editor-detached()`). The host instantiates an IME component +
@@ -102,44 +94,6 @@ mod ime_bindings {
     });
 }
 
-/// Task 64 — typed bindings for the OPTIONAL `my:skiko-gfx/frame-pacing`
-/// export (`next-frame-delay() -> u32`). Guests that want on-demand
-/// rendering export `frame-pacing-world` (a probe-only world) alongside
-/// `renderer`. The host instantiates the component, then tries to bind
-/// these via `FramePacingWorld::new(...).ok()` (same pattern as
-/// `ime_bindings`); `Some` ⇒ the standalone loop gates render-frame on the
-/// returned delay, `None` ⇒ legacy unconditional 60 fps. See task 64.
-mod frame_pacing_bindings {
-    wasmtime::component::bindgen!({
-        path: "../../wit/skiko-gfx.wit",
-        world: "frame-pacing-world",
-    });
-}
-
-/// wasi:canvas draft (proposals/wasi-canvas) host bindings — feature-gated
-/// (`wasi-canvas`). A SECOND canvas package over the same SkiaRenderer,
-/// coexisting with my:skiko-gfx (see proposals/wasi-canvas/COMPATIBILITY.md).
-/// Resources map onto host types in `wasi_canvas_impl`.
-#[cfg(feature = "wasi-canvas")]
-mod wasi_canvas_bindings {
-    wasmtime::component::bindgen!({
-        path: "../../proposals/wasi-canvas/wit",
-        world: "canvas-host",
-        // All methods return wasmtime::Result so table lookups can trap.
-        imports: { default: trappable },
-        with: {
-            "wasi:canvas/types.shader": crate::wasi_canvas_impl::ShaderRes,
-            "wasi:canvas/types.image": crate::wasi_canvas_impl::ImageRes,
-            "wasi:canvas/draw.canvas": crate::wasi_canvas_impl::CanvasRes,
-            "wasi:canvas/draw.graphics": crate::wasi_canvas_impl::GraphicsRes,
-            "wasi:canvas/embedding.canvas-context": crate::wasi_canvas_impl::CanvasContextRes,
-            "wasi:canvas/draw.picture": crate::wasi_canvas_impl::PictureRes,
-            "wasi:canvas/glyphs.typeface": crate::wasi_canvas_impl::TypefaceRes,
-            "wasi:canvas/layout.paragraph": crate::wasi_canvas_impl::ParagraphRes,
-            "wasi:canvas/layout.paragraph-builder": crate::wasi_canvas_impl::ParagraphBuilderRes,
-        },
-    });
-}
 #[cfg(feature = "wasi-canvas")]
 mod wasi_canvas_impl;
 
@@ -170,33 +124,6 @@ mod wasi_canvas_002_bindings {
 }
 #[cfg(feature = "wasi-canvas")]
 mod wasi_canvas_002_impl;
-
-/// wasi:input-handlers draft (proposals/wasi-input-handlers) — push-model
-/// input EXPORTED by new-style guests. Three independent probe-only
-/// worlds (the frame-pacing pattern); per input type the host routes
-/// EXCLUSIVELY to a bound handler, legacy renderer events only when
-/// unbound. Not feature-gated: probing costs nothing for guests that
-/// don't export them.
-pub mod input_handlers_bindings {
-    pub mod pointer {
-        wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit",
-            world: "pointer-handler-world",
-        });
-    }
-    pub mod key {
-        wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit",
-            world: "key-handler-world",
-        });
-    }
-    pub mod frame {
-        wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit",
-            world: "frame-handler-world",
-        });
-    }
-}
 
 /// The consolidation event, Phase A (docs/ui-shell-consolidation.md):
 /// the my:skiko-gfx platform remainder re-bound under its real homes —
@@ -302,18 +229,6 @@ pub mod input_handlers_002_bindings {
             world: "gesture-handler-world",
         });
     }
-}
-
-/// Typed bindings for the OPTIONAL `my:skiko-gfx/key-input` export — the
-/// W3C-UIEvents key model (code token + modifiers + text) for guests that
-/// want desktop-grade keyboards (see the interface doc in skiko-gfx.wit).
-/// Probed after instantiation like `frame_pacing_bindings`; hosts emit
-/// v1 + v2 + (v3 when bound) for every keystroke.
-pub mod key_input_bindings {
-    wasmtime::component::bindgen!({
-        path: "../../wit/skiko-gfx.wit",
-        world: "key-input-world",
-    });
 }
 
 /// Arbiter Inc. 3c — host-import side of `wandr:alarm`. The host implements
@@ -541,10 +456,6 @@ pub struct App {
     engine:          Engine,
     loaded:          Option<LoadedApp>,
     store:           Option<Store<HostState>>,
-    bindings:        Option<bindings::SkikoUi>,
-    // Some(...) only if the guest exports my:skiko-gfx/key-input (the W3C
-    // key model — this winit path IS the desktop host it exists for).
-    key_input:       Option<key_input_bindings::KeyInputWorld>,
     // wasi:input-handlers probes — exclusive routing per input type.
     guest_input:     input::GuestInput,
     // wandr:ui-shell/shell-events export probe — lifecycle + scheduler
@@ -592,8 +503,6 @@ impl App {
             engine,
             loaded,
             store: None,
-            bindings: None,
-            key_input: None,
             guest_input: input::GuestInput::default(),
             shell_events: None,
             test_renderer: None,
@@ -663,7 +572,7 @@ impl ApplicationHandler for App {
             let _stale = std::mem::replace(old_renderer, new_renderer);
             drop(_stale);
             self.window = Some(window);
-            self.set_lifecycle(bindings::my::skiko_gfx::lifecycle::State::Resumed);
+            self.set_lifecycle(crate::ui_shell_bindings::wandr::ui_shell::lifecycle::State::Resumed);
             if let Some(w) = &self.window { w.request_redraw(); }
             return;
         }
@@ -708,8 +617,8 @@ impl ApplicationHandler for App {
                 renderer,
                 scheduler: scheduler_impl::SchedulerState::default(),
                 lifecycle: lifecycle_impl::LifecycleState {
-                    current: bindings::my::skiko_gfx::lifecycle::State::Resumed,
-                    pending: Some(bindings::my::skiko_gfx::lifecycle::State::Resumed),
+                    current: crate::ui_shell_bindings::wandr::ui_shell::lifecycle::State::Resumed,
+                    pending: Some(crate::ui_shell_bindings::wandr::ui_shell::lifecycle::State::Resumed),
                 },
                 clipboard: None,
                 wasi,
@@ -748,8 +657,6 @@ impl ApplicationHandler for App {
             log::info!("WASM component instantiated");
 
             self.store    = Some(store);
-            self.bindings = inst.skiko;
-            self.key_input = inst.key_input;
             self.guest_input = inst.guest_input;
             self.shell_events = inst.shell_events;
         } else {
@@ -765,7 +672,7 @@ impl ApplicationHandler for App {
         log::info!("suspended — dispatching Stopped, dropping window (store kept alive)");
         // Dispatch Stopped through the guest BEFORE releasing the window —
         // wasm-side observers can react while the renderer is still valid.
-        self.set_lifecycle(bindings::my::skiko_gfx::lifecycle::State::Stopped);
+        self.set_lifecycle(crate::ui_shell_bindings::wandr::ui_shell::lifecycle::State::Stopped);
         // Drop the Window reference so winit / android-activity can release
         // the NativeWindow cleanly. The renderer's EGL surface inside the
         // wasmtime Store will become invalid as a side effect; nothing
@@ -785,7 +692,6 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 if let Some(s) = self.store.as_mut() {
-                    let b = self.bindings.as_ref();
                     let sh = self.shell_events.as_ref();
                     // No init() call needed — appMain() runs on the first render-frame.
                     let nanos = std::time::SystemTime::now()
@@ -797,14 +703,14 @@ impl ApplicationHandler for App {
                     let due = s.data_mut().scheduler.drain_due(std::time::Instant::now());
                     for callback_id in due {
                         if let Err(e) =
-                            input::dispatch_scheduled_callback(b, sh, &mut *s, callback_id)
+                            input::dispatch_scheduled_callback(sh, &mut *s, callback_id)
                         {
                             log::warn!("on_scheduled_callback({callback_id}) failed: {e:#}");
                         }
                     }
 
                     let t0 = std::time::Instant::now();
-                    let result = input::dispatch_frame(b, &mut *s, &self.guest_input, nanos);
+                    let result = input::dispatch_frame(&mut *s, &self.guest_input, nanos);
 
                     // Fire any pending lifecycle transition AFTER the first
                     // render_frame succeeds (gives appMain a chance to register
@@ -813,7 +719,7 @@ impl ApplicationHandler for App {
                         let pending = s.data_mut().lifecycle.pending.take();
                         if let Some(state) = pending {
                             if let Err(e) =
-                                input::dispatch_lifecycle(b, sh, &mut *s, state as u32)
+                                input::dispatch_lifecycle(sh, &mut *s, state as u32)
                             {
                                 log::warn!("on_lifecycle_changed failed: {e:#}");
                             }
@@ -958,8 +864,7 @@ impl ApplicationHandler for App {
                 // laid out for the stale size — found via Slint on WSLg:
                 // the ListView collapsed to the pre-resize zero leftover).
                 if let Some(s) = self.store.as_mut() {
-                    let b = self.bindings.as_ref();
-                    let _ = input::dispatch_resize_routed(b, s, &self.guest_input, size.width, size.height);
+                    let _ = input::dispatch_resize_routed(s, &self.guest_input, size.width, size.height);
                 }
                 if let Some(w) = &self.window { w.request_redraw(); }
             }
@@ -984,9 +889,8 @@ impl ApplicationHandler for App {
                 };
                 let pointer_id: u32 = (t.id & 0xFFFF_FFFF) as u32;
                 if let Some(s) = self.store.as_mut() {
-                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_pointer_routed(
-                        b, s, &self.guest_input, kind, pointer_id,
+                        s, &self.guest_input, kind, pointer_id,
                         t.location.x as f32, t.location.y as f32,
                         pressure, [false; 4],
                         input::PointerMeta::touch_contact(kind != 1),
@@ -1002,9 +906,8 @@ impl ApplicationHandler for App {
                     self.modifiers.super_key(), self.modifiers.shift_key(),
                 ];
                 if let Some(s) = self.store.as_mut() {
-                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_pointer_routed(
-                        b, s, &self.guest_input, 2, 0,
+                        s, &self.guest_input, 2, 0,
                         self.last_cursor.0, self.last_cursor.1,
                         0.0, mods,
                         input::PointerMeta::mouse(0, self.buttons_held),
@@ -1033,9 +936,8 @@ impl ApplicationHandler for App {
                     self.modifiers.super_key(), self.modifiers.shift_key(),
                 ];
                 if let Some(s) = self.store.as_mut() {
-                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_pointer_routed(
-                        b, s, &self.guest_input, kind, 0, cx, cy, 1.0, mods,
+                        s, &self.guest_input, kind, 0, cx, cy, 1.0, mods,
                         input::PointerMeta::mouse(btn, self.buttons_held),
                     );
                 }
@@ -1066,9 +968,8 @@ impl ApplicationHandler for App {
                     self.modifiers.super_key(), self.modifiers.shift_key(),
                 ];
                 if let Some(s) = self.store.as_mut() {
-                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_pointer_routed(
-                        b, s, &self.guest_input, 3, 0, cx, cy, 0.0, mods,
+                        s, &self.guest_input, 3, 0, cx, cy, 0.0, mods,
                         input::PointerMeta::wheel(self.buttons_held, dx, dy),
                     );
                 }
@@ -1080,9 +981,8 @@ impl ApplicationHandler for App {
             WindowEvent::CursorEntered { .. } => {
                 let (cx, cy) = self.last_cursor;
                 if let Some(s) = self.store.as_mut() {
-                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_pointer_routed(
-                        b, s, &self.guest_input, 5, 0, cx, cy, 0.0, [false; 4],
+                        s, &self.guest_input, 5, 0, cx, cy, 0.0, [false; 4],
                         input::PointerMeta::mouse(0, self.buttons_held),
                     );
                 }
@@ -1090,9 +990,8 @@ impl ApplicationHandler for App {
             WindowEvent::CursorLeft { .. } => {
                 let (cx, cy) = self.last_cursor;
                 if let Some(s) = self.store.as_mut() {
-                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_pointer_routed(
-                        b, s, &self.guest_input, 6, 0, cx, cy, 0.0, [false; 4],
+                        s, &self.guest_input, 6, 0, cx, cy, 0.0, [false; 4],
                         input::PointerMeta::mouse(0, self.buttons_held),
                     );
                 }
@@ -1137,7 +1036,6 @@ impl ApplicationHandler for App {
                     _ => 0,  // Unknown — guest falls back to code-point if non-zero
                 };
                 if let Some(s) = self.store.as_mut() {
-                    let b = self.bindings.as_ref();
                     // winit's KeyCode variants are NAMED after the W3C
                     // UIEvents code tokens — the Debug name IS the token.
                     let w3c_code = match event.physical_key {
@@ -1156,22 +1054,7 @@ impl ApplicationHandler for App {
                         meta: self.modifiers.super_key(),
                         shift: self.modifiers.shift_key(),
                     };
-                    if matches!(input::dispatch_key_routed(&self.guest_input, s, &ev4), Ok(true)) {
-                        return;
-                    }
-                    let _ = input::dispatch_key(b, s, kind, code);
-                    let _ = input::dispatch_key_v2(b, s, kind, code_point, key_id);
-                    let ev3 = key_input_bindings::exports::my::skiko_gfx::key_input::KeyEvent {
-                        down: kind == 0,
-                        repeat: event.repeat,
-                        code: w3c_code,
-                        text,
-                        alt: self.modifiers.alt_key(),
-                        ctrl: self.modifiers.control_key(),
-                        meta: self.modifiers.super_key(),
-                        shift: self.modifiers.shift_key(),
-                    };
-                    let _ = input::dispatch_key_v3(self.key_input.as_ref(), s, &ev3);
+                    let _ = input::dispatch_key_routed(&self.guest_input, s, &ev4);
                 }
             }
 
@@ -1192,9 +1075,9 @@ impl ApplicationHandler for App {
             // right order.
             WindowEvent::Focused(focused) => {
                 self.set_lifecycle(if focused {
-                    bindings::my::skiko_gfx::lifecycle::State::Resumed
+                    crate::ui_shell_bindings::wandr::ui_shell::lifecycle::State::Resumed
                 } else {
-                    bindings::my::skiko_gfx::lifecycle::State::Paused
+                    crate::ui_shell_bindings::wandr::ui_shell::lifecycle::State::Paused
                 });
             }
 
@@ -1210,14 +1093,13 @@ impl App {
     /// on_lifecycle_changed when winit raises the same window-focus state
     /// multiple times.
     #[cfg(target_os = "android")]
-    fn set_lifecycle(&mut self, state: bindings::my::skiko_gfx::lifecycle::State) {
+    fn set_lifecycle(&mut self, state: crate::ui_shell_bindings::wandr::ui_shell::lifecycle::State) {
         if let Some(s) = self.store.as_mut() {
             if s.data().lifecycle.current == state {
                 return;
             }
             s.data_mut().lifecycle.current = state;
             if let Err(e) = input::dispatch_lifecycle(
-                self.bindings.as_ref(),
                 self.shell_events.as_ref(),
                 &mut *s,
                 state as u32,
@@ -1228,7 +1110,7 @@ impl App {
     }
 
     #[cfg(not(target_os = "android"))]
-    fn set_lifecycle(&mut self, _state: bindings::my::skiko_gfx::lifecycle::State) {}
+    fn set_lifecycle(&mut self, _state: crate::ui_shell_bindings::wandr::ui_shell::lifecycle::State) {}
 }
 
 #[cfg(target_os = "android")]

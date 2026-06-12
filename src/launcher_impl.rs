@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use crate::bindings::my::skiko_gfx::launcher::Host;
+use crate::chrome_bindings::wandr::chrome::launcher::Host;
 
 // arbiter socket: crate::arbiter_sock::arbiter_sock_path() ($WANDR_ARBITER_SOCK)
 

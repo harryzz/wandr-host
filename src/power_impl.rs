@@ -1,4 +1,4 @@
-use crate::bindings::my::skiko_gfx::power::{Hint, Host, Mode};
+use crate::device_bindings::wandr::device::power::{Hint, Host, Mode};
 
 // ── Binder path (Android, stable AIDL HAL) ───────────────────────────────────
 //

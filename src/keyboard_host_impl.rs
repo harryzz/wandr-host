@@ -16,7 +16,7 @@
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 
-use crate::bindings::my::skiko_gfx::keyboard::Host;
+use crate::keyboard_send_bindings::wandr::ime::keyboard_send::Host;
 
 // arbiter socket: crate::arbiter_sock::arbiter_sock_path() ($WANDR_ARBITER_SOCK)
 

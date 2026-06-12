@@ -11,7 +11,7 @@
 //! overlay sizing stays on `keyboard.request-overlay-height` (the host keeps
 //! owning the per-orientation px scaling; task 71 did NOT move that to percent).
 
-use crate::bindings::my::skiko_gfx::display::{Host, Orientation, Size};
+use crate::chrome_bindings::wandr::chrome::display::{Host, Orientation, Size};
 
 /// One-shot sanity log (process-global) — prints the geometry snapshot the
 /// first time any guest reads a size, so on-device verification can confirm

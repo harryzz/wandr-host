@@ -7,7 +7,7 @@
 use wasmtime::component::Resource;
 
 use crate::HostState;
-use crate::bindings::my::skiko_gfx::audio as old;
+use crate::audio_impl as old;
 use crate::wasi_audio_bindings::wasi::audio::pcm as wit;
 
 /// Playback stream = a legacy output track handle.
@@ -44,7 +44,7 @@ impl wit::HostPlayback for HostState {
         // The legacy backend collapses failure causes into sentinel 0;
         // surfaced as `unavailable` (permission/config splits are a
         // backend-side refinement lane).
-        let h = <HostState as old::Host>::create_track(self, old_config(&config));
+        let h = old::create_track(old_config(&config));
         if h == 0 {
             return Err(wit::AudioError::Unavailable);
         }
@@ -59,7 +59,7 @@ impl wit::HostPlayback for HostState {
             Ok(r) => r.0,
             Err(_) => return 0,
         };
-        <HostState as old::Host>::write_pcm_f32(self, h, samples)
+        old::write_pcm_f32(h, &samples)
     }
 
     fn buffered_frames(&mut self, self_: Resource<PlaybackRes>) -> u32 {
@@ -67,12 +67,12 @@ impl wit::HostPlayback for HostState {
             Ok(r) => r.0,
             Err(_) => return 0,
         };
-        <HostState as old::Host>::pending_frames(self, h)
+        old::pending_frames(h)
     }
 
     fn start(&mut self, self_: Resource<PlaybackRes>) -> Result<(), wit::AudioError> {
         let h = self.table.get(&self_).map_err(|_| wit::AudioError::Unavailable)?.0;
-        if <HostState as old::Host>::start(self, h) {
+        if old::start(h) {
             Ok(())
         } else {
             Err(wit::AudioError::Unavailable)
@@ -81,7 +81,7 @@ impl wit::HostPlayback for HostState {
 
     fn pause(&mut self, self_: Resource<PlaybackRes>) -> Result<(), wit::AudioError> {
         let h = self.table.get(&self_).map_err(|_| wit::AudioError::Unavailable)?.0;
-        if <HostState as old::Host>::pause(self, h) {
+        if old::pause(h) {
             Ok(())
         } else {
             Err(wit::AudioError::Unavailable)
@@ -90,7 +90,7 @@ impl wit::HostPlayback for HostState {
 
     fn drop(&mut self, rep: Resource<PlaybackRes>) -> wasmtime::Result<()> {
         let r = self.table.delete(rep)?;
-        <HostState as old::Host>::close(self, r.0);
+        old::close(r.0);
         Ok(())
     }
 }
@@ -100,7 +100,7 @@ impl wit::HostCapture for HostState {
         &mut self,
         config: wit::StreamConfig,
     ) -> Result<Resource<CaptureRes>, wit::AudioError> {
-        let h = <HostState as old::Host>::open_capture(self, old_config(&config));
+        let h = old::open_capture(old_config(&config));
         if h == 0 {
             return Err(wit::AudioError::Unavailable);
         }
@@ -115,7 +115,7 @@ impl wit::HostCapture for HostState {
             Ok(r) => r.0,
             Err(_) => return Vec::new(),
         };
-        <HostState as old::Host>::read_pcm_f32(self, h, max_frames)
+        old::read_pcm_f32(h, max_frames)
     }
 
     fn available_frames(&mut self, self_: Resource<CaptureRes>) -> u32 {
@@ -123,12 +123,12 @@ impl wit::HostCapture for HostState {
             Ok(r) => r.0,
             Err(_) => return 0,
         };
-        <HostState as old::Host>::pending_frames(self, h)
+        old::pending_frames(h)
     }
 
     fn start(&mut self, self_: Resource<CaptureRes>) -> Result<(), wit::AudioError> {
         let h = self.table.get(&self_).map_err(|_| wit::AudioError::Unavailable)?.0;
-        if <HostState as old::Host>::start(self, h) {
+        if old::start(h) {
             Ok(())
         } else {
             Err(wit::AudioError::Unavailable)
@@ -137,7 +137,7 @@ impl wit::HostCapture for HostState {
 
     fn pause(&mut self, self_: Resource<CaptureRes>) -> Result<(), wit::AudioError> {
         let h = self.table.get(&self_).map_err(|_| wit::AudioError::Unavailable)?.0;
-        if <HostState as old::Host>::pause(self, h) {
+        if old::pause(h) {
             Ok(())
         } else {
             Err(wit::AudioError::Unavailable)
@@ -146,7 +146,7 @@ impl wit::HostCapture for HostState {
 
     fn drop(&mut self, rep: Resource<CaptureRes>) -> wasmtime::Result<()> {
         let r = self.table.delete(rep)?;
-        <HostState as old::Host>::close(self, r.0);
+        old::close(r.0);
         Ok(())
     }
 }

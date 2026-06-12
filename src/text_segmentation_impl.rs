@@ -1,4 +1,4 @@
-use crate::bindings::my::skiko_gfx::text_segmentation::{BoundaryKind, Host};
+use crate::ui_shell_bindings::wandr::ui_shell::text_segmentation::{BoundaryKind, Host};
 use icu_segmenter::{
     GraphemeClusterSegmenter, LineSegmenter, SentenceSegmenter, WordSegmenter,
     options::{LineBreakOptions, SentenceBreakInvariantOptions, WordBreakInvariantOptions},

@@ -1,4 +1,4 @@
-use crate::bindings::my::skiko_gfx::pointer_icon::{Host, Kind};
+use crate::chrome_bindings::wandr::chrome::pointer_icon::{Host, Kind};
 
 /// No-op on Android touch devices. Hooked into the WIT so guests can call
 /// it unconditionally; the actual cursor change would require

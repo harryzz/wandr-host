@@ -1,4 +1,4 @@
-use crate::bindings::my::skiko_gfx::haptics::{Feedback, Host};
+use crate::device_bindings::wandr::device::haptics::{Feedback, Host};
 use std::fs;
 use std::path::Path;
 

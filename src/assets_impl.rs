@@ -11,7 +11,7 @@
 
 use std::path::{Component, Path};
 
-use crate::bindings::my::skiko_gfx::assets::Host;
+use crate::assets_pkg_bindings::wandr::assets::assets::Host;
 
 impl Host for crate::HostState {
     fn read(&mut self, name: String) -> Option<Vec<u8>> {

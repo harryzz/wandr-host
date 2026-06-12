@@ -20,9 +20,22 @@
 //! failing, we'll fall back to the BnAAudioClient stub pattern from
 //! task 20.
 
-use crate::bindings::my::skiko_gfx::audio::{
-    ChannelLayout, Format, Host, StreamClass, TrackConfig, TrackHandle,
-};
+// Phase C: the audio value types live HERE now (the my:skiko-gfx wire
+// types' post-consolidation home). wasi:audio (wasi_audio_impl) and the
+// host-internal consumers (ringer, routing) speak these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelLayout { Mono, Stereo }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format { PcmF32, PcmI16 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamClass { Media, VoiceCall, Notification }
+#[derive(Clone, Copy, Debug)]
+pub struct TrackConfig {
+    pub sample_rate: u32,
+    pub channel_layout: ChannelLayout,
+    pub format: Format,
+    pub class: StreamClass,
+}
 
 #[cfg(target_os = "android")]
 mod binder_path {
@@ -1929,41 +1942,6 @@ pub fn probe_backend(secs: u64, hz: f32, vol: f32) {
     eprintln!("probe-backend: done");
 }
 
-impl Host for crate::HostState {
-    // All methods delegate to the module-level backend-dispatch functions above
-    // (AudioFlinger-direct by default; legacy AAudio with WANDR_AUDIO_BACKEND=aaudio).
-    fn create_track(&mut self, cfg: TrackConfig) -> TrackHandle {
-        create_track(cfg)
-    }
-
-    fn write_pcm_f32(&mut self, track: TrackHandle, samples: Vec<f32>) -> u32 {
-        write_pcm_f32(track, &samples)
-    }
-
-    fn start(&mut self, track: TrackHandle) -> bool {
-        start(track)
-    }
-
-    fn pause(&mut self, track: TrackHandle) -> bool {
-        pause(track)
-    }
-
-    fn close(&mut self, track: TrackHandle) {
-        close(track)
-    }
-
-    fn pending_frames(&mut self, track: TrackHandle) -> u32 {
-        pending_frames(track)
-    }
-
-    fn open_capture(&mut self, cfg: TrackConfig) -> TrackHandle {
-        open_capture(cfg)
-    }
-
-    fn read_pcm_f32(&mut self, capture: TrackHandle, max_frames: u32) -> Vec<f32> {
-        read_pcm_f32(capture, max_frames)
-    }
-}
 
 /// Mic-capture de-risk entry (`wandr-host --probe-audio-capture`): does
 /// openStream(INPUT) succeed for our (root/su) caller? See `binder_path::probe_capture`.

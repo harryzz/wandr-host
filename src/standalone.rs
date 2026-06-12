@@ -17,7 +17,6 @@ use wasmtime::{Engine, Store};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 use crate::app_loader::{self, AppLoader, AppRef, LoadedApp};
-use crate::bindings;
 use crate::{App, HostState};
 
 /// Where the `libsf_surface` shim is deployed on the device.
@@ -489,7 +488,7 @@ fn run_cwasm_loop(
     // equal-layer tie-break and covers it).
     fg_layer: i32,
 ) -> Result<()> {
-    use bindings::my::skiko_gfx::lifecycle::State;
+    use crate::ui_shell_bindings::wandr::ui_shell::lifecycle::State;
 
     // Logical surface size the guest must lay its UI out to. The winit path
     // gets this from a `WindowEvent::Resized`; standalone has no winit, so we
@@ -562,7 +561,6 @@ fn run_cwasm_loop(
     }
 
     let inst = loaded.instantiate(&mut store)?;
-    let skiko = inst.skiko;
     let ime_events = inst.ime_events;
     // Arbiter Inc. 3c — Some(...) only if the guest exports wandr:alarm/alarm-handler.
     let alarm_events = inst.alarm_events;
@@ -575,15 +573,11 @@ fn run_cwasm_loop(
     // (below), so the arbiter's retained-value-on-subscribe delivery isn't dropped
     // by a not-yet-listening socket.
     let events_incoming = inst.events_incoming;
-    // Task 64 — Some(...) only if the guest exports my:skiko-gfx/frame-pacing.
-    let frame_pacing = inst.frame_pacing;
     // Phase B — wandr:ui-shell export probes. shell-events takes lifecycle +
     // scheduler callbacks EXCLUSIVELY when bound; shell frame-pacing likewise
     // wins over the legacy my:skiko-gfx/frame-pacing probe.
     let shell_events = inst.shell_events;
     let shell_pacing = inst.shell_pacing;
-    // Some(...) only if the guest exports my:skiko-gfx/key-input (W3C key model).
-    let key_input = inst.key_input;
     // wasi:input-handlers probes — exclusive routing per input type.
     let guest_input = inst.guest_input;
     // Signal bg-receipt (M2) — a background-service keeps pumping its engine
@@ -615,7 +609,7 @@ fn run_cwasm_loop(
 
     // Tell the guest the surface size before the first frame, so Compose lays
     // out to the full panel (no winit `Resized` event to do this for us).
-    if let Err(e) = crate::input::dispatch_resize_routed(skiko.as_ref(), &mut store, &guest_input, logical_w, logical_h)
+    if let Err(e) = crate::input::dispatch_resize_routed(&mut store, &guest_input, logical_w, logical_h)
     {
         log::warn!("standalone: on_resize({logical_w}x{logical_h}) failed: {e:#}");
     }
@@ -787,11 +781,11 @@ fn run_cwasm_loop(
                     if mode == OverlayMode::None {
                         report_orientation_lock_to_arbiter(orientation_locked);
                     }
-                    let target = bindings::my::skiko_gfx::lifecycle::State::Resumed;
+                    let target = State::Resumed;
                     if store.data().lifecycle.current != target {
                         store.data_mut().lifecycle.current = target;
                         if let Err(e) = crate::input::dispatch_lifecycle(
-                            skiko.as_ref(), shell_events.as_ref(), &mut store, target as u32)
+                            shell_events.as_ref(), &mut store, target as u32)
                         {
                             log::warn!("standalone: on_lifecycle_changed(fg→Resumed) failed: {e:#}");
                         }
@@ -800,11 +794,11 @@ fn run_cwasm_loop(
                 AppRole::Background => {
                     sf.set_layer(0);
                     sf.set_visible(false);
-                    let target = bindings::my::skiko_gfx::lifecycle::State::Paused;
+                    let target = State::Paused;
                     if store.data().lifecycle.current != target {
                         store.data_mut().lifecycle.current = target;
                         if let Err(e) = crate::input::dispatch_lifecycle(
-                            skiko.as_ref(), shell_events.as_ref(), &mut store, target as u32)
+                            shell_events.as_ref(), &mut store, target as u32)
                         {
                             log::warn!("standalone: on_lifecycle_changed(bg→Paused) failed: {e:#}");
                         }
@@ -820,11 +814,11 @@ fn run_cwasm_loop(
                     // background pool; IME at i32::MAX or MAX-1 wins.
                     sf.set_layer(0);
                     sf.set_visible(true);
-                    let target = bindings::my::skiko_gfx::lifecycle::State::Resumed;
+                    let target = State::Resumed;
                     if store.data().lifecycle.current != target {
                         store.data_mut().lifecycle.current = target;
                         if let Err(e) = crate::input::dispatch_lifecycle(
-                            skiko.as_ref(), shell_events.as_ref(), &mut store, target as u32)
+                            shell_events.as_ref(), &mut store, target as u32)
                         {
                             log::warn!("standalone: on_lifecycle_changed(overlay-behind→Resumed) failed: {e:#}");
                         }
@@ -862,7 +856,7 @@ fn run_cwasm_loop(
                         let r = &store.data().renderer;
                         (r.logical_width, r.logical_height)
                     };
-                    if let Err(e) = crate::input::dispatch_resize_routed(skiko.as_ref(), &mut store, &guest_input, lw, lh)
+                    if let Err(e) = crate::input::dispatch_resize_routed(&mut store, &guest_input, lw, lh)
                     {
                         log::warn!("standalone: overlay-resize on_resize({lw}x{lh}) failed: {e:#}");
                     }
@@ -910,7 +904,7 @@ fn run_cwasm_loop(
                     (r.logical_width, r.logical_height)
                 };
                 log::info!("standalone: orient change → {target_orient} logical {lw}x{lh}");
-                if let Err(e) = crate::input::dispatch_resize_routed(skiko.as_ref(), &mut store, &guest_input, lw, lh)
+                if let Err(e) = crate::input::dispatch_resize_routed(&mut store, &guest_input, lw, lh)
                 {
                     log::warn!("standalone: rotation on_resize({lw}x{lh}) failed: {e:#}");
                 }
@@ -946,7 +940,7 @@ fn run_cwasm_loop(
                     }
                 };
                 if let Err(e) = crate::input::dispatch_pointer_routed(
-                    skiko.as_ref(), &mut store, &guest_input, ev.kind as u8,
+                    &mut store, &guest_input, ev.kind as u8,
                     ev.pointer_id as u32, lx, ly, ev.pressure, [false; 4],
                     crate::input::PointerMeta::touch_contact(ev.kind != 1),
                 ) {
@@ -977,7 +971,7 @@ fn run_cwasm_loop(
                 } else {
                     let action = if ev.kind == 10 { 0u8 } else { 1u8 };
                     if let Err(e) = crate::input::dispatch_android_key(
-                        skiko.as_ref(), &mut store, &guest_input, key_input.as_ref(), action, ev.key_code, ev.meta_state,
+                        &mut store, &guest_input, action, ev.key_code, ev.meta_state,
                     ) {
                         log::warn!("standalone: dispatch_android_key failed: {e:#}");
                     }
@@ -1009,24 +1003,6 @@ fn run_cwasm_loop(
                             log::warn!("standalone: key-handler (ime-inbound) failed: {e:?}");
                             continue;
                         }
-                    }
-                    if let Err(e) = crate::input::dispatch_key_v2(
-                        skiko.as_ref(), &mut store, action, code_point, key_id,
-                    ) {
-                        log::warn!("standalone: dispatch_key_v2 (ime-inbound) failed: {e:#}");
-                    }
-                    // v3 (optional): soft-keyboard keys have no physical
-                    // code; named keys map via key-id, text via code-point.
-                    let ev3 = crate::key_input_bindings::exports::my::skiko_gfx::key_input::KeyEvent {
-                        down: action == 0,
-                        repeat: false,
-                        code: crate::input::key_id_to_w3c(key_id).to_string(),
-                        text: char::from_u32(code_point).filter(|c| *c != '\0')
-                            .map(String::from).unwrap_or_default(),
-                        alt: false, ctrl: false, meta: false, shift: false,
-                    };
-                    if let Err(e) = crate::input::dispatch_key_v3(key_input.as_ref(), &mut store, &ev3) {
-                        log::warn!("standalone: dispatch_key_v3 (ime-inbound) failed: {e:#}");
                     }
                 }
                 // Task 49 step 1a — IME-bound events. Only meaningful
@@ -1245,7 +1221,7 @@ fn run_cwasm_loop(
                         let r = &store.data().renderer;
                         (r.logical_width, r.logical_height)
                     };
-                    if let Err(e) = crate::input::dispatch_resize_routed(skiko.as_ref(), &mut store, &guest_input, lw, lh)
+                    if let Err(e) = crate::input::dispatch_resize_routed(&mut store, &guest_input, lw, lh)
                     {
                         log::warn!("standalone: keyboard-inset on_resize({lw}x{lh}) failed: {e:#}");
                     }
@@ -1312,7 +1288,7 @@ fn run_cwasm_loop(
                         let r = &store.data().renderer;
                         (r.logical_width, r.logical_height)
                     };
-                    if let Err(e) = crate::input::dispatch_resize_routed(skiko.as_ref(), &mut store, &guest_input, lw, lh)
+                    if let Err(e) = crate::input::dispatch_resize_routed(&mut store, &guest_input, lw, lh)
                     {
                         log::warn!("standalone: geometry on_resize({lw}x{lh}) failed: {e:#}");
                     }
@@ -1331,7 +1307,7 @@ fn run_cwasm_loop(
         }
         for cb in due {
             if let Err(e) = crate::input::dispatch_scheduled_callback(
-                skiko.as_ref(), shell_events.as_ref(), &mut store, cb)
+                shell_events.as_ref(), &mut store, cb)
             {
                 log::warn!("standalone: on_scheduled_callback({cb}) failed: {e:#}");
             }
@@ -1383,14 +1359,14 @@ fn run_cwasm_loop(
         // skip the expensive render_frame + buffer swap; bg-tick keeps it alive).
         let backgrounded = matches!(cur_role, crate::app_role::AppRole::Background);
         if !backgrounded && (frame < 3 || std::time::Instant::now() >= next_render_at || dirty) {
-            let result = crate::input::dispatch_frame(skiko.as_ref(), &mut store, &guest_input, nanos);
+            let result = crate::input::dispatch_frame(&mut store, &guest_input, nanos);
 
             // Fire the pending lifecycle transition after the first successful
             // frame (gives appMain a chance to register its observer first).
             if result.is_ok() {
                 if let Some(state) = store.data_mut().lifecycle.pending.take() {
                     if let Err(e) = crate::input::dispatch_lifecycle(
-                        skiko.as_ref(), shell_events.as_ref(), &mut store, state as u32)
+                        shell_events.as_ref(), &mut store, state as u32)
                     {
                         log::warn!("standalone: on_lifecycle_changed failed: {e:#}");
                     }
@@ -1412,11 +1388,6 @@ fn run_cwasm_loop(
             // the legacy unconditional path, rate-limited by the fps cap below).
             let guest_delay = if let Some(fp) = shell_pacing.as_ref() {
                 fp.wandr_ui_shell_frame_pacing()
-                    .call_next_frame_delay(&mut store)
-                    .unwrap_or(0)
-                    .min(IDLE_CAP_MS as u32) as u64
-            } else if let Some(fp) = frame_pacing.as_ref() {
-                fp.my_skiko_gfx_frame_pacing()
                     .call_next_frame_delay(&mut store)
                     .unwrap_or(0)
                     .min(IDLE_CAP_MS as u32) as u64
@@ -1499,10 +1470,10 @@ fn run_cwasm_loop(
     //              frames after so the resulting recompositions render
     //              before EGL/binder teardown via the SfSurface Drop chain.
     log::info!("standalone: dispatching Destroyed → drain frames → exit");
-    let final_state = bindings::my::skiko_gfx::lifecycle::State::Destroyed;
+    let final_state = State::Destroyed;
     store.data_mut().lifecycle.current = final_state;
     if let Err(e) = crate::input::dispatch_lifecycle(
-        skiko.as_ref(), shell_events.as_ref(), &mut store, final_state as u32)
+        shell_events.as_ref(), &mut store, final_state as u32)
     {
         log::warn!("standalone: on_lifecycle_changed(Destroyed) failed: {e:#}");
     }
@@ -1511,7 +1482,7 @@ fn run_cwasm_loop(
         .unwrap_or_default()
         .as_nanos() as u64;
     for _ in 0..3 {
-        if let Err(e) = crate::input::dispatch_frame(skiko.as_ref(), &mut store, &guest_input, drain_nanos)
+        if let Err(e) = crate::input::dispatch_frame(&mut store, &guest_input, drain_nanos)
         {
             log::warn!("standalone: drain render_frame failed: {e:#}");
             break;

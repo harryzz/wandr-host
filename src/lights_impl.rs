@@ -1,4 +1,4 @@
-use crate::bindings::my::skiko_gfx::lights::{FlashMode, Host, LightState, LightType};
+use crate::device_bindings::wandr::device::lights::{FlashMode, Host, LightState, LightType};
 
 // ── Binder path (Android, stable AIDL HAL) ───────────────────────────────────
 //

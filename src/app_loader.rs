@@ -21,7 +21,6 @@ use crate::app_installer::{
     engine_compatibility_hash_hex, format_cache_key, parse_resolved_deps_from_key,
     sha256_hex, ComponentCacheEntry,
 };
-use crate::bindings;
 use crate::HostState;
 
 /// What the caller wants to load.
@@ -217,24 +216,10 @@ struct LoadedDep {
 /// helpers) get `ime_events: None` because their components don't
 /// satisfy the ime-events world's exports.
 pub struct InstantiatedApp {
-    /// The legacy skiko-ui bindings — OPTIONAL since Phase B: new-style
-    /// guests (wasi:canvas 0.0.2 + input-handlers + ui-shell) don't
-    /// export my:skiko-gfx/renderer at all; dispatch handles None.
-    pub skiko: Option<bindings::SkikoUi>,
     /// `Some(...)` if the component exports `wandr:ime/ime`. The host's
     /// `ime_inbound.rs` drain calls into these when an
     /// `editor-attached`/`editor-detached` message arrives.
     pub ime_events: Option<crate::ime_bindings::ImeEvents>,
-    /// Task 64 — `Some(...)` if the component exports the optional
-    /// `my:skiko-gfx/frame-pacing` interface. The standalone render loop
-    /// calls `next-frame-delay` after each frame to gate on-demand
-    /// rendering; `None` keeps the legacy unconditional 60 fps path.
-    pub frame_pacing: Option<crate::frame_pacing_bindings::FramePacingWorld>,
-    /// `Some(...)` if the component exports the optional
-    /// `my:skiko-gfx/key-input` interface (W3C-UIEvents key model: code
-    /// token + modifiers + text). Key dispatch emits v1 + v2 always and
-    /// additionally `on-key` on these; `None` = mobile-shaped v2 only.
-    pub key_input: Option<crate::key_input_bindings::KeyInputWorld>,
     /// wasi:input-handlers probes (push-model input; new-style guests).
     /// Per input type, dispatch routes EXCLUSIVELY to a bound handler.
     pub guest_input: crate::input::GuestInput,
@@ -276,8 +261,6 @@ impl LoadedApp {
             .map_err(|e| anyhow!("wasmtime_wasi::p2::add_to_linker_sync: {e:#}"))?;
         crate::signal_tls::add_to_linker(&mut linker) // task 66 — wasi:tls (Signal CA)
             .map_err(|e| anyhow!("signal_tls::add_to_linker: {e:#}"))?;
-        bindings::SkikoUi::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
-            .map_err(|e| anyhow!("SkikoUi::add_to_linker: {e:#}"))?;
         crate::alarm_host_bindings::AlarmHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("AlarmHost::add_to_linker: {e:#}"))?; // Arbiter Inc. 3c
         crate::task_manager_host_bindings::TaskManagerHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
@@ -303,9 +286,6 @@ impl LoadedApp {
         crate::audio_focus_host_bindings::AudioFocusHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("AudioFocusHost::add_to_linker: {e:#}"))?; // wandr-arbiter-audio M2
         #[cfg(feature = "wasi-canvas")]
-        crate::wasi_canvas_impl::add_to_linker(&mut linker)
-            .map_err(|e| anyhow!("wasi-canvas add_to_linker: {e:#}"))?; // proposals/wasi-canvas draft
-        #[cfg(feature = "wasi-canvas")]
         crate::wasi_canvas_002_impl::add_to_linker(&mut linker)
             .map_err(|e| anyhow!("wasi-canvas-0.0.2 add_to_linker: {e:#}"))?; // R3 side-by-side
         crate::consolidated_impl::add_to_linker(&mut linker)
@@ -324,10 +304,6 @@ impl LoadedApp {
         let instance = linker
             .instantiate(&mut *store, &self.entry)
             .map_err(|e| anyhow!("linker.instantiate failed: {e:#}"))?;
-        let skiko = bindings::SkikoUi::new(&mut *store, &instance).ok();
-        if skiko.is_none() {
-            log::info!("loader: no my:skiko-gfx/renderer export — new-style guest (Phase B)");
-        }
         // Optional — IME apps (whose world `include`s
         // `wandr:ime/ime-events`) satisfy these exports; non-IME apps
         // don't. `.ok()` swallows the bind-failure into None.
@@ -335,25 +311,8 @@ impl LoadedApp {
         if ime_events.is_some() {
             log::info!("loader: app exports wandr:ime/ime — IME-events bindings enabled");
         }
-        // Task 64 — optional on-demand-render hint. Same .ok() probe: a
-        // guest that exports `frame-pacing-world` binds, one that doesn't
-        // yields None (legacy 60 fps).
-        let frame_pacing =
-            crate::frame_pacing_bindings::FramePacingWorld::new(&mut *store, &instance).ok();
-        if frame_pacing.is_some() {
-            log::info!("loader: app exports my:skiko-gfx/frame-pacing — on-demand rendering enabled");
-        }
-        // Optional W3C-UIEvents key model (same .ok() probe).
-        let key_input =
-            crate::key_input_bindings::KeyInputWorld::new(&mut *store, &instance).ok();
-        if key_input.is_some() {
-            log::info!("loader: app exports my:skiko-gfx/key-input — desktop key events enabled");
-        }
-        // wasi:input-handlers probes (each interface independently).
+        // wasi:input-handlers@0.0.2 probes (each interface independently).
         let guest_input = crate::input::GuestInput {
-            pointer: crate::input_handlers_bindings::pointer::PointerHandlerWorld::new(&mut *store, &instance).ok(),
-            key: crate::input_handlers_bindings::key::KeyHandlerWorld::new(&mut *store, &instance).ok(),
-            frame: crate::input_handlers_bindings::frame::FrameHandlerWorld::new(&mut *store, &instance).ok(),
             pointer2: crate::input_handlers_002_bindings::pointer::PointerHandlerWorld::new(&mut *store, &instance).ok(),
             key2: crate::input_handlers_002_bindings::key::KeyHandlerWorld::new(&mut *store, &instance).ok(),
             frame2: crate::input_handlers_002_bindings::frame::FrameHandlerWorld::new(&mut *store, &instance).ok(),
@@ -362,12 +321,7 @@ impl LoadedApp {
             crate::ui_shell_export_bindings::events::ShellEventsWorld::new(&mut *store, &instance).ok();
         let shell_pacing =
             crate::ui_shell_export_bindings::pacing::FramePacingWorld::new(&mut *store, &instance).ok();
-        if guest_input.pointer.is_some() || guest_input.key.is_some() || guest_input.frame.is_some() {
-            log::info!(
-                "loader: app exports wasi:input-handlers (pointer={} key={} frame={})",
-                guest_input.pointer.is_some(), guest_input.key.is_some(), guest_input.frame.is_some(),
-            );
-        }
+
         // Arbiter Inc. 3c — optional alarm handler (same .ok() probe).
         let alarm_events =
             crate::alarm_events_bindings::AlarmEvents::new(&mut *store, &instance).ok();
@@ -399,7 +353,7 @@ impl LoadedApp {
             log::info!("loader: app exports wandr:events/incoming-handler — event-bus delivery enabled");
         }
         Ok(InstantiatedApp {
-            skiko, ime_events, frame_pacing, key_input, guest_input,
+            ime_events, guest_input,
             shell_events,
             shell_pacing, alarm_events, bg_tick,
             notify_events, audio_focus_events, events_incoming,
@@ -420,8 +374,6 @@ impl LoadedApp {
             .map_err(|e| anyhow!("wasmtime_wasi::p2::add_to_linker_sync: {e:#}"))?;
         crate::signal_tls::add_to_linker(&mut linker) // task 66 — wasi:tls (Signal CA)
             .map_err(|e| anyhow!("signal_tls::add_to_linker: {e:#}"))?;
-        bindings::SkikoUi::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
-            .map_err(|e| anyhow!("SkikoUi::add_to_linker: {e:#}"))?;
         crate::alarm_host_bindings::AlarmHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("AlarmHost::add_to_linker: {e:#}"))?; // Arbiter Inc. 3c
         crate::task_manager_host_bindings::TaskManagerHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
@@ -446,9 +398,6 @@ impl LoadedApp {
             .map_err(|e| anyhow!("KeyguardHost::add_to_linker: {e:#}"))?; // keyguard M3
         crate::audio_focus_host_bindings::AudioFocusHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("AudioFocusHost::add_to_linker: {e:#}"))?; // wandr-arbiter-audio M2
-        #[cfg(feature = "wasi-canvas")]
-        crate::wasi_canvas_impl::add_to_linker(&mut linker)
-            .map_err(|e| anyhow!("wasi-canvas add_to_linker: {e:#}"))?; // proposals/wasi-canvas draft
         #[cfg(feature = "wasi-canvas")]
         crate::wasi_canvas_002_impl::add_to_linker(&mut linker)
             .map_err(|e| anyhow!("wasi-canvas-0.0.2 add_to_linker: {e:#}"))?; // R3 side-by-side
