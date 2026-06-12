@@ -547,6 +547,9 @@ pub struct App {
     key_input:       Option<key_input_bindings::KeyInputWorld>,
     // wasi:input-handlers probes — exclusive routing per input type.
     guest_input:     input::GuestInput,
+    // wandr:ui-shell/shell-events export probe — lifecycle + scheduler
+    // callbacks route here EXCLUSIVELY when bound (Phase B preference).
+    shell_events:    Option<input::ShellEventsWorld>,
     // Renderer owned directly when running without a WASM component.
     test_renderer:   Option<canvas_impl::SkiaRenderer>,
     last_cursor:     (f32, f32),
@@ -592,6 +595,7 @@ impl App {
             bindings: None,
             key_input: None,
             guest_input: input::GuestInput::default(),
+            shell_events: None,
             test_renderer: None,
             last_cursor: (0.0, 0.0),
             buttons_held: 0,
@@ -650,7 +654,7 @@ impl ApplicationHandler for App {
         // inherited — their textures lived in the dying gr_context.
         // Composition, scheduler state, and lifecycle observers persist
         // because the wasmtime Store is preserved.
-        if self.store.is_some() && self.bindings.is_some() {
+        if self.store.is_some() {
             log::info!("resumed (warm) — swapping renderer in existing store, inheriting CPU caches");
             let store = self.store.as_mut().unwrap();
             let mut new_renderer = renderer;
@@ -744,9 +748,10 @@ impl ApplicationHandler for App {
             log::info!("WASM component instantiated");
 
             self.store    = Some(store);
-            self.bindings = Some(inst.skiko);
+            self.bindings = inst.skiko;
             self.key_input = inst.key_input;
             self.guest_input = inst.guest_input;
+            self.shell_events = inst.shell_events;
         } else {
             log::info!("no WASM component — running in renderer-test mode");
             self.test_renderer = Some(renderer);
@@ -779,7 +784,9 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
 
             WindowEvent::RedrawRequested => {
-                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                if let Some(s) = self.store.as_mut() {
+                    let b = self.bindings.as_ref();
+                    let sh = self.shell_events.as_ref();
                     // No init() call needed — appMain() runs on the first render-frame.
                     let nanos = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -789,8 +796,8 @@ impl ApplicationHandler for App {
                     // Drain any scheduler callbacks whose deadline has passed.
                     let due = s.data_mut().scheduler.drain_due(std::time::Instant::now());
                     for callback_id in due {
-                        if let Err(e) = b.my_skiko_gfx_renderer()
-                            .call_on_scheduled_callback(&mut *s, callback_id)
+                        if let Err(e) =
+                            input::dispatch_scheduled_callback(b, sh, &mut *s, callback_id)
                         {
                             log::warn!("on_scheduled_callback({callback_id}) failed: {e:#}");
                         }
@@ -805,8 +812,8 @@ impl ApplicationHandler for App {
                     if result.is_ok() {
                         let pending = s.data_mut().lifecycle.pending.take();
                         if let Some(state) = pending {
-                            if let Err(e) = b.my_skiko_gfx_renderer()
-                                .call_on_lifecycle_changed(&mut *s, state as u32)
+                            if let Err(e) =
+                                input::dispatch_lifecycle(b, sh, &mut *s, state as u32)
                             {
                                 log::warn!("on_lifecycle_changed failed: {e:#}");
                             }
@@ -950,7 +957,8 @@ impl ApplicationHandler for App {
                 // geometry pushes; without it a WM resize leaves the guest
                 // laid out for the stale size — found via Slint on WSLg:
                 // the ListView collapsed to the pre-resize zero leftover).
-                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                if let Some(s) = self.store.as_mut() {
+                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_resize_routed(b, s, &self.guest_input, size.width, size.height);
                 }
                 if let Some(w) = &self.window { w.request_redraw(); }
@@ -975,7 +983,8 @@ impl ApplicationHandler for App {
                     None => 0.0,
                 };
                 let pointer_id: u32 = (t.id & 0xFFFF_FFFF) as u32;
-                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                if let Some(s) = self.store.as_mut() {
+                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_pointer_routed(
                         b, s, &self.guest_input, kind, pointer_id,
                         t.location.x as f32, t.location.y as f32,
@@ -992,7 +1001,8 @@ impl ApplicationHandler for App {
                     self.modifiers.alt_key(), self.modifiers.control_key(),
                     self.modifiers.super_key(), self.modifiers.shift_key(),
                 ];
-                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                if let Some(s) = self.store.as_mut() {
+                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_pointer_routed(
                         b, s, &self.guest_input, 2, 0,
                         self.last_cursor.0, self.last_cursor.1,
@@ -1022,7 +1032,8 @@ impl ApplicationHandler for App {
                     self.modifiers.alt_key(), self.modifiers.control_key(),
                     self.modifiers.super_key(), self.modifiers.shift_key(),
                 ];
-                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                if let Some(s) = self.store.as_mut() {
+                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_pointer_routed(
                         b, s, &self.guest_input, kind, 0, cx, cy, 1.0, mods,
                         input::PointerMeta::mouse(btn, self.buttons_held),
@@ -1054,7 +1065,8 @@ impl ApplicationHandler for App {
                     self.modifiers.alt_key(), self.modifiers.control_key(),
                     self.modifiers.super_key(), self.modifiers.shift_key(),
                 ];
-                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                if let Some(s) = self.store.as_mut() {
+                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_pointer_routed(
                         b, s, &self.guest_input, 3, 0, cx, cy, 0.0, mods,
                         input::PointerMeta::wheel(self.buttons_held, dx, dy),
@@ -1067,7 +1079,8 @@ impl ApplicationHandler for App {
             // 0.0.1/legacy guests by the dispatch routing.
             WindowEvent::CursorEntered { .. } => {
                 let (cx, cy) = self.last_cursor;
-                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                if let Some(s) = self.store.as_mut() {
+                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_pointer_routed(
                         b, s, &self.guest_input, 5, 0, cx, cy, 0.0, [false; 4],
                         input::PointerMeta::mouse(0, self.buttons_held),
@@ -1076,7 +1089,8 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorLeft { .. } => {
                 let (cx, cy) = self.last_cursor;
-                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                if let Some(s) = self.store.as_mut() {
+                    let b = self.bindings.as_ref();
                     let _ = input::dispatch_pointer_routed(
                         b, s, &self.guest_input, 6, 0, cx, cy, 0.0, [false; 4],
                         input::PointerMeta::mouse(0, self.buttons_held),
@@ -1122,7 +1136,8 @@ impl ApplicationHandler for App {
                     Key::Named(NamedKey::Delete)     => 46,
                     _ => 0,  // Unknown — guest falls back to code-point if non-zero
                 };
-                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                if let Some(s) = self.store.as_mut() {
+                    let b = self.bindings.as_ref();
                     // winit's KeyCode variants are NAMED after the W3C
                     // UIEvents code tokens — the Debug name IS the token.
                     let w3c_code = match event.physical_key {
@@ -1196,14 +1211,17 @@ impl App {
     /// multiple times.
     #[cfg(target_os = "android")]
     fn set_lifecycle(&mut self, state: bindings::my::skiko_gfx::lifecycle::State) {
-        if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+        if let Some(s) = self.store.as_mut() {
             if s.data().lifecycle.current == state {
                 return;
             }
             s.data_mut().lifecycle.current = state;
-            if let Err(e) = b.my_skiko_gfx_renderer()
-                .call_on_lifecycle_changed(&mut *s, state as u32)
-            {
+            if let Err(e) = input::dispatch_lifecycle(
+                self.bindings.as_ref(),
+                self.shell_events.as_ref(),
+                &mut *s,
+                state as u32,
+            ) {
                 log::warn!("on_lifecycle_changed({state:?}) failed: {e:#}");
             }
         }

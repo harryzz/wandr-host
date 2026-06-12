@@ -577,6 +577,11 @@ fn run_cwasm_loop(
     let events_incoming = inst.events_incoming;
     // Task 64 — Some(...) only if the guest exports my:skiko-gfx/frame-pacing.
     let frame_pacing = inst.frame_pacing;
+    // Phase B — wandr:ui-shell export probes. shell-events takes lifecycle +
+    // scheduler callbacks EXCLUSIVELY when bound; shell frame-pacing likewise
+    // wins over the legacy my:skiko-gfx/frame-pacing probe.
+    let shell_events = inst.shell_events;
+    let shell_pacing = inst.shell_pacing;
     // Some(...) only if the guest exports my:skiko-gfx/key-input (W3C key model).
     let key_input = inst.key_input;
     // wasi:input-handlers probes — exclusive routing per input type.
@@ -610,7 +615,7 @@ fn run_cwasm_loop(
 
     // Tell the guest the surface size before the first frame, so Compose lays
     // out to the full panel (no winit `Resized` event to do this for us).
-    if let Err(e) = crate::input::dispatch_resize_routed(&skiko, &mut store, &guest_input, logical_w, logical_h)
+    if let Err(e) = crate::input::dispatch_resize_routed(skiko.as_ref(), &mut store, &guest_input, logical_w, logical_h)
     {
         log::warn!("standalone: on_resize({logical_w}x{logical_h}) failed: {e:#}");
     }
@@ -785,9 +790,8 @@ fn run_cwasm_loop(
                     let target = bindings::my::skiko_gfx::lifecycle::State::Resumed;
                     if store.data().lifecycle.current != target {
                         store.data_mut().lifecycle.current = target;
-                        if let Err(e) = skiko
-                            .my_skiko_gfx_renderer()
-                            .call_on_lifecycle_changed(&mut store, target as u32)
+                        if let Err(e) = crate::input::dispatch_lifecycle(
+                            skiko.as_ref(), shell_events.as_ref(), &mut store, target as u32)
                         {
                             log::warn!("standalone: on_lifecycle_changed(fg→Resumed) failed: {e:#}");
                         }
@@ -799,9 +803,8 @@ fn run_cwasm_loop(
                     let target = bindings::my::skiko_gfx::lifecycle::State::Paused;
                     if store.data().lifecycle.current != target {
                         store.data_mut().lifecycle.current = target;
-                        if let Err(e) = skiko
-                            .my_skiko_gfx_renderer()
-                            .call_on_lifecycle_changed(&mut store, target as u32)
+                        if let Err(e) = crate::input::dispatch_lifecycle(
+                            skiko.as_ref(), shell_events.as_ref(), &mut store, target as u32)
                         {
                             log::warn!("standalone: on_lifecycle_changed(bg→Paused) failed: {e:#}");
                         }
@@ -820,9 +823,8 @@ fn run_cwasm_loop(
                     let target = bindings::my::skiko_gfx::lifecycle::State::Resumed;
                     if store.data().lifecycle.current != target {
                         store.data_mut().lifecycle.current = target;
-                        if let Err(e) = skiko
-                            .my_skiko_gfx_renderer()
-                            .call_on_lifecycle_changed(&mut store, target as u32)
+                        if let Err(e) = crate::input::dispatch_lifecycle(
+                            skiko.as_ref(), shell_events.as_ref(), &mut store, target as u32)
                         {
                             log::warn!("standalone: on_lifecycle_changed(overlay-behind→Resumed) failed: {e:#}");
                         }
@@ -860,7 +862,7 @@ fn run_cwasm_loop(
                         let r = &store.data().renderer;
                         (r.logical_width, r.logical_height)
                     };
-                    if let Err(e) = crate::input::dispatch_resize_routed(&skiko, &mut store, &guest_input, lw, lh)
+                    if let Err(e) = crate::input::dispatch_resize_routed(skiko.as_ref(), &mut store, &guest_input, lw, lh)
                     {
                         log::warn!("standalone: overlay-resize on_resize({lw}x{lh}) failed: {e:#}");
                     }
@@ -908,7 +910,7 @@ fn run_cwasm_loop(
                     (r.logical_width, r.logical_height)
                 };
                 log::info!("standalone: orient change → {target_orient} logical {lw}x{lh}");
-                if let Err(e) = crate::input::dispatch_resize_routed(&skiko, &mut store, &guest_input, lw, lh)
+                if let Err(e) = crate::input::dispatch_resize_routed(skiko.as_ref(), &mut store, &guest_input, lw, lh)
                 {
                     log::warn!("standalone: rotation on_resize({lw}x{lh}) failed: {e:#}");
                 }
@@ -944,7 +946,7 @@ fn run_cwasm_loop(
                     }
                 };
                 if let Err(e) = crate::input::dispatch_pointer_routed(
-                    &skiko, &mut store, &guest_input, ev.kind as u8,
+                    skiko.as_ref(), &mut store, &guest_input, ev.kind as u8,
                     ev.pointer_id as u32, lx, ly, ev.pressure, [false; 4],
                     crate::input::PointerMeta::touch_contact(ev.kind != 1),
                 ) {
@@ -975,7 +977,7 @@ fn run_cwasm_loop(
                 } else {
                     let action = if ev.kind == 10 { 0u8 } else { 1u8 };
                     if let Err(e) = crate::input::dispatch_android_key(
-                        &skiko, &mut store, &guest_input, key_input.as_ref(), action, ev.key_code, ev.meta_state,
+                        skiko.as_ref(), &mut store, &guest_input, key_input.as_ref(), action, ev.key_code, ev.meta_state,
                     ) {
                         log::warn!("standalone: dispatch_android_key failed: {e:#}");
                     }
@@ -1009,7 +1011,7 @@ fn run_cwasm_loop(
                         }
                     }
                     if let Err(e) = crate::input::dispatch_key_v2(
-                        &skiko, &mut store, action, code_point, key_id,
+                        skiko.as_ref(), &mut store, action, code_point, key_id,
                     ) {
                         log::warn!("standalone: dispatch_key_v2 (ime-inbound) failed: {e:#}");
                     }
@@ -1243,7 +1245,7 @@ fn run_cwasm_loop(
                         let r = &store.data().renderer;
                         (r.logical_width, r.logical_height)
                     };
-                    if let Err(e) = crate::input::dispatch_resize_routed(&skiko, &mut store, &guest_input, lw, lh)
+                    if let Err(e) = crate::input::dispatch_resize_routed(skiko.as_ref(), &mut store, &guest_input, lw, lh)
                     {
                         log::warn!("standalone: keyboard-inset on_resize({lw}x{lh}) failed: {e:#}");
                     }
@@ -1310,7 +1312,7 @@ fn run_cwasm_loop(
                         let r = &store.data().renderer;
                         (r.logical_width, r.logical_height)
                     };
-                    if let Err(e) = crate::input::dispatch_resize_routed(&skiko, &mut store, &guest_input, lw, lh)
+                    if let Err(e) = crate::input::dispatch_resize_routed(skiko.as_ref(), &mut store, &guest_input, lw, lh)
                     {
                         log::warn!("standalone: geometry on_resize({lw}x{lh}) failed: {e:#}");
                     }
@@ -1328,9 +1330,8 @@ fn run_cwasm_loop(
             dirty = true; // task 64 — a timer came due (delay()/animation tick)
         }
         for cb in due {
-            if let Err(e) = skiko
-                .my_skiko_gfx_renderer()
-                .call_on_scheduled_callback(&mut store, cb)
+            if let Err(e) = crate::input::dispatch_scheduled_callback(
+                skiko.as_ref(), shell_events.as_ref(), &mut store, cb)
             {
                 log::warn!("standalone: on_scheduled_callback({cb}) failed: {e:#}");
             }
@@ -1382,15 +1383,14 @@ fn run_cwasm_loop(
         // skip the expensive render_frame + buffer swap; bg-tick keeps it alive).
         let backgrounded = matches!(cur_role, crate::app_role::AppRole::Background);
         if !backgrounded && (frame < 3 || std::time::Instant::now() >= next_render_at || dirty) {
-            let result = crate::input::dispatch_frame(&skiko, &mut store, &guest_input, nanos);
+            let result = crate::input::dispatch_frame(skiko.as_ref(), &mut store, &guest_input, nanos);
 
             // Fire the pending lifecycle transition after the first successful
             // frame (gives appMain a chance to register its observer first).
             if result.is_ok() {
                 if let Some(state) = store.data_mut().lifecycle.pending.take() {
-                    if let Err(e) = skiko
-                        .my_skiko_gfx_renderer()
-                        .call_on_lifecycle_changed(&mut store, state as u32)
+                    if let Err(e) = crate::input::dispatch_lifecycle(
+                        skiko.as_ref(), shell_events.as_ref(), &mut store, state as u32)
                     {
                         log::warn!("standalone: on_lifecycle_changed failed: {e:#}");
                     }
@@ -1407,15 +1407,21 @@ fn run_cwasm_loop(
             }
 
             // Ask the guest how long it may sleep before the next frame.
-            // No frame-pacing export ⇒ 0 (render every interval — the legacy
-            // unconditional path, now rate-limited by the fps cap below).
-            let guest_delay = match frame_pacing.as_ref() {
-                Some(fp) => fp
-                    .my_skiko_gfx_frame_pacing()
+            // A wandr:ui-shell/frame-pacing export wins over the legacy
+            // my:skiko-gfx probe; neither bound ⇒ 0 (render every interval —
+            // the legacy unconditional path, rate-limited by the fps cap below).
+            let guest_delay = if let Some(fp) = shell_pacing.as_ref() {
+                fp.wandr_ui_shell_frame_pacing()
                     .call_next_frame_delay(&mut store)
                     .unwrap_or(0)
-                    .min(IDLE_CAP_MS as u32) as u64,
-                None => 0,
+                    .min(IDLE_CAP_MS as u32) as u64
+            } else if let Some(fp) = frame_pacing.as_ref() {
+                fp.my_skiko_gfx_frame_pacing()
+                    .call_next_frame_delay(&mut store)
+                    .unwrap_or(0)
+                    .min(IDLE_CAP_MS as u32) as u64
+            } else {
+                0
             };
             // Floor the next-frame delay by the fps cap so an animating /
             // unconditional guest never renders faster than `target_fps`.
@@ -1495,9 +1501,8 @@ fn run_cwasm_loop(
     log::info!("standalone: dispatching Destroyed → drain frames → exit");
     let final_state = bindings::my::skiko_gfx::lifecycle::State::Destroyed;
     store.data_mut().lifecycle.current = final_state;
-    if let Err(e) = skiko
-        .my_skiko_gfx_renderer()
-        .call_on_lifecycle_changed(&mut store, final_state as u32)
+    if let Err(e) = crate::input::dispatch_lifecycle(
+        skiko.as_ref(), shell_events.as_ref(), &mut store, final_state as u32)
     {
         log::warn!("standalone: on_lifecycle_changed(Destroyed) failed: {e:#}");
     }
@@ -1506,7 +1511,7 @@ fn run_cwasm_loop(
         .unwrap_or_default()
         .as_nanos() as u64;
     for _ in 0..3 {
-        if let Err(e) = crate::input::dispatch_frame(&skiko, &mut store, &guest_input, drain_nanos)
+        if let Err(e) = crate::input::dispatch_frame(skiko.as_ref(), &mut store, &guest_input, drain_nanos)
         {
             log::warn!("standalone: drain render_frame failed: {e:#}");
             break;

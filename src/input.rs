@@ -106,7 +106,7 @@ fn touch_suppressed() -> bool {
 }
 
 pub fn dispatch_pointer(
-    bindings: &SkikoUi,
+    bindings: Option<&SkikoUi>,
     store: &mut Store<HostState>,
     kind: u8,
     x: f32, y: f32,
@@ -121,8 +121,9 @@ pub fn dispatch_pointer(
         2 => PointerKind::Move,
         _ => PointerKind::Scroll,
     };
-    bindings.my_skiko_gfx_renderer()
-        .call_on_pointer_event(store, kind, x, y)?;
+    if let Some(b) = bindings {
+        b.my_skiko_gfx_renderer().call_on_pointer_event(store, kind, x, y)?;
+    }
     Ok(())
 }
 
@@ -130,7 +131,7 @@ pub fn dispatch_pointer(
 /// Calls both v1 (for backward compat) and v2 (for callers that want the
 /// extras). Single-touch / mouse callers should pass pointer_id=0.
 pub fn dispatch_pointer_v2(
-    bindings: &SkikoUi,
+    bindings: Option<&SkikoUi>,
     store: &mut Store<HostState>,
     kind: u8,
     pointer_id: u32,
@@ -145,7 +146,7 @@ pub fn dispatch_pointer_v2(
 /// scroll deltas only exist on this path); otherwise legacy v1+v2.
 /// `mods` = [alt, ctrl, meta, shift] (desktop; touch passes false).
 pub fn dispatch_pointer_routed(
-    bindings: &SkikoUi,
+    bindings: Option<&SkikoUi>,
     store: &mut Store<HostState>,
     guest_input: &GuestInput,
     kind: u8,
@@ -222,6 +223,7 @@ pub fn dispatch_pointer_routed(
         ph.wasi_input_handlers_pointer_handler().call_on_pointer(store, ev)?;
         return Ok(());
     }
+    let Some(bindings) = bindings else { return Ok(()) };
     let pk = match kind {
         0 => PointerKind::Down,
         1 => PointerKind::Up,
@@ -263,7 +265,7 @@ pub fn dispatch_key_routed(
 /// Frame dispatch: a bound frame-handler owns render driving; else the
 /// legacy renderer.render-frame. Returns the call result either way.
 pub fn dispatch_frame(
-    bindings: &SkikoUi,
+    bindings: Option<&SkikoUi>,
     store: &mut Store<HostState>,
     guest_input: &GuestInput,
     nanos: u64,
@@ -272,15 +274,15 @@ pub fn dispatch_frame(
         fh.wasi_input_handlers_frame_handler().call_on_frame(store, nanos)?;
     } else if let Some(fh) = &guest_input.frame {
         fh.wasi_input_handlers_frame_handler().call_on_frame(store, nanos)?;
-    } else {
-        bindings.my_skiko_gfx_renderer().call_render_frame(store, nanos)?;
+    } else if let Some(b) = bindings {
+        b.my_skiko_gfx_renderer().call_render_frame(store, nanos)?;
     }
     Ok(())
 }
 
 /// Resize dispatch: a bound frame-handler receives it EXCLUSIVELY.
 pub fn dispatch_resize_routed(
-    bindings: &SkikoUi,
+    bindings: Option<&SkikoUi>,
     store: &mut Store<HostState>,
     guest_input: &GuestInput,
     w: u32, h: u32,
@@ -289,20 +291,21 @@ pub fn dispatch_resize_routed(
         fh.wasi_input_handlers_frame_handler().call_on_resize(store, w, h)?;
     } else if let Some(fh) = &guest_input.frame {
         fh.wasi_input_handlers_frame_handler().call_on_resize(store, w, h)?;
-    } else {
-        bindings.my_skiko_gfx_renderer().call_on_resize(store, w, h)?;
+    } else if let Some(b) = bindings {
+        b.my_skiko_gfx_renderer().call_on_resize(store, w, h)?;
     }
     Ok(())
 }
 
 pub fn dispatch_key(
-    bindings: &SkikoUi,
+    bindings: Option<&SkikoUi>,
     store: &mut Store<HostState>,
     kind: u8, key_code: u32,
 ) -> anyhow::Result<()> {
     let kind = if kind == 0 { KeyKind::Down } else { KeyKind::Up };
-    bindings.my_skiko_gfx_renderer()
-        .call_on_key_event(store, kind, key_code)?;
+    if let Some(b) = bindings {
+        b.my_skiko_gfx_renderer().call_on_key_event(store, kind, key_code)?;
+    }
     Ok(())
 }
 
@@ -311,13 +314,14 @@ pub fn dispatch_key(
 /// (`on-key-event-v2`) for every keystroke. Guests can ignore whichever
 /// they don't need.
 pub fn dispatch_key_v2(
-    bindings: &SkikoUi,
+    bindings: Option<&SkikoUi>,
     store: &mut Store<HostState>,
     kind: u8, code_point: u32, key_id: u32,
 ) -> anyhow::Result<()> {
     let kk = if kind == 0 { KeyKind::Down } else { KeyKind::Up };
-    bindings.my_skiko_gfx_renderer()
-        .call_on_key_event_v2(store, kk, code_point, key_id)?;
+    if let Some(b) = bindings {
+        b.my_skiko_gfx_renderer().call_on_key_event_v2(store, kk, code_point, key_id)?;
+    }
     Ok(())
 }
 
@@ -331,7 +335,7 @@ pub fn dispatch_key_v2(
 /// Unmapped keys still fire as `code_point = 0, key_id = 0` so the guest
 /// at least sees a keystroke.
 pub fn dispatch_android_key(
-    bindings: &SkikoUi,
+    bindings: Option<&SkikoUi>,
     store: &mut Store<HostState>,
     guest_input: &GuestInput,
     key_input: Option<&crate::key_input_bindings::KeyInputWorld>,
@@ -354,11 +358,13 @@ pub fn dispatch_android_key(
     if dispatch_key_routed(guest_input, store, &ev4)? {
         return Ok(());
     }
-    let r = bindings.my_skiko_gfx_renderer();
-    // v1 carries the raw AKEYCODE so callers that wired against it still work.
-    let kk = if kind == 0 { KeyKind::Down } else { KeyKind::Up };
-    r.call_on_key_event(&mut *store, kk, key_code.max(0) as u32)?;
-    r.call_on_key_event_v2(&mut *store, kk, code_point, key_id)?;
+    if let Some(b) = bindings {
+        let r = b.my_skiko_gfx_renderer();
+        // v1 carries the raw AKEYCODE so callers that wired against it still work.
+        let kk = if kind == 0 { KeyKind::Down } else { KeyKind::Up };
+        r.call_on_key_event(&mut *store, kk, key_code.max(0) as u32)?;
+        r.call_on_key_event_v2(&mut *store, kk, code_point, key_id)?;
+    }
     // v3 (optional): the W3C model — physical code token + full meta bits.
     let ev = crate::key_input_bindings::exports::my::skiko_gfx::key_input::KeyEvent {
         down: kind == 0,
@@ -517,11 +523,65 @@ fn map_android_keycode(code: i32, shift: bool) -> (u32, u32) {
 }
 
 pub fn dispatch_resize(
-    bindings: &SkikoUi,
+    bindings: Option<&SkikoUi>,
     store: &mut Store<HostState>,
     w: u32, h: u32,
 ) -> anyhow::Result<()> {
-    bindings.my_skiko_gfx_renderer()
-        .call_on_resize(store, w, h)?;
+    if let Some(b) = bindings {
+        b.my_skiko_gfx_renderer().call_on_resize(store, w, h)?;
+    }
+    Ok(())
+}
+
+
+/// Phase B — shell callbacks with preference: a bound
+/// wandr:ui-shell/shell-events export receives lifecycle + scheduled
+/// callbacks EXCLUSIVELY; legacy my:skiko-gfx/renderer otherwise.
+pub type ShellEventsWorld = crate::ui_shell_export_bindings::events::ShellEventsWorld;
+
+fn shell_state(state: u32) -> crate::ui_shell_export_bindings::events::exports::wandr::ui_shell::shell_events::State {
+    use crate::ui_shell_export_bindings::events::exports::wandr::ui_shell::shell_events::State as S;
+    match state {
+        0 => S::Initialized,
+        1 => S::Created,
+        2 => S::Started,
+        3 => S::Resumed,
+        4 => S::Paused,
+        5 => S::Stopped,
+        _ => S::Destroyed,
+    }
+}
+
+pub fn dispatch_lifecycle(
+    bindings: Option<&SkikoUi>,
+    shell: Option<&ShellEventsWorld>,
+    store: &mut Store<HostState>,
+    state: u32,
+) -> anyhow::Result<()> {
+    if let Some(sh) = shell {
+        sh.wandr_ui_shell_shell_events()
+            .call_on_lifecycle_changed(store, shell_state(state))?;
+        return Ok(());
+    }
+    if let Some(b) = bindings {
+        b.my_skiko_gfx_renderer().call_on_lifecycle_changed(store, state)?;
+    }
+    Ok(())
+}
+
+pub fn dispatch_scheduled_callback(
+    bindings: Option<&SkikoUi>,
+    shell: Option<&ShellEventsWorld>,
+    store: &mut Store<HostState>,
+    callback_id: u32,
+) -> anyhow::Result<()> {
+    if let Some(sh) = shell {
+        sh.wandr_ui_shell_shell_events()
+            .call_on_scheduled_callback(store, callback_id)?;
+        return Ok(());
+    }
+    if let Some(b) = bindings {
+        b.my_skiko_gfx_renderer().call_on_scheduled_callback(store, callback_id)?;
+    }
     Ok(())
 }

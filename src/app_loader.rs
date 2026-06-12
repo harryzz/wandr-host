@@ -217,8 +217,10 @@ struct LoadedDep {
 /// helpers) get `ime_events: None` because their components don't
 /// satisfy the ime-events world's exports.
 pub struct InstantiatedApp {
-    /// The canonical skiko-ui bindings — what every guest gets.
-    pub skiko: bindings::SkikoUi,
+    /// The legacy skiko-ui bindings — OPTIONAL since Phase B: new-style
+    /// guests (wasi:canvas 0.0.2 + input-handlers + ui-shell) don't
+    /// export my:skiko-gfx/renderer at all; dispatch handles None.
+    pub skiko: Option<bindings::SkikoUi>,
     /// `Some(...)` if the component exports `wandr:ime/ime`. The host's
     /// `ime_inbound.rs` drain calls into these when an
     /// `editor-attached`/`editor-detached` message arrives.
@@ -236,6 +238,11 @@ pub struct InstantiatedApp {
     /// wasi:input-handlers probes (push-model input; new-style guests).
     /// Per input type, dispatch routes EXCLUSIVELY to a bound handler.
     pub guest_input: crate::input::GuestInput,
+    /// Phase B — wandr:ui-shell export probes: shell-events receives
+    /// lifecycle + scheduled callbacks EXCLUSIVELY when bound; the
+    /// ui-shell frame-pacing probe is preferred over the legacy one.
+    pub shell_events: Option<crate::ui_shell_export_bindings::events::ShellEventsWorld>,
+    pub shell_pacing: Option<crate::ui_shell_export_bindings::pacing::FramePacingWorld>,
     /// Arbiter Inc. 3c — `Some(...)` if the component exports
     /// `wandr:alarm/alarm-handler`. `ime_inbound`'s `alarm-fired` drain calls
     /// `on-alarm(id)` on these; `None` for guests that don't use alarms.
@@ -317,8 +324,10 @@ impl LoadedApp {
         let instance = linker
             .instantiate(&mut *store, &self.entry)
             .map_err(|e| anyhow!("linker.instantiate failed: {e:#}"))?;
-        let skiko = bindings::SkikoUi::new(&mut *store, &instance)
-            .map_err(|e| anyhow!("SkikoUi::new failed: {e:#}"))?;
+        let skiko = bindings::SkikoUi::new(&mut *store, &instance).ok();
+        if skiko.is_none() {
+            log::info!("loader: no my:skiko-gfx/renderer export — new-style guest (Phase B)");
+        }
         // Optional — IME apps (whose world `include`s
         // `wandr:ime/ime-events`) satisfy these exports; non-IME apps
         // don't. `.ok()` swallows the bind-failure into None.
@@ -349,6 +358,10 @@ impl LoadedApp {
             key2: crate::input_handlers_002_bindings::key::KeyHandlerWorld::new(&mut *store, &instance).ok(),
             frame2: crate::input_handlers_002_bindings::frame::FrameHandlerWorld::new(&mut *store, &instance).ok(),
         };
+        let shell_events =
+            crate::ui_shell_export_bindings::events::ShellEventsWorld::new(&mut *store, &instance).ok();
+        let shell_pacing =
+            crate::ui_shell_export_bindings::pacing::FramePacingWorld::new(&mut *store, &instance).ok();
         if guest_input.pointer.is_some() || guest_input.key.is_some() || guest_input.frame.is_some() {
             log::info!(
                 "loader: app exports wasi:input-handlers (pointer={} key={} frame={})",
@@ -386,7 +399,9 @@ impl LoadedApp {
             log::info!("loader: app exports wandr:events/incoming-handler — event-bus delivery enabled");
         }
         Ok(InstantiatedApp {
-            skiko, ime_events, frame_pacing, key_input, guest_input, alarm_events, bg_tick,
+            skiko, ime_events, frame_pacing, key_input, guest_input,
+            shell_events,
+            shell_pacing, alarm_events, bg_tick,
             notify_events, audio_focus_events, events_incoming,
         })
     }
