@@ -44,7 +44,10 @@ impl shell::locale::Host for HostState {
     fn primary_locale(&mut self) -> String {
         <HostState as old::locale::Host>::primary_locale(self)
     }
-    fn is_24_hour_format(&mut self) -> bool {
+    // WIT name is `is-twenty-four-hour-format`: a digit can't start a WIT
+    // identifier word, so the legacy `is-24-hour-format` spelling can't
+    // cross into the spec-clean package (guest wit-parsers reject it).
+    fn is_twenty_four_hour_format(&mut self) -> bool {
         <HostState as old::locale::Host>::is_24_hour_format(self)
     }
     fn get_layout_direction(&mut self) -> shell::locale::LayoutDirection {
