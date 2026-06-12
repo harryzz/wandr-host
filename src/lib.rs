@@ -143,6 +143,34 @@ mod wasi_canvas_bindings {
 #[cfg(feature = "wasi-canvas")]
 mod wasi_canvas_impl;
 
+/// wasi:canvas@0.0.2 (proposals/wasi-canvas/wit-0.0.2) — served
+/// SIDE-BY-SIDE with 0.0.1 over the same SkiaRenderer (the R3
+/// version-coexistence rule; REDESIGN-0.0.2.md). Heavy resources map
+/// onto the SAME backing types as 0.0.1; only the buffered
+/// paragraph-builder (setter form) and the scene layer are new.
+#[cfg(feature = "wasi-canvas")]
+mod wasi_canvas_002_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../proposals/wasi-canvas/wit-0.0.2",
+        world: "canvas-host",
+        imports: { default: trappable },
+        with: {
+            "wasi:canvas/types.shader": crate::wasi_canvas_impl::ShaderRes,
+            "wasi:canvas/types.image": crate::wasi_canvas_impl::ImageRes,
+            "wasi:canvas/draw.canvas": crate::wasi_canvas_impl::CanvasRes,
+            "wasi:canvas/draw.graphics": crate::wasi_canvas_impl::GraphicsRes,
+            "wasi:canvas/embedding.canvas-context": crate::wasi_canvas_impl::CanvasContextRes,
+            "wasi:canvas/draw.picture": crate::wasi_canvas_impl::PictureRes,
+            "wasi:canvas/glyphs.typeface": crate::wasi_canvas_impl::TypefaceRes,
+            "wasi:canvas/layout.paragraph": crate::wasi_canvas_impl::ParagraphRes,
+            "wasi:canvas/layout.paragraph-builder": crate::wasi_canvas_002_impl::ParagraphBuilder002Res,
+            "wasi:canvas/scene.layer": crate::wasi_canvas_002_impl::LayerRes,
+        },
+    });
+}
+#[cfg(feature = "wasi-canvas")]
+mod wasi_canvas_002_impl;
+
 /// wasi:input-handlers draft (proposals/wasi-input-handlers) — push-model
 /// input EXPORTED by new-style guests. Three independent probe-only
 /// worlds (the frame-pacing pattern); per input type the host routes
@@ -166,6 +194,37 @@ pub mod input_handlers_bindings {
         wasmtime::component::bindgen!({
             path: "../../proposals/wasi-input-handlers/wit",
             world: "frame-handler-world",
+        });
+    }
+}
+
+/// wasi:input-handlers@0.0.2 (wit-0.0.2) — the six-consumer-union event
+/// records (buttons/device/tilt + enter/leave + the optional
+/// gesture-handler), probed SIDE-BY-SIDE with 0.0.1; per input type the
+/// dispatch prefers 0.0.2 > 0.0.1 > legacy, exclusively.
+pub mod input_handlers_002_bindings {
+    pub mod pointer {
+        wasmtime::component::bindgen!({
+            path: "../../proposals/wasi-input-handlers/wit-0.0.2",
+            world: "pointer-handler-world",
+        });
+    }
+    pub mod key {
+        wasmtime::component::bindgen!({
+            path: "../../proposals/wasi-input-handlers/wit-0.0.2",
+            world: "key-handler-world",
+        });
+    }
+    pub mod frame {
+        wasmtime::component::bindgen!({
+            path: "../../proposals/wasi-input-handlers/wit-0.0.2",
+            world: "frame-handler-world",
+        });
+    }
+    pub mod gesture {
+        wasmtime::component::bindgen!({
+            path: "../../proposals/wasi-input-handlers/wit-0.0.2",
+            world: "gesture-handler-world",
         });
     }
 }
@@ -416,6 +475,8 @@ pub struct App {
     // Renderer owned directly when running without a WASM component.
     test_renderer:   Option<canvas_impl::SkiaRenderer>,
     last_cursor:     (f32, f32),
+    /// W3C `buttons` held-set for the mouse (bit0=primary … bit4=forward).
+    buttons_held:    u8,
     // Live modifier state (winit reports it as a separate event stream).
     modifiers:       winit::keyboard::ModifiersState,
 }
@@ -458,6 +519,7 @@ impl App {
             guest_input: input::GuestInput::default(),
             test_renderer: None,
             last_cursor: (0.0, 0.0),
+            buttons_held: 0,
             modifiers: winit::keyboard::ModifiersState::default(),
         }
     }
@@ -843,6 +905,7 @@ impl ApplicationHandler for App {
                         b, s, &self.guest_input, kind, pointer_id,
                         t.location.x as f32, t.location.y as f32,
                         pressure, [false; 4],
+                        input::PointerMeta::touch_contact(kind != 1),
                     );
                 }
                 if let Some(w) = &self.window { w.request_redraw(); }
@@ -859,21 +922,91 @@ impl ApplicationHandler for App {
                         b, s, &self.guest_input, 2, 0,
                         self.last_cursor.0, self.last_cursor.1,
                         0.0, mods,
+                        input::PointerMeta::mouse(0, self.buttons_held),
                     );
                 }
             }
 
-            WindowEvent::MouseInput { state, .. } => {
+            WindowEvent::MouseInput { state, button, .. } => {
                 let kind: u8 = if state == ElementState::Pressed { 0 } else { 1 };
+                let btn: u8 = match button {
+                    winit::event::MouseButton::Left => 1,
+                    winit::event::MouseButton::Right => 2,
+                    winit::event::MouseButton::Middle => 3,
+                    winit::event::MouseButton::Back => 4,
+                    winit::event::MouseButton::Forward => 5,
+                    winit::event::MouseButton::Other(_) => 0,
+                };
+                // W3C: `buttons` reflects the state AFTER the transition.
+                if btn > 0 {
+                    let bit = 1u8 << (btn - 1);
+                    if kind == 0 { self.buttons_held |= bit; } else { self.buttons_held &= !bit; }
+                }
                 let (cx, cy) = self.last_cursor;
                 let mods = [
                     self.modifiers.alt_key(), self.modifiers.control_key(),
                     self.modifiers.super_key(), self.modifiers.shift_key(),
                 ];
                 if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
-                    let _ = input::dispatch_pointer_routed(b, s, &self.guest_input, kind, 0, cx, cy, 1.0, mods);
+                    let _ = input::dispatch_pointer_routed(
+                        b, s, &self.guest_input, kind, 0, cx, cy, 1.0, mods,
+                        input::PointerMeta::mouse(btn, self.buttons_held),
+                    );
                 }
                 if let Some(w) = &self.window { w.request_redraw(); }
+            }
+
+            // Mouse wheel → kind=scroll at the cursor (closes the task-101
+            // "scroll-wheel unmapped" edge). W3C sign: positive = content
+            // down/right (winit's LineDelta is inverted).
+            WindowEvent::MouseWheel { delta, .. } => {
+                /// Pixels per wheel "line": 3 lines × 16 px CSS-default
+                /// line-height — the browser convention for LINE-mode
+                /// wheels; PixelDelta (trackpads) passes through as-is.
+                const LINE_SCROLL_PX: f32 = 48.0;
+                let (dx, dy) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) =>
+                        (-x * LINE_SCROLL_PX, -y * LINE_SCROLL_PX),
+                    winit::event::MouseScrollDelta::PixelDelta(p) =>
+                        (-p.x as f32, -p.y as f32),
+                };
+                // XWayland smooth-scroll valuators bracket each notch with
+                // zero-delta wheel events (user-observed (0,0)s) — contract
+                // noise, suppressed: no consumer wants "scroll by nothing".
+                if dx == 0.0 && dy == 0.0 { return; }
+                let (cx, cy) = self.last_cursor;
+                let mods = [
+                    self.modifiers.alt_key(), self.modifiers.control_key(),
+                    self.modifiers.super_key(), self.modifiers.shift_key(),
+                ];
+                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                    let _ = input::dispatch_pointer_routed(
+                        b, s, &self.guest_input, 3, 0, cx, cy, 0.0, mods,
+                        input::PointerMeta::wheel(self.buttons_held, dx, dy),
+                    );
+                }
+                if let Some(w) = &self.window { w.request_redraw(); }
+            }
+
+            // 0.0.2 hover lifecycle (enter/leave) — dropped silently for
+            // 0.0.1/legacy guests by the dispatch routing.
+            WindowEvent::CursorEntered { .. } => {
+                let (cx, cy) = self.last_cursor;
+                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                    let _ = input::dispatch_pointer_routed(
+                        b, s, &self.guest_input, 5, 0, cx, cy, 0.0, [false; 4],
+                        input::PointerMeta::mouse(0, self.buttons_held),
+                    );
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                let (cx, cy) = self.last_cursor;
+                if let (Some(b), Some(s)) = (&self.bindings, self.store.as_mut()) {
+                    let _ = input::dispatch_pointer_routed(
+                        b, s, &self.guest_input, 6, 0, cx, cy, 0.0, [false; 4],
+                        input::PointerMeta::mouse(0, self.buttons_held),
+                    );
+                }
             }
 
             WindowEvent::KeyboardInput { event, .. } => {

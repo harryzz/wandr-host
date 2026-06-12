@@ -7,6 +7,8 @@
 #pragma once
 
 #include "include/core/SkDrawable.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPath.h"
 #include "include/core/SkRect.h"
 #include "include/core/SkRRect.h"
 #include "include/core/SkRefCnt.h"
@@ -31,9 +33,15 @@ public:
         SkScalar pivotX, SkScalar pivotY,
         SkScalar alpha);
 
-    enum class ClipKind { None, Rect, RRect };
+    /// scene 0.0.2 path: an EXPLICIT 3x3 replaces the property-derived
+    /// transform (last setter wins; alpha separate via setAlpha).
+    void setMatrix(const SkMatrix& m);
+    void setAlpha(SkScalar alpha);
+
+    enum class ClipKind { None, Rect, RRect, Path };
     void setClipRect(const SkRect& r, bool antialias);
     void setClipRRect(const SkRRect& rr, bool antialias);
+    void setClipPath(const SkPath& p, bool antialias);
     void clearClip();
 
     void setShadowElevation(SkScalar e);
@@ -55,10 +63,16 @@ private:
     SkScalar fPivotX = 0, fPivotY = 0;
     SkScalar fAlpha = 1.0f;
 
+    // scene 0.0.2: explicit matrix mode (supersedes the property
+    // pipeline when set).
+    bool fHasMatrix = false;
+    SkMatrix fMatrix = SkMatrix::I();
+
     // Clip applied AFTER transforms.
     ClipKind fClipKind = ClipKind::None;
     SkRect fClipRect = SkRect::MakeEmpty();
     SkRRect fClipRRect;
+    SkPath fClipPath;
     bool fClipAA = true;
 
     // Coarse shadow: drop a translucent fill of the clip shape offset
@@ -90,6 +104,16 @@ extern "C" {
                                       bool antialias);
     void wasi_drawable_clear_clip(SkDrawable* d);
     void wasi_drawable_set_shadow_elevation(SkDrawable* d, float elevation);
+
+    // scene 0.0.2 entries.
+    void wasi_drawable_set_matrix(SkDrawable* d,
+                                  float m00, float m01, float m02,
+                                  float m10, float m11, float m12,
+                                  float m20, float m21, float m22);
+    void wasi_drawable_set_alpha(SkDrawable* d, float alpha);
+    /// `path` is an SkPath* (copied; caller keeps ownership).
+    void wasi_drawable_set_clip_path(SkDrawable* d, const void* path,
+                                     bool antialias);
 
     void wasi_drawable_ref(SkDrawable* d);
     void wasi_drawable_unref(SkDrawable* d);

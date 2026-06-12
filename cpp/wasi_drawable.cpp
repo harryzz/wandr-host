@@ -39,6 +39,21 @@ void WasiDrawable::setTransform(
     fAlpha = alpha;
 }
 
+void WasiDrawable::setMatrix(const SkMatrix& m) {
+    fHasMatrix = true;
+    fMatrix = m;
+}
+
+void WasiDrawable::setAlpha(SkScalar alpha) {
+    fAlpha = alpha;
+}
+
+void WasiDrawable::setClipPath(const SkPath& p, bool antialias) {
+    fClipKind = ClipKind::Path;
+    fClipPath = p;
+    fClipAA = antialias;
+}
+
 void WasiDrawable::setClipRect(const SkRect& r, bool antialias) {
     fClipKind = ClipKind::Rect;
     fClipRect = r;
@@ -67,21 +82,26 @@ void WasiDrawable::onDraw(SkCanvas* canvas) {
     if (!fInner) return;
     canvas->save();
 
-    // 1. Position into parent space.
-    if (fLayerX != 0 || fLayerY != 0)
-        canvas->translate(fLayerX, fLayerY);
+    if (fHasMatrix) {
+        // scene 0.0.2: explicit matrix supersedes the property pipeline.
+        canvas->concat(fMatrix);
+    } else {
+        // 1. Position into parent space.
+        if (fLayerX != 0 || fLayerY != 0)
+            canvas->translate(fLayerX, fLayerY);
 
-    // 2. Compose-model translation (post-position, pre-scale/rotate).
-    if (fTranslationX != 0 || fTranslationY != 0)
-        canvas->translate(fTranslationX, fTranslationY);
+        // 2. Compose-model translation (post-position, pre-scale/rotate).
+        if (fTranslationX != 0 || fTranslationY != 0)
+            canvas->translate(fTranslationX, fTranslationY);
 
-    // 3. Scale + rotate around pivot (T(pivot) · S · R · T(-pivot)).
-    bool hasTransform = fScaleX != 1 || fScaleY != 1 || fRotationZ != 0;
-    if (hasTransform) {
-        if (fPivotX != 0 || fPivotY != 0) canvas->translate(fPivotX, fPivotY);
-        if (fScaleX != 1 || fScaleY != 1) canvas->scale(fScaleX, fScaleY);
-        if (fRotationZ != 0) canvas->rotate(fRotationZ);
-        if (fPivotX != 0 || fPivotY != 0) canvas->translate(-fPivotX, -fPivotY);
+        // 3. Scale + rotate around pivot (T(pivot) · S · R · T(-pivot)).
+        bool hasTransform = fScaleX != 1 || fScaleY != 1 || fRotationZ != 0;
+        if (hasTransform) {
+            if (fPivotX != 0 || fPivotY != 0) canvas->translate(fPivotX, fPivotY);
+            if (fScaleX != 1 || fScaleY != 1) canvas->scale(fScaleX, fScaleY);
+            if (fRotationZ != 0) canvas->rotate(fRotationZ);
+            if (fPivotX != 0 || fPivotY != 0) canvas->translate(-fPivotX, -fPivotY);
+        }
     }
 
     // 4. Coarse shadow (before clip — shadow can extend past the layer).
@@ -97,6 +117,7 @@ void WasiDrawable::onDraw(SkCanvas* canvas) {
         switch (fClipKind) {
             case ClipKind::Rect:  canvas->drawRect(fClipRect, sp);   break;
             case ClipKind::RRect: canvas->drawRRect(fClipRRect, sp); break;
+            case ClipKind::Path:  canvas->drawPath(fClipPath, sp);   break;
             default: break;
         }
         canvas->restore();
@@ -109,6 +130,9 @@ void WasiDrawable::onDraw(SkCanvas* canvas) {
             break;
         case ClipKind::RRect:
             canvas->clipRRect(fClipRRect, SkClipOp::kIntersect, fClipAA);
+            break;
+        case ClipKind::Path:
+            canvas->clipPath(fClipPath, SkClipOp::kIntersect, fClipAA);
             break;
         default: break;
     }
@@ -182,6 +206,25 @@ extern "C" void wasi_drawable_clear_clip(SkDrawable* d) {
 
 extern "C" void wasi_drawable_set_shadow_elevation(SkDrawable* d, float elevation) {
     static_cast<WasiDrawable*>(d)->setShadowElevation(elevation);
+}
+
+extern "C" void wasi_drawable_set_matrix(SkDrawable* d,
+                                         float m00, float m01, float m02,
+                                         float m10, float m11, float m12,
+                                         float m20, float m21, float m22) {
+    SkMatrix m;
+    m.setAll(m00, m01, m02, m10, m11, m12, m20, m21, m22);
+    static_cast<WasiDrawable*>(d)->setMatrix(m);
+}
+
+extern "C" void wasi_drawable_set_alpha(SkDrawable* d, float alpha) {
+    static_cast<WasiDrawable*>(d)->setAlpha(alpha);
+}
+
+extern "C" void wasi_drawable_set_clip_path(SkDrawable* d, const void* path,
+                                            bool antialias) {
+    static_cast<WasiDrawable*>(d)->setClipPath(
+        *static_cast<const SkPath*>(path), antialias);
 }
 
 extern "C" void wasi_drawable_ref(SkDrawable* d) {

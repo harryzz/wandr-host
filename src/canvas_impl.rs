@@ -101,7 +101,7 @@ fn shape_text_fallback(text: &str, font: &Font) -> Option<skia_safe::TextBlob> {
 // ops that resolve to the CURRENT picture at replay time. See
 // cpp/wasi_drawable.h for rationale.
 
-mod wasi_drawable_ffi {
+pub(crate) mod wasi_drawable_ffi {
     use std::os::raw::c_void;
     extern "C" {
         pub fn wasi_drawable_create() -> *mut c_void;
@@ -124,6 +124,14 @@ mod wasi_drawable_ffi {
                                             antialias: bool);
         pub fn wasi_drawable_clear_clip(d: *mut c_void);
         pub fn wasi_drawable_set_shadow_elevation(d: *mut c_void, elevation: f32);
+        // scene 0.0.2 entries (wasi_canvas_002_impl).
+        pub fn wasi_drawable_set_matrix(d: *mut c_void,
+                                        m00: f32, m01: f32, m02: f32,
+                                        m10: f32, m11: f32, m12: f32,
+                                        m20: f32, m21: f32, m22: f32);
+        pub fn wasi_drawable_set_alpha(d: *mut c_void, alpha: f32);
+        pub fn wasi_drawable_set_clip_path(d: *mut c_void, path: *const c_void,
+                                           antialias: bool);
         pub fn wasi_drawable_ref(d: *mut c_void);
         pub fn wasi_drawable_unref(d: *mut c_void);
         pub fn wasi_canvas_draw_drawable(canvas: *mut c_void, d: *mut c_void);
@@ -138,7 +146,7 @@ mod wasi_drawable_ffi {
 /// type has the same starting layout. We use this to bridge skia-safe ↔
 /// our C FFI without going through `pub(crate)` `NativeAccess`/`from_ptr`.
 #[inline]
-fn handle_to_native_ptr<T>(handle: *const T) -> *mut std::os::raw::c_void {
+pub(crate) fn handle_to_native_ptr<T>(handle: *const T) -> *mut std::os::raw::c_void {
     unsafe { *(handle as *const *mut std::os::raw::c_void) }
 }
 

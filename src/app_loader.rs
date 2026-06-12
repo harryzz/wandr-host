@@ -298,6 +298,9 @@ impl LoadedApp {
         #[cfg(feature = "wasi-canvas")]
         crate::wasi_canvas_impl::add_to_linker(&mut linker)
             .map_err(|e| anyhow!("wasi-canvas add_to_linker: {e:#}"))?; // proposals/wasi-canvas draft
+        #[cfg(feature = "wasi-canvas")]
+        crate::wasi_canvas_002_impl::add_to_linker(&mut linker)
+            .map_err(|e| anyhow!("wasi-canvas-0.0.2 add_to_linker: {e:#}"))?; // R3 side-by-side
 
         for dep in &self.deps {
             wire_dep_into_linker(&mut linker, store, dep)?;
@@ -338,6 +341,9 @@ impl LoadedApp {
             pointer: crate::input_handlers_bindings::pointer::PointerHandlerWorld::new(&mut *store, &instance).ok(),
             key: crate::input_handlers_bindings::key::KeyHandlerWorld::new(&mut *store, &instance).ok(),
             frame: crate::input_handlers_bindings::frame::FrameHandlerWorld::new(&mut *store, &instance).ok(),
+            pointer2: crate::input_handlers_002_bindings::pointer::PointerHandlerWorld::new(&mut *store, &instance).ok(),
+            key2: crate::input_handlers_002_bindings::key::KeyHandlerWorld::new(&mut *store, &instance).ok(),
+            frame2: crate::input_handlers_002_bindings::frame::FrameHandlerWorld::new(&mut *store, &instance).ok(),
         };
         if guest_input.pointer.is_some() || guest_input.key.is_some() || guest_input.frame.is_some() {
             log::info!(
@@ -424,6 +430,9 @@ impl LoadedApp {
         #[cfg(feature = "wasi-canvas")]
         crate::wasi_canvas_impl::add_to_linker(&mut linker)
             .map_err(|e| anyhow!("wasi-canvas add_to_linker: {e:#}"))?; // proposals/wasi-canvas draft
+        #[cfg(feature = "wasi-canvas")]
+        crate::wasi_canvas_002_impl::add_to_linker(&mut linker)
+            .map_err(|e| anyhow!("wasi-canvas-0.0.2 add_to_linker: {e:#}"))?; // R3 side-by-side
 
         for dep in &self.deps {
             wire_dep_into_linker(&mut linker, store, dep)?;

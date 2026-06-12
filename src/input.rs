@@ -4,6 +4,7 @@ use crate::HostState;
 use crate::bindings::SkikoUi;
 use crate::bindings::exports::my::skiko_gfx::renderer::{KeyKind, PointerKind};
 use crate::input_handlers_bindings as ih;
+use crate::input_handlers_002_bindings as ih2;
 
 /// Per-guest wasi:input-handlers probes (proposals/wasi-input-handlers).
 /// Per input type, dispatch routes EXCLUSIVELY to a bound handler — a
@@ -14,11 +15,61 @@ pub struct GuestInput {
     pub pointer: Option<ih::pointer::PointerHandlerWorld>,
     pub key: Option<ih::key::KeyHandlerWorld>,
     pub frame: Option<ih::frame::FrameHandlerWorld>,
+    // wasi:input-handlers@0.0.2 probes — dispatch prefers 0.0.2 > 0.0.1 >
+    // legacy, exclusively per input type (R3 side-by-side versions).
+    pub pointer2: Option<ih2::pointer::PointerHandlerWorld>,
+    pub key2: Option<ih2::key::KeyHandlerWorld>,
+    pub frame2: Option<ih2::frame::FrameHandlerWorld>,
+}
+
+/// 0.0.2 pointer enrichment carried from the event source (small ints so
+/// call sites don't touch generated types): `device` 0=unknown 1=mouse
+/// 2=touch 3=pen; `button` (the CHANGED one) 0=none 1=primary 2=secondary
+/// 3=middle 4=back 5=forward; `buttons` = held bitmask (bit0=primary …
+/// bit4=forward). Tilt/twist stay 0 until a pen source exists.
+#[derive(Default, Clone, Copy)]
+pub struct PointerMeta {
+    pub device: u8,
+    pub button: u8,
+    pub buttons: u8,
+    /// Scroll deltas (kind == scroll), surface units, W3C sign
+    /// (positive = content moves down/right).
+    pub scroll_dx: f32,
+    pub scroll_dy: f32,
+}
+
+impl PointerMeta {
+    pub fn touch_contact(down: bool) -> Self {
+        // W3C convention: a touch contact holds the primary button.
+        PointerMeta { device: 2, button: 1, buttons: if down { 1 } else { 0 }, ..Default::default() }
+    }
+    pub fn mouse(button: u8, held: u8) -> Self {
+        PointerMeta { device: 1, button, buttons: held, ..Default::default() }
+    }
+    pub fn wheel(held: u8, dx: f32, dy: f32) -> Self {
+        PointerMeta { device: 1, buttons: held, scroll_dx: dx, scroll_dy: dy, ..Default::default() }
+    }
 }
 
 pub type PointerEventV4 = ih::pointer::exports::wasi::input_handlers::pointer_handler::PointerEvent;
 pub type PointerKindV4 = ih::pointer::exports::wasi::input_handlers::pointer_handler::Kind;
 pub type KeyEventV4 = ih::key::exports::wasi::input_handlers::key_handler::KeyEvent;
+pub type PointerEventV5 = ih2::pointer::exports::wasi::input_handlers::pointer_handler::PointerEvent;
+pub type PointerKindV5 = ih2::pointer::exports::wasi::input_handlers::pointer_handler::Kind;
+pub type PointerDeviceV5 = ih2::pointer::exports::wasi::input_handlers::pointer_handler::PointerDevice;
+pub type ButtonV5 = ih2::pointer::exports::wasi::input_handlers::pointer_handler::Button;
+pub type ButtonsV5 = ih2::pointer::exports::wasi::input_handlers::pointer_handler::Buttons;
+pub type KeyEventV5 = ih2::key::exports::wasi::input_handlers::key_handler::KeyEvent;
+
+fn buttons_v5(mask: u8) -> ButtonsV5 {
+    let mut b = ButtonsV5::empty();
+    if mask & 1 != 0 { b |= ButtonsV5::PRIMARY; }
+    if mask & 2 != 0 { b |= ButtonsV5::SECONDARY; }
+    if mask & 4 != 0 { b |= ButtonsV5::MIDDLE; }
+    if mask & 8 != 0 { b |= ButtonsV5::BACK; }
+    if mask & 16 != 0 { b |= ButtonsV5::FORWARD; }
+    b
+}
 
 /// Touch-suppression gate (task 79). When set, all pointer dispatch is dropped
 /// — used during a proximity screen-off (call at the ear) so a cheek/ear touch
@@ -86,7 +137,7 @@ pub fn dispatch_pointer_v2(
     x: f32, y: f32,
     pressure: f32,
 ) -> anyhow::Result<()> {
-    dispatch_pointer_routed(bindings, store, &GuestInput::default(), kind, pointer_id, x, y, pressure, [false; 4])
+    dispatch_pointer_routed(bindings, store, &GuestInput::default(), kind, pointer_id, x, y, pressure, [false; 4], PointerMeta::default())
 }
 
 /// Pointer dispatch with wasi:input-handlers routing: a bound
@@ -102,9 +153,54 @@ pub fn dispatch_pointer_routed(
     x: f32, y: f32,
     pressure: f32,
     mods: [bool; 4],
+    meta: PointerMeta,
 ) -> anyhow::Result<()> {
     // Task 79 — drop touch while the panel is blanked for proximity.
     if touch_suppressed() {
+        return Ok(());
+    }
+    if let Some(ph) = &guest_input.pointer2 {
+        let ev = PointerEventV5 {
+            id: pointer_id,
+            kind: match kind {
+                0 => PointerKindV5::Down,
+                1 => PointerKindV5::Up,
+                2 => PointerKindV5::Move,
+                4 => PointerKindV5::Cancel,
+                5 => PointerKindV5::Enter,
+                6 => PointerKindV5::Leave,
+                _ => PointerKindV5::Scroll,
+            },
+            device: match meta.device {
+                1 => PointerDeviceV5::Mouse,
+                2 => PointerDeviceV5::Touch,
+                3 => PointerDeviceV5::Pen,
+                _ => PointerDeviceV5::Unknown,
+            },
+            x, y,
+            pressure,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+            twist: 0.0,
+            scroll_dx: meta.scroll_dx,
+            scroll_dy: meta.scroll_dy,
+            button: match (kind, meta.button) {
+                // button = the CHANGED button: only meaningful on down/up.
+                (0 | 1, 1) => ButtonV5::Primary,
+                (0 | 1, 2) => ButtonV5::Secondary,
+                (0 | 1, 3) => ButtonV5::Middle,
+                (0 | 1, 4) => ButtonV5::Back,
+                (0 | 1, 5) => ButtonV5::Forward,
+                _ => ButtonV5::None,
+            },
+            buttons: buttons_v5(meta.buttons),
+            alt: mods[0], ctrl: mods[1], meta: mods[2], shift: mods[3],
+        };
+        ph.wasi_input_handlers_pointer_handler().call_on_pointer(store, ev)?;
+        return Ok(());
+    }
+    // enter/leave have no 0.0.1/legacy representation — 0.0.2-only.
+    if kind == 5 || kind == 6 {
         return Ok(());
     }
     if let Some(ph) = &guest_input.pointer {
@@ -119,8 +215,8 @@ pub fn dispatch_pointer_routed(
             },
             x, y,
             pressure,
-            scroll_dx: 0.0,
-            scroll_dy: 0.0,
+            scroll_dx: meta.scroll_dx,
+            scroll_dy: meta.scroll_dy,
             alt: mods[0], ctrl: mods[1], meta: mods[2], shift: mods[3],
         };
         ph.wasi_input_handlers_pointer_handler().call_on_pointer(store, ev)?;
@@ -146,6 +242,17 @@ pub fn dispatch_key_routed(
     store: &mut Store<HostState>,
     ev: &KeyEventV4,
 ) -> anyhow::Result<bool> {
+    if let Some(kh) = &guest_input.key2 {
+        let ev2 = KeyEventV5 {
+            down: ev.down,
+            repeat: ev.repeat,
+            code: ev.code.clone(),
+            text: ev.text.clone(),
+            alt: ev.alt, ctrl: ev.ctrl, meta: ev.meta, shift: ev.shift,
+        };
+        kh.wasi_input_handlers_key_handler().call_on_key(store, &ev2)?;
+        return Ok(true);
+    }
     if let Some(kh) = &guest_input.key {
         kh.wasi_input_handlers_key_handler().call_on_key(store, ev)?;
         return Ok(true);
@@ -161,7 +268,9 @@ pub fn dispatch_frame(
     guest_input: &GuestInput,
     nanos: u64,
 ) -> anyhow::Result<()> {
-    if let Some(fh) = &guest_input.frame {
+    if let Some(fh) = &guest_input.frame2 {
+        fh.wasi_input_handlers_frame_handler().call_on_frame(store, nanos)?;
+    } else if let Some(fh) = &guest_input.frame {
         fh.wasi_input_handlers_frame_handler().call_on_frame(store, nanos)?;
     } else {
         bindings.my_skiko_gfx_renderer().call_render_frame(store, nanos)?;
@@ -176,7 +285,9 @@ pub fn dispatch_resize_routed(
     guest_input: &GuestInput,
     w: u32, h: u32,
 ) -> anyhow::Result<()> {
-    if let Some(fh) = &guest_input.frame {
+    if let Some(fh) = &guest_input.frame2 {
+        fh.wasi_input_handlers_frame_handler().call_on_resize(store, w, h)?;
+    } else if let Some(fh) = &guest_input.frame {
         fh.wasi_input_handlers_frame_handler().call_on_resize(store, w, h)?;
     } else {
         bindings.my_skiko_gfx_renderer().call_on_resize(store, w, h)?;

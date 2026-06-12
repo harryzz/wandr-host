@@ -946,6 +946,7 @@ fn run_cwasm_loop(
                 if let Err(e) = crate::input::dispatch_pointer_routed(
                     &skiko, &mut store, &guest_input, ev.kind as u8,
                     ev.pointer_id as u32, lx, ly, ev.pressure, [false; 4],
+                    crate::input::PointerMeta::touch_contact(ev.kind != 1),
                 ) {
                     log::warn!("standalone: dispatch_pointer_v2 failed: {e:#}");
                 }

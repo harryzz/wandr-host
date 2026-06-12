@@ -1,61 +1,56 @@
-//! Host implementation of the `wasi:canvas` DRAFT (proposals/wasi-canvas),
-//! behind the `wasi-canvas` cargo feature. Maps ~1:1 onto the same
-//! `SkiaRenderer` that serves `my:skiko-gfx` — the coexistence strategy
-//! from COMPATIBILITY.md (this is a second linker package, not a
-//! migration). The optional `layout` interface is NOT implemented yet
-//! (the draft marks it embedder-optional; follow-up with the first
-//! managed-runtime consumer).
-//!
-//! Resource model: every wasi:canvas resource is a `ResourceTable` entry
-//! (the wandr:crypto / wandr:video pattern). The `canvas` resource is
-//! either the renderer's MAIN surface, an OFFSCREEN raster surface, or a
-//! picture RECORDING — drawing helpers split the `HostState` borrow so
-//! the table and the renderer can be used together.
+//! Host implementation of `wasi:canvas@0.0.2` (proposals/wasi-canvas/
+//! wit-0.0.2) — served SIDE-BY-SIDE with 0.0.1 over the same SkiaRenderer
+//! (the R3 version-coexistence rule, REDESIGN-0.0.2.md §2). Heavy
+//! resources share 0.0.1's backing types; the 0.0.2-only pieces are the
+//! 29-mode blend enum, gradient local matrices, the union text-style
+//! (decoration/shadows/background/baseline-shift), the BUFFERED
+//! setter-form paragraph-builder, and the `scene` interface — host-
+//! retained layers re-skinning the WasiDrawable machinery the legacy
+//! RenderNode path already ships (cpp/wasi_drawable.{h,cpp}).
 
 use wasmtime::component::{Resource, ResourceTable};
 
 use crate::HostState;
-use crate::wasi_canvas_bindings::wasi::canvas::draw as wit_draw;
-use crate::wasi_canvas_bindings::wasi::canvas::embedding as wit_embedding;
-use crate::wasi_canvas_bindings::wasi::canvas::glyphs as wit_glyphs;
-use crate::wasi_canvas_bindings::wasi::canvas::layout as wit_layout;
-use crate::wasi_canvas_bindings::wasi::canvas::types as wit_types;
-// (module path note: bindgen nests generated modules under wasi::canvas::*)
+use crate::canvas_impl::{WasiDrawable, wasi_drawable_ffi};
+use crate::wasi_canvas_impl::{
+    CanvasContextRes, CanvasRes, GraphicsRes, ImageRes, ParagraphRes, PictureRes, ShaderRes,
+    TypefaceRes,
+};
+use crate::wasi_canvas_002_bindings::wasi::canvas::draw as wit_draw;
+use crate::wasi_canvas_002_bindings::wasi::canvas::embedding as wit_embedding;
+use crate::wasi_canvas_002_bindings::wasi::canvas::glyphs as wit_glyphs;
+use crate::wasi_canvas_002_bindings::wasi::canvas::layout as wit_layout;
+use crate::wasi_canvas_002_bindings::wasi::canvas::scene as wit_scene;
+use crate::wasi_canvas_002_bindings::wasi::canvas::types as wit_types;
 
-// ─── resource backing types ──────────────────────────────────────────────────
+// ─── 0.0.2-only resource backing types ───────────────────────────────────────
 
-pub struct ShaderRes(pub skia_safe::Shader);
-pub struct ImageRes(pub skia_safe::Image);
-pub struct PictureRes(pub skia_safe::Picture);
-pub struct TypefaceRes(pub skia_safe::Typeface);
-/// `Rc<RefCell<…>>` so paint can hold the paragraph while `with_canvas`
-/// re-borrows the table for the target canvas (two table entries can't be
-/// borrowed simultaneously through the safe ResourceTable API).
-pub struct ParagraphRes(pub std::rc::Rc<std::cell::RefCell<skia_safe::textlayout::Paragraph>>);
-pub struct ParagraphBuilderRes(pub skia_safe::textlayout::ParagraphBuilder);
+/// Host-retained layer: the WasiDrawable (swappable inner + live
+/// matrix/clip/alpha/shadow, applied at replay). Captured recordings keep
+/// the underlying SkDrawable alive via skia's refcount, so dropping the
+/// guest handle never invalidates captures (the contract's lifetime rule).
+pub struct LayerRes(pub WasiDrawable);
+// SAFETY: single-threaded store; same justification as CanvasRes.
+unsafe impl Send for LayerRes {}
 
-// SAFETY: same single-threaded-store justification as CanvasRes below.
-unsafe impl Send for ParagraphRes {}
-unsafe impl Send for ParagraphBuilderRes {}
-/// The creation capability is the handle itself; no state behind it (an
-/// attenuating embedder would interpose, not parameterize this).
-pub struct GraphicsRes;
-
-pub enum CanvasRes {
-    /// The embedder-presented target: the renderer's current surface.
-    Main,
-    /// `graphics.new-offscreen` — own raster surface, snapshot-able.
-    Offscreen(skia_safe::Surface),
-    /// `graphics.start-recording` — captures into a display list.
-    Recording(skia_safe::PictureRecorder),
+/// Setter-form builder, BUFFERED: skparagraph wants the paragraph style
+/// at construction, but 0.0.2 lets setters arrive any time before build —
+/// so ops accumulate and the skia builder is constructed at build().
+#[derive(Default)]
+pub struct ParagraphBuilder002Res {
+    default_style: Option<wit_layout::TextStyle>,
+    align: Option<wit_layout::Align>,
+    direction: Option<wit_layout::TextDirection>,
+    max_lines: u32,
+    ellipsis: String,
+    ops: Vec<BuilderOp>,
 }
 
-// SAFETY: ResourceTable requires Send, but skia Surface/PictureRecorder are
-// not Send. All access is serialized through `&mut HostState` on the
-// store's single thread (the same justification as the raw NDK pointers in
-// video.rs and the renderer's own surfaces living in HostState) — wandr
-// guests are single-threaded and the store never crosses threads.
-unsafe impl Send for CanvasRes {}
+pub enum BuilderOp {
+    PushStyle(wit_layout::TextStyle),
+    PopStyle,
+    AddText(String),
+}
 
 // ─── conversions ─────────────────────────────────────────────────────────────
 
@@ -65,11 +60,17 @@ fn blend_mode(m: wit_types::BlendMode) -> skia_safe::BlendMode {
     match m {
         W::SrcOver => B::SrcOver,
         W::Src => B::Src,
+        W::Dst => B::Dst,
+        W::DstOver => B::DstOver,
+        W::SrcIn => B::SrcIn,
         W::DstIn => B::DstIn,
+        W::SrcOut => B::SrcOut,
         W::DstOut => B::DstOut,
         W::SrcAtop => B::SrcATop,
         W::DstAtop => B::DstATop,
         W::Xor => B::Xor,
+        W::Plus => B::Plus,
+        W::Modulate => B::Modulate,
         W::Multiply => B::Multiply,
         W::Screen => B::Screen,
         W::Overlay => B::Overlay,
@@ -82,6 +83,10 @@ fn blend_mode(m: wit_types::BlendMode) -> skia_safe::BlendMode {
         W::Difference => B::Difference,
         W::Exclusion => B::Exclusion,
         W::Clear => B::Clear,
+        W::Hue => B::Hue,
+        W::Saturation => B::Saturation,
+        W::Color => B::Color,
+        W::Luminosity => B::Luminosity,
     }
 }
 
@@ -142,8 +147,6 @@ fn color(argb: u32) -> skia_safe::Color {
     skia_safe::Color::new(argb)
 }
 
-/// wit paint → skia Paint (shader looked up from the table; mask blur
-/// applied; `alpha` multiplied via setAlpha after color/shader).
 fn paint(table: &ResourceTable, p: &wit_types::Paint) -> skia_safe::Paint {
     let mut sp = skia_safe::Paint::default();
     sp.set_color(color(p.color));
@@ -199,7 +202,6 @@ fn paint(table: &ResourceTable, p: &wit_types::Paint) -> skia_safe::Paint {
         }
         None => {}
     }
-    // Alpha multiplies AFTER color/shader, like paint-attrs in skiko-gfx.
     let a = ((sp.alpha() as u32 * p.alpha as u32) / 255) as u8;
     sp.set_alpha(a);
     sp
@@ -215,11 +217,6 @@ fn stops_to_arrays(stops: &[(f32, u32)]) -> (Vec<skia_safe::Color>, Vec<f32>) {
     (colors, positions)
 }
 
-// ─── canvas access (split-borrow helper) ─────────────────────────────────────
-
-/// Run `f` against the skia canvas behind a `canvas` resource. Splits the
-/// HostState borrow so Main can reach the renderer while the table entry
-/// is held.
 fn with_canvas<R>(
     state: &mut HostState,
     c: &Resource<CanvasRes>,
@@ -237,7 +234,7 @@ fn with_canvas<R>(
     })
 }
 
-// ─── types interface ─────────────────────────────────────────────────────────
+// ─── types ───────────────────────────────────────────────────────────────────
 
 impl wit_types::Host for HostState {}
 
@@ -261,7 +258,7 @@ impl wit_types::HostImage for HostState {
     }
 }
 
-// ─── draw interface ──────────────────────────────────────────────────────────
+// ─── draw ────────────────────────────────────────────────────────────────────
 
 impl wit_draw::Host for HostState {}
 
@@ -280,8 +277,10 @@ impl wit_draw::HostGraphics for HostState {
         end: wit_types::Point,
         stops: Vec<(f32, u32)>,
         tile: wit_types::TileMode,
+        local: Option<wit_types::Transform>,
     ) -> wasmtime::Result<Resource<ShaderRes>> {
         let (colors, positions) = stops_to_arrays(&stops);
+        let lm = local.map(matrix);
         let shader = skia_safe::gradient_shader::linear(
             (
                 skia_safe::Point::new(start.x, start.y),
@@ -291,7 +290,7 @@ impl wit_draw::HostGraphics for HostState {
             Some(positions.as_slice()),
             tile_mode(tile),
             None,
-            None,
+            lm.as_ref(),
         )
         .ok_or_else(|| wasmtime::Error::msg("linear-gradient failed"))?;
         Ok(self.table.push(ShaderRes(shader))?)
@@ -304,8 +303,10 @@ impl wit_draw::HostGraphics for HostState {
         radius: f32,
         stops: Vec<(f32, u32)>,
         tile: wit_types::TileMode,
+        local: Option<wit_types::Transform>,
     ) -> wasmtime::Result<Resource<ShaderRes>> {
         let (colors, positions) = stops_to_arrays(&stops);
+        let lm = local.map(matrix);
         let shader = skia_safe::gradient_shader::radial(
             skia_safe::Point::new(center.x, center.y),
             radius,
@@ -313,7 +314,7 @@ impl wit_draw::HostGraphics for HostState {
             Some(positions.as_slice()),
             tile_mode(tile),
             None,
-            None,
+            lm.as_ref(),
         )
         .ok_or_else(|| wasmtime::Error::msg("radial-gradient failed"))?;
         Ok(self.table.push(ShaderRes(shader))?)
@@ -327,8 +328,10 @@ impl wit_draw::HostGraphics for HostState {
         end_angle: f32,
         stops: Vec<(f32, u32)>,
         tile: wit_types::TileMode,
+        local: Option<wit_types::Transform>,
     ) -> wasmtime::Result<Resource<ShaderRes>> {
         let (colors, positions) = stops_to_arrays(&stops);
+        let lm = local.map(matrix);
         let shader = skia_safe::gradient_shader::sweep(
             skia_safe::Point::new(center.x, center.y),
             colors.as_slice(),
@@ -336,7 +339,7 @@ impl wit_draw::HostGraphics for HostState {
             tile_mode(tile),
             (start_angle, end_angle),
             None,
-            None,
+            lm.as_ref(),
         )
         .ok_or_else(|| wasmtime::Error::msg("sweep-gradient failed"))?;
         Ok(self.table.push(ShaderRes(shader))?)
@@ -444,7 +447,7 @@ impl wit_draw::HostCanvas for HostState {
         Ok(match table.get(&self_)? {
             CanvasRes::Main => renderer.logical_width as f32,
             CanvasRes::Offscreen(s) => s.width() as f32,
-            CanvasRes::Recording(_) => 0.0, // bounds not retained; fine for v1
+            CanvasRes::Recording(_) => 0.0,
         })
     }
     fn height(&mut self, self_: Resource<CanvasRes>) -> wasmtime::Result<f32> {
@@ -705,8 +708,6 @@ impl wit_draw::HostCanvas for HostState {
     ) -> wasmtime::Result<Result<Resource<ImageRes>, ()>> {
         let img = match self.table.get_mut(&self_)? {
             CanvasRes::Offscreen(surface) => Some(surface.image_snapshot()),
-            // The embedder-presented canvas keeps its pixels private;
-            // recordings have no pixels.
             CanvasRes::Main | CanvasRes::Recording(_) => None,
         };
         match img {
@@ -721,7 +722,7 @@ impl wit_draw::HostCanvas for HostState {
     }
 }
 
-// ─── glyphs interface ────────────────────────────────────────────────────────
+// ─── glyphs ──────────────────────────────────────────────────────────────────
 
 impl wit_glyphs::HostTypeface for HostState {
     fn from_bytes(
@@ -767,11 +768,8 @@ impl wit_glyphs::Host for HostState {
     }
 }
 
-// ─── layout interface (host-shaped paragraphs; skparagraph-backed) ───────────
+// ─── layout (union text-style + buffered setter-form builder) ────────────────
 
-/// wit text-style → skia textlayout TextStyle, reusing the renderer's
-/// family-alias typeface resolution (task 41: FontCollection alone can't
-/// resolve /system/fonts names on this device).
 fn layout_text_style(
     renderer: &mut crate::canvas_impl::SkiaRenderer,
     s: &wit_layout::TextStyle,
@@ -797,10 +795,50 @@ fn layout_text_style(
         ts.set_height(s.line_height);
         ts.set_height_override(true);
     }
+    if s.baseline_shift != 0.0 {
+        ts.set_baseline_shift(s.baseline_shift);
+    }
+    if let Some(d) = &s.decoration {
+        use skia_safe::textlayout as tl;
+        let mut ty = tl::TextDecoration::NO_DECORATION;
+        if d.underline {
+            ty |= tl::TextDecoration::UNDERLINE;
+        }
+        if d.overline {
+            ty |= tl::TextDecoration::OVERLINE;
+        }
+        if d.line_through {
+            ty |= tl::TextDecoration::LINE_THROUGH;
+        }
+        ts.set_decoration_type(ty);
+        ts.set_decoration_color(if d.color != 0 {
+            color(d.color)
+        } else {
+            color(s.color)
+        });
+        ts.set_decoration_style(match d.style {
+            wit_layout::DecorationLineStyle::Solid => tl::TextDecorationStyle::Solid,
+            wit_layout::DecorationLineStyle::Double => tl::TextDecorationStyle::Double,
+            wit_layout::DecorationLineStyle::Dotted => tl::TextDecorationStyle::Dotted,
+            wit_layout::DecorationLineStyle::Dashed => tl::TextDecorationStyle::Dashed,
+            wit_layout::DecorationLineStyle::Wavy => tl::TextDecorationStyle::Wavy,
+        });
+        ts.set_decoration_thickness_multiplier(if d.thickness > 0.0 { d.thickness } else { 1.0 });
+    }
+    for sh in &s.shadows {
+        ts.add_shadow(skia_safe::textlayout::TextShadow::new(
+            color(sh.color),
+            skia_safe::Point::new(sh.offset.x, sh.offset.y),
+            sh.sigma as f64,
+        ));
+    }
+    if let Some(bg) = s.background {
+        let mut bp = skia_safe::Paint::default();
+        bp.set_color(color(bg));
+        ts.set_background_paint(&bp);
+    }
     if !s.family.is_empty() {
         ts.set_font_families(&[s.family.as_str()]);
-        // Known aliases / absolute paths: resolve via the renderer's
-        // typeface cache (FontMgr-by-name is broken on-device).
         if s.family.starts_with('/')
             || matches!(
                 s.family.as_str(),
@@ -822,58 +860,121 @@ impl wit_layout::HostParagraphBuilder for HostState {
     fn new(
         &mut self,
         default_style: wit_layout::TextStyle,
-        align: wit_layout::Align,
-    ) -> wasmtime::Result<Resource<ParagraphBuilderRes>> {
-        let ts = layout_text_style(&mut self.renderer, &default_style);
-        let mut style = skia_safe::textlayout::ParagraphStyle::new();
-        style.set_text_style(&ts);
-        style.set_text_align(match align {
-            wit_layout::Align::Start => skia_safe::textlayout::TextAlign::Start,
-            wit_layout::Align::Center => skia_safe::textlayout::TextAlign::Center,
-            wit_layout::Align::End => skia_safe::textlayout::TextAlign::End,
-            wit_layout::Align::Justify => skia_safe::textlayout::TextAlign::Justify,
-        });
-        let fc = self.renderer.font_collection.clone();
-        let builder = skia_safe::textlayout::ParagraphBuilder::new(&style, fc);
-        Ok(self.table.push(ParagraphBuilderRes(builder))?)
+    ) -> wasmtime::Result<Resource<ParagraphBuilder002Res>> {
+        Ok(self.table.push(ParagraphBuilder002Res {
+            default_style: Some(default_style),
+            ..Default::default()
+        })?)
+    }
+
+    fn set_align(
+        &mut self,
+        self_: Resource<ParagraphBuilder002Res>,
+        a: wit_layout::Align,
+    ) -> wasmtime::Result<()> {
+        self.table.get_mut(&self_)?.align = Some(a);
+        Ok(())
+    }
+    fn set_direction(
+        &mut self,
+        self_: Resource<ParagraphBuilder002Res>,
+        d: wit_layout::TextDirection,
+    ) -> wasmtime::Result<()> {
+        self.table.get_mut(&self_)?.direction = Some(d);
+        Ok(())
+    }
+    fn set_max_lines(
+        &mut self,
+        self_: Resource<ParagraphBuilder002Res>,
+        n: u32,
+    ) -> wasmtime::Result<()> {
+        self.table.get_mut(&self_)?.max_lines = n;
+        Ok(())
+    }
+    fn set_ellipsis(
+        &mut self,
+        self_: Resource<ParagraphBuilder002Res>,
+        e: String,
+    ) -> wasmtime::Result<()> {
+        self.table.get_mut(&self_)?.ellipsis = e;
+        Ok(())
     }
 
     fn push_style(
         &mut self,
-        self_: Resource<ParagraphBuilderRes>,
+        self_: Resource<ParagraphBuilder002Res>,
         style: wit_layout::TextStyle,
     ) -> wasmtime::Result<()> {
-        let ts = layout_text_style(&mut self.renderer, &style);
-        self.table.get_mut(&self_)?.0.push_style(&ts);
+        self.table.get_mut(&self_)?.ops.push(BuilderOp::PushStyle(style));
         Ok(())
     }
-
-    fn pop_style(&mut self, self_: Resource<ParagraphBuilderRes>) -> wasmtime::Result<()> {
-        self.table.get_mut(&self_)?.0.pop();
+    fn pop_style(&mut self, self_: Resource<ParagraphBuilder002Res>) -> wasmtime::Result<()> {
+        self.table.get_mut(&self_)?.ops.push(BuilderOp::PopStyle);
         Ok(())
     }
-
     fn add_text(
         &mut self,
-        self_: Resource<ParagraphBuilderRes>,
+        self_: Resource<ParagraphBuilder002Res>,
         text: String,
     ) -> wasmtime::Result<()> {
-        self.table.get_mut(&self_)?.0.add_text(&text);
+        self.table.get_mut(&self_)?.ops.push(BuilderOp::AddText(text));
         Ok(())
     }
 
     fn build(
         &mut self,
-        b: Resource<ParagraphBuilderRes>,
+        b: Resource<ParagraphBuilder002Res>,
     ) -> wasmtime::Result<Resource<ParagraphRes>> {
-        let mut builder = self.table.delete(b)?;
-        let para = builder.0.build();
+        let state = self.table.delete(b)?;
+        let default_style = state
+            .default_style
+            .ok_or_else(|| wasmtime::Error::msg("paragraph-builder: missing default style"))?;
+        let ts = layout_text_style(&mut self.renderer, &default_style);
+        let mut style = skia_safe::textlayout::ParagraphStyle::new();
+        style.set_text_style(&ts);
+        if let Some(a) = state.align {
+            style.set_text_align(match a {
+                wit_layout::Align::Start => skia_safe::textlayout::TextAlign::Start,
+                wit_layout::Align::Center => skia_safe::textlayout::TextAlign::Center,
+                wit_layout::Align::End => skia_safe::textlayout::TextAlign::End,
+                wit_layout::Align::Justify => skia_safe::textlayout::TextAlign::Justify,
+            });
+        }
+        if let Some(d) = state.direction {
+            style.set_text_direction(match d {
+                wit_layout::TextDirection::Ltr => skia_safe::textlayout::TextDirection::LTR,
+                wit_layout::TextDirection::Rtl => skia_safe::textlayout::TextDirection::RTL,
+            });
+        }
+        if state.max_lines > 0 {
+            style.set_max_lines(Some(state.max_lines as usize));
+        }
+        if !state.ellipsis.is_empty() {
+            style.set_ellipsis(state.ellipsis.as_str());
+        }
+        let fc = self.renderer.font_collection.clone();
+        let mut builder = skia_safe::textlayout::ParagraphBuilder::new(&style, fc);
+        for op in &state.ops {
+            match op {
+                BuilderOp::PushStyle(s) => {
+                    let ts = layout_text_style(&mut self.renderer, s);
+                    builder.push_style(&ts);
+                }
+                BuilderOp::PopStyle => {
+                    builder.pop();
+                }
+                BuilderOp::AddText(t) => {
+                    builder.add_text(t);
+                }
+            }
+        }
+        let paragraph = builder.build();
         Ok(self
             .table
-            .push(ParagraphRes(std::rc::Rc::new(std::cell::RefCell::new(para))))?)
+            .push(ParagraphRes(std::rc::Rc::new(std::cell::RefCell::new(paragraph))))?)
     }
 
-    fn drop(&mut self, rep: Resource<ParagraphBuilderRes>) -> wasmtime::Result<()> {
+    fn drop(&mut self, rep: Resource<ParagraphBuilder002Res>) -> wasmtime::Result<()> {
         self.table.delete(rep)?;
         Ok(())
     }
@@ -914,6 +1015,9 @@ impl wit_layout::HostParagraph for HostState {
     }
     fn line_count(&mut self, self_: Resource<ParagraphRes>) -> wasmtime::Result<u32> {
         Ok(self.table.get(&self_)?.0.borrow().line_number() as u32)
+    }
+    fn did_exceed_max_lines(&mut self, self_: Resource<ParagraphRes>) -> wasmtime::Result<bool> {
+        Ok(self.table.get(&self_)?.0.borrow().did_exceed_max_lines())
     }
 
     fn lines(
@@ -1016,12 +1120,167 @@ impl wit_layout::HostParagraph for HostState {
     }
 }
 
-// ─── embedding interface (the wandr reactor-model handoff) ───────────────────
+// ─── scene (host-retained layers over the WasiDrawable machinery) ────────────
 
-/// The canvas-flavored graphics context (wasi-gfx graphics-context idiom).
-/// One per surface; reactor guests have exactly one, so this is a unit —
-/// the surface binding is implicit (the renderer's presented target).
-pub struct CanvasContextRes;
+impl wit_scene::Host for HostState {
+    fn draw_layer(
+        &mut self,
+        canvas: Resource<CanvasRes>,
+        l: Resource<LayerRes>,
+    ) -> wasmtime::Result<()> {
+        let raw_d = self.table.get(&l)?.0.as_ptr();
+        if raw_d.is_null() {
+            return Ok(());
+        }
+        with_canvas(self, &canvas, |c| {
+            // Same transparent-wrapper cast as the legacy draw-drawable —
+            // skia recordings sk_ref the drawable, which IS the contract's
+            // "host keeps the layer alive until the last capture drops".
+            let canvas_ptr = c as *const skia_safe::Canvas as *mut std::os::raw::c_void;
+            unsafe { wasi_drawable_ffi::wasi_canvas_draw_drawable(canvas_ptr, raw_d) };
+        })
+    }
+}
+
+impl wit_scene::HostLayer for HostState {
+    fn new(&mut self, _g: Resource<GraphicsRes>) -> wasmtime::Result<Resource<LayerRes>> {
+        Ok(self.table.push(LayerRes(WasiDrawable::new()))?)
+    }
+
+    fn set_content(
+        &mut self,
+        self_: Resource<LayerRes>,
+        recording: Resource<CanvasRes>,
+    ) -> wasmtime::Result<()> {
+        let entry = self.table.delete(recording)?;
+        match entry {
+            CanvasRes::Recording(mut recorder) => {
+                // finish_recording_as_drawable keeps captured child layers
+                // LIVE (a picture snapshot would freeze them) — the
+                // contract's nested-layer rule.
+                let inner = recorder.finish_recording_as_drawable();
+                self.table.get_mut(&self_)?.0.set_inner(inner.as_ref());
+                Ok(())
+            }
+            _ => Err(wasmtime::Error::msg("scene.set-content on a non-recording canvas")),
+        }
+    }
+
+    fn set_bounds(
+        &mut self,
+        self_: Resource<LayerRes>,
+        bounds: wit_types::Rect,
+    ) -> wasmtime::Result<()> {
+        self.table.get_mut(&self_)?.0.set_bounds(
+            bounds.x,
+            bounds.y,
+            bounds.x + bounds.width,
+            bounds.y + bounds.height,
+        );
+        Ok(())
+    }
+
+    fn set_transform(
+        &mut self,
+        self_: Resource<LayerRes>,
+        t: wit_types::Transform,
+    ) -> wasmtime::Result<()> {
+        let raw_d = self.table.get(&self_)?.0.as_ptr();
+        unsafe {
+            wasi_drawable_ffi::wasi_drawable_set_matrix(
+                raw_d, t.m00, t.m01, t.m02, t.m10, t.m11, t.m12, t.m20, t.m21, t.m22,
+            );
+        }
+        Ok(())
+    }
+
+    fn set_alpha(&mut self, self_: Resource<LayerRes>, alpha: u8) -> wasmtime::Result<()> {
+        let raw_d = self.table.get(&self_)?.0.as_ptr();
+        unsafe { wasi_drawable_ffi::wasi_drawable_set_alpha(raw_d, alpha as f32 / 255.0) };
+        Ok(())
+    }
+
+    fn set_clip_rect(
+        &mut self,
+        self_: Resource<LayerRes>,
+        r: wit_types::Rect,
+        anti_alias: bool,
+    ) -> wasmtime::Result<()> {
+        let raw_d = self.table.get(&self_)?.0.as_ptr();
+        unsafe {
+            wasi_drawable_ffi::wasi_drawable_set_clip_rect(
+                raw_d, r.x, r.y, r.x + r.width, r.y + r.height, anti_alias,
+            );
+        }
+        Ok(())
+    }
+
+    fn set_clip_rounded_rect(
+        &mut self,
+        self_: Resource<LayerRes>,
+        rr: wit_types::RoundedRect,
+        anti_alias: bool,
+    ) -> wasmtime::Result<()> {
+        let raw_d = self.table.get(&self_)?.0.as_ptr();
+        let radii = [
+            rr.top_left.x, rr.top_left.y,
+            rr.top_right.x, rr.top_right.y,
+            rr.bottom_right.x, rr.bottom_right.y,
+            rr.bottom_left.x, rr.bottom_left.y,
+        ];
+        unsafe {
+            wasi_drawable_ffi::wasi_drawable_set_clip_rrect(
+                raw_d,
+                rr.rect.x,
+                rr.rect.y,
+                rr.rect.x + rr.rect.width,
+                rr.rect.y + rr.rect.height,
+                radii.as_ptr(),
+                anti_alias,
+            );
+        }
+        Ok(())
+    }
+
+    fn set_clip_path(
+        &mut self,
+        self_: Resource<LayerRes>,
+        path: String,
+        anti_alias: bool,
+    ) -> wasmtime::Result<()> {
+        let raw_d = self.table.get(&self_)?.0.as_ptr();
+        if let Some(p) = svg_path(&path, wit_types::FillRule::Nonzero) {
+            // &Path → *const SkPath: Handle<SkPath> is a transparent
+            // single-field wrapper (the documented draw-drawable cast rule).
+            let path_ptr = &p as *const skia_safe::Path as *const std::os::raw::c_void;
+            unsafe { wasi_drawable_ffi::wasi_drawable_set_clip_path(raw_d, path_ptr, anti_alias) };
+        }
+        Ok(())
+    }
+
+    fn clear_clip(&mut self, self_: Resource<LayerRes>) -> wasmtime::Result<()> {
+        let raw_d = self.table.get(&self_)?.0.as_ptr();
+        unsafe { wasi_drawable_ffi::wasi_drawable_clear_clip(raw_d) };
+        Ok(())
+    }
+
+    fn set_shadow_elevation(
+        &mut self,
+        self_: Resource<LayerRes>,
+        elevation: f32,
+    ) -> wasmtime::Result<()> {
+        let raw_d = self.table.get(&self_)?.0.as_ptr();
+        unsafe { wasi_drawable_ffi::wasi_drawable_set_shadow_elevation(raw_d, elevation) };
+        Ok(())
+    }
+
+    fn drop(&mut self, rep: Resource<LayerRes>) -> wasmtime::Result<()> {
+        self.table.delete(rep)?;
+        Ok(())
+    }
+}
+
+// ─── embedding ───────────────────────────────────────────────────────────────
 
 impl wit_embedding::Host for HostState {
     fn get_context(&mut self) -> wasmtime::Result<Resource<CanvasContextRes>> {
@@ -1037,10 +1296,6 @@ impl wit_embedding::HostCanvasContext for HostState {
         Ok(self.table.push(GraphicsRes)?)
     }
 
-    /// Mirror of the skiko-gfx begin-frame policy: make the GL context
-    /// current (android), clear to opaque black, re-apply the base
-    /// transform — then hand the guest the Main canvas handle (the
-    /// "current buffer" of this swapchain-shaped context).
     fn get_current_buffer(
         &mut self,
         _self_: Resource<CanvasContextRes>,
@@ -1068,72 +1323,11 @@ impl wit_embedding::HostCanvasContext for HostState {
 
 // ─── linker registration ─────────────────────────────────────────────────────
 
-/// Register the wasi:canvas draft onto a guest linker (feature-gated call
-/// sites in app_loader).
 pub fn add_to_linker(
     linker: &mut wasmtime::component::Linker<HostState>,
 ) -> wasmtime::Result<()> {
-    crate::wasi_canvas_bindings::CanvasHost::add_to_linker::<_, wasmtime::component::HasSelf<HostState>>(
-        linker,
-        |s| s,
-    )
-}
-
-// ─── tests (offscreen path; no renderer needed) ──────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Drive the skia mapping helpers directly against an offscreen
-    /// surface — the table/HostState plumbing is exercised on device, the
-    /// pixel-producing conversions are what unit tests can lock down.
-    #[test]
-    fn offscreen_draw_and_snapshot() {
-        let mut surface = skia_safe::surfaces::raster_n32_premul((10, 10)).unwrap();
-        let c = surface.canvas();
-        c.clear(color(0xFF000000));
-        let table = ResourceTable::new();
-        let p = wit_types::Paint {
-            style: wit_types::PaintStyle::Fill,
-            color: 0xFFFF0000,
-            alpha: 255,
-            blend: wit_types::BlendMode::SrcOver,
-            anti_alias: false,
-            shader: None,
-            stroke_width: 0.0,
-            stroke_cap: wit_types::StrokeCap::Butt,
-            stroke_join: wit_types::StrokeJoin::Miter,
-            stroke_miter: 4.0,
-            blur: None,
-            filter: None,
-        };
-        c.draw_rect(rect(wit_types::Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }), &paint(&table, &p));
-        let img = surface.image_snapshot();
-        let pm = img.peek_pixels().unwrap();
-        let px = pm.get_color((5, 5));
-        assert_eq!(px, skia_safe::Color::RED);
-    }
-
-    #[test]
-    fn rrect_and_path_mapping() {
-        let rr = wit_types::RoundedRect {
-            rect: wit_types::Rect { x: 0.0, y: 0.0, width: 20.0, height: 10.0 },
-            top_left: wit_types::Point { x: 2.0, y: 2.0 },
-            top_right: wit_types::Point { x: 3.0, y: 3.0 },
-            bottom_right: wit_types::Point { x: 0.0, y: 0.0 },
-            bottom_left: wit_types::Point { x: 1.0, y: 1.0 },
-        };
-        let s = rrect(&rr);
-        assert_eq!(s.bounds().width(), 20.0);
-        assert!(svg_path("M 0 0 L 10 0 L 10 10 Z", wit_types::FillRule::Evenodd).is_some());
-        assert!(svg_path("not a path", wit_types::FillRule::Nonzero).is_none());
-    }
-
-    #[test]
-    fn gradient_stops_mapping() {
-        let (colors, positions) = stops_to_arrays(&[(0.0, 0xFF000000), (1.0, 0xFFFFFFFF)]);
-        assert_eq!(colors.len(), 2);
-        assert_eq!(positions, vec![0.0, 1.0]);
-    }
+    crate::wasi_canvas_002_bindings::CanvasHost::add_to_linker::<
+        _,
+        wasmtime::component::HasSelf<HostState>,
+    >(linker, |s| s)
 }
