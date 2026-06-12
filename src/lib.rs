@@ -198,6 +198,65 @@ pub mod input_handlers_bindings {
     }
 }
 
+/// The consolidation event, Phase A (docs/ui-shell-consolidation.md):
+/// the my:skiko-gfx platform remainder re-bound under its real homes —
+/// wandr:ui-shell (universal UI-shell), wandr:{device,chrome,assets} +
+/// wandr:ime/keyboard-send (app/OS services), wasi:logging (upstream).
+/// Impls DELEGATE to the existing my:skiko-gfx trait impls; my:skiko-gfx
+/// keeps serving until Phase C.
+mod ui_shell_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/ui-shell.wit",
+        world: "ui-shell-imports",
+    });
+}
+/// Probe-only export worlds (wired to dispatch in Phase B).
+pub mod ui_shell_export_bindings {
+    pub mod events {
+        wasmtime::component::bindgen!({
+            path: "../../wit/ui-shell.wit",
+            world: "shell-events-world",
+        });
+    }
+    pub mod pacing {
+        wasmtime::component::bindgen!({
+            path: "../../wit/ui-shell.wit",
+            world: "frame-pacing-world",
+        });
+    }
+}
+mod logging_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/deps-upstream/logging",
+        world: "imports",
+    });
+}
+mod device_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/device.wit",
+        world: "device-imports",
+    });
+}
+mod chrome_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/chrome.wit",
+        world: "chrome-imports",
+    });
+}
+mod assets_pkg_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/assets.wit",
+        world: "assets-imports",
+    });
+}
+mod keyboard_send_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../wit/ime.wit",
+        world: "keyboard-send-imports",
+    });
+}
+mod consolidated_impl;
+
 /// wasi:input-handlers@0.0.2 (wit-0.0.2) — the six-consumer-union event
 /// records (buttons/device/tilt + enter/leave + the optional
 /// gesture-handler), probed SIDE-BY-SIDE with 0.0.1; per input type the
