@@ -303,6 +303,8 @@ impl LoadedApp {
             .map_err(|e| anyhow!("wasi-canvas-0.0.2 add_to_linker: {e:#}"))?; // R3 side-by-side
         crate::consolidated_impl::add_to_linker(&mut linker)
             .map_err(|e| anyhow!("consolidation add_to_linker: {e:#}"))?; // Phase A: ui-shell/device/chrome/assets/keyboard-send/logging
+        crate::wasi_audio_impl::add_to_linker(&mut linker)
+            .map_err(|e| anyhow!("wasi-audio add_to_linker: {e:#}"))?; // Phase A: the charter's audio slot
 
         for dep in &self.deps {
             wire_dep_into_linker(&mut linker, store, dep)?;
@@ -437,6 +439,8 @@ impl LoadedApp {
             .map_err(|e| anyhow!("wasi-canvas-0.0.2 add_to_linker: {e:#}"))?; // R3 side-by-side
         crate::consolidated_impl::add_to_linker(&mut linker)
             .map_err(|e| anyhow!("consolidation add_to_linker: {e:#}"))?; // Phase A: ui-shell/device/chrome/assets/keyboard-send/logging
+        crate::wasi_audio_impl::add_to_linker(&mut linker)
+            .map_err(|e| anyhow!("wasi-audio add_to_linker: {e:#}"))?; // Phase A: the charter's audio slot
 
         for dep in &self.deps {
             wire_dep_into_linker(&mut linker, store, dep)?;

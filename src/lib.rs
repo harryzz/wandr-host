@@ -256,6 +256,22 @@ mod keyboard_send_bindings {
     });
 }
 mod consolidated_impl;
+/// wasi:audio draft (proposals/wasi-audio) — the charter's empty audio
+/// slot, served over the SAME track machinery as my:skiko-gfx/audio
+/// (resources wrapping the proven u32 handles; Phase A of the
+/// consolidation, so Phase B guests land on the de-warted shapes
+/// directly instead of migrating twice).
+mod wasi_audio_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../proposals/wasi-audio/wit",
+        world: "audio-guest",
+        with: {
+            "wasi:audio/pcm.playback": crate::wasi_audio_impl::PlaybackRes,
+            "wasi:audio/pcm.capture": crate::wasi_audio_impl::CaptureRes,
+        },
+    });
+}
+mod wasi_audio_impl;
 
 /// wasi:input-handlers@0.0.2 (wit-0.0.2) — the six-consumer-union event
 /// records (buttons/device/tilt + enter/leave + the optional
