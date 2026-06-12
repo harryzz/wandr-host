@@ -4,92 +4,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use winit::window::Window;
 
-// ─── Rasterized-text cache ───────────────────────────────────────────────────
-//
-// Without this cache `blit_text_blob` allocates a fresh CPU surface +
-// `SkImage` on every call and Skia uploads each as a unique GPU texture that
-// is never reused. With ~50 text draws per frame at 60 fps that's ~3000
-// texture uploads/sec and ~9 MB/sec leak. Caching by (blob-bounds-hash,
-// paint colour) caps the working set at O(distinct labels).
-
-struct CachedTextImage {
-    image:    skia_safe::Image,
-    offset_x: f32,
-    offset_y: f32,
-}
-
-const TEXT_IMAGE_CACHE_CAP: usize = 256;
-
-fn rasterize_text_blob(blob: &skia_safe::TextBlob, paint: &Paint) -> Option<CachedTextImage> {
-    let bounds = blob.bounds();
-    let img_w = (bounds.width().ceil()  as i32 + 4).max(1);
-    let img_h = (bounds.height().ceil() as i32 + 4).max(1);
-    let mut cpu = skia_safe::surfaces::raster_n32_premul((img_w, img_h))?;
-    cpu.canvas().clear(Color::TRANSPARENT);
-    cpu.canvas().draw_text_blob(blob, (-bounds.left() + 1.0, -bounds.top() + 1.0), paint);
-    Some(CachedTextImage {
-        image:    cpu.image_snapshot(),
-        offset_x: bounds.left() - 1.0,
-        offset_y: bounds.top() - 1.0,
-    })
-}
-
-fn paint_cache_key(p: &Paint) -> u32 {
-    // skia_safe::Color is repr(transparent) wrapping SkColor (u32) —
-    // safe to transmute.
-    unsafe { std::mem::transmute::<skia_safe::Color, u32>(p.color()) }
-}
-
-/// Content-based hash of a text blob: text + font params. Two blobs with the
-/// same content hash render identically; two with different content always
-/// get different keys (regardless of whether their visual bounds match).
-fn text_content_hash(text: &str, family: &str, size: f32, weight: u32, italic: bool) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    family.hash(&mut h);
-    size.to_bits().hash(&mut h);
-    weight.hash(&mut h);
-    italic.hash(&mut h);
-    h.finish()
-}
-
-// ─── Emoji-capable text shaping ──────────────────────────────────────────────
-//
-// `TextBlob::from_str` lays out with a SINGLE typeface and no font fallback, so
-// any codepoint the primary face lacks (emoji, CJK) is dropped — that's why
-// emoji vanished in dioxus-canvas guests while the Compose path (which goes
-// through the textlayout FontCollection, with fallback) rendered them fine.
-// Shape through SkShaper (harfbuzz + ICU, embedded) with the system FontMgr as
-// the fallback chain so missing glyphs land on NotoColorEmoji etc. The N32
-// raster surface in `rasterize_text_blob` preserves color-emoji bitmaps.
-// Cached thread-local: shaping is stateless and the renderer runs on one thread.
-thread_local! {
-    static FALLBACK_SHAPER: skia_safe::shaper::Shaper =
-        skia_safe::shaper::Shaper::new(skia_safe::FontMgr::new());
-}
-
-/// Shape `text` at `font` into a single-line blob with system-font fallback for
-/// glyphs the primary face lacks. Falls back to `from_str` if shaping yields
-/// nothing, so plain text never regresses.
-///
-/// Baseline alignment: `SkShaper`'s run handler puts the first line's TOP at the
-/// offset, so the baseline lands at `offset.y - ascent` (ascent is negative).
-/// `TextBlob::from_str` puts the baseline at y=0, and all guest draw points are
-/// baseline-relative — so we pass `offset.y = ascent` to land the baseline back
-/// at 0 and keep text where the guest expects it.
-fn shape_text_fallback(text: &str, font: &Font) -> Option<skia_safe::TextBlob> {
-    if text.is_empty() {
-        return None;
-    }
-    let (_, metrics) = font.metrics();
-    let offset_y = metrics.ascent; // negative → shifts the blob up to baseline 0
-    FALLBACK_SHAPER
-        .with(|sh| sh.shape_text_blob(text, font, true, 1.0e6, (0.0, offset_y)))
-        .map(|(blob, _)| blob)
-        .or_else(|| skia_safe::TextBlob::from_str(text, font))
-}
-
 // ─── WasiDrawable FFI ────────────────────────────────────────────────────────
 //
 // C++ shim in host/cpp/wasi_drawable.{h,cpp} subclasses SkDrawable with a
@@ -104,13 +18,6 @@ pub(crate) mod wasi_drawable_ffi {
         pub fn wasi_drawable_set_inner(outer: *mut c_void, inner: *mut c_void);
         pub fn wasi_drawable_set_bounds(d: *mut c_void,
                                         l: f32, t: f32, r: f32, b: f32);
-        pub fn wasi_drawable_set_transform(d: *mut c_void,
-                                           layer_x: f32, layer_y: f32,
-                                           translation_x: f32, translation_y: f32,
-                                           scale_x: f32, scale_y: f32,
-                                           rotation_z: f32,
-                                           pivot_x: f32, pivot_y: f32,
-                                           alpha: f32);
         pub fn wasi_drawable_set_clip_rect(d: *mut c_void,
                                            l: f32, t: f32, r: f32, b: f32,
                                            antialias: bool);
@@ -128,7 +35,6 @@ pub(crate) mod wasi_drawable_ffi {
         pub fn wasi_drawable_set_alpha(d: *mut c_void, alpha: f32);
         pub fn wasi_drawable_set_clip_path(d: *mut c_void, path: *const c_void,
                                            antialias: bool);
-        pub fn wasi_drawable_ref(d: *mut c_void);
         pub fn wasi_drawable_unref(d: *mut c_void);
         pub fn wasi_canvas_draw_drawable(canvas: *mut c_void, d: *mut c_void);
     }
@@ -185,37 +91,7 @@ impl Drop for WasiDrawable {
 // impl Send for SkiaRenderer below.
 unsafe impl Send for WasiDrawable {}
 
-// ─── Multi-run text-blob builder ─────────────────────────────────────────────
-
-struct TextBlobRun {
-    text:   String,
-    family: String,
-    size:   f32,
-    weight: u32,
-    italic: bool,
-    x:      f32,
-    y:      f32,
-}
-
 // ─── Renderer state ──────────────────────────────────────────────────────────
-
-/// Plain-data copy of `skia_safe::textlayout::LineMetrics` numeric fields.
-/// Task 50 — see `SkiaRenderer::para_line_metrics_cache`.
-pub struct CachedLineMetrics {
-    pub start_index: u32,
-    pub end_index: u32,
-    pub end_excluding_whitespaces: u32,
-    pub end_including_newline: u32,
-    pub hard_break: bool,
-    pub ascent: f64,
-    pub descent: f64,
-    pub unscaled_ascent: f64,
-    pub height: f64,
-    pub width: f64,
-    pub left: f64,
-    pub baseline: f64,
-    pub line_number: u32,
-}
 
 pub struct SkiaRenderer {
     // Drop order matters: gr_context + surface must drop before egl so that
@@ -269,70 +145,8 @@ pub struct SkiaRenderer {
     #[cfg(target_os = "android")]
     pub(crate) egl: crate::egl::android::EglContext,
 
-    // Each blob carries a content hash (text + font params) so the text-image
-    // cache key can distinguish "Count: 5" from "Count: 0" — same bounds,
-    // different content. Without this the cache returns a stale GPU texture
-    // and the displayed text never updates.
-    text_blobs:       HashMap<u32, (skia_safe::TextBlob, u64)>,
-    multi_blob_cache: HashMap<u32, Vec<(skia_safe::TextBlob, f32, f32, u64)>>,
-    text_blob_runs:   Vec<TextBlobRun>,
-    images:           HashMap<u32, skia_safe::Image>,
-    shader_cache:     HashMap<u32, skia_safe::Shader>,
-    next_blob_id:     u32,
-    next_shader_id:   u32,
-    // Picture recording (Tier A skia shim). recorders are in either
-    // "idle" or "recording" state; recording_stack holds the IDs of
-    // recorders currently in begin_recording → finish state, with the
-    // top redirecting `canvas()` draws into the recorder's canvas.
-    recorders:        HashMap<u32, skia_safe::PictureRecorder>,
-    pictures:         HashMap<u32, skia_safe::Picture>,
-    recording_stack:  Vec<u32>,
-    next_recorder_id: u32,
-    next_picture_id:  u32,
-    // WasiDrawable instances (deferred-replay shim). Each maps id → owned
-    // SkDrawable*. Parent recordings hold raw pointers via drawDrawable, so
-    // dropping a drawable while a parent picture still references it would
-    // dangling. Compose drops them at RenderNode.close() AFTER releasing
-    // the parent layer that referenced them, which is correct order.
-    drawables:        HashMap<u32, WasiDrawable>,
-    next_drawable_id: u32,
     typeface_cache:   HashMap<(String, bool, bool), Typeface>,
-    /// Guest-registered typefaces (create-typeface from raw font bytes) for
-    /// the guest-shaped glyph path (draw-glyphs). Ids share next_blob_id.
-    guest_typefaces:  HashMap<u32, Typeface>,
-
-    text_image_cache: HashMap<(u64, u32), CachedTextImage>,
-    text_image_keys:  std::collections::VecDeque<(u64, u32)>,
-
-    pub para_builders:   HashMap<u32, skia_safe::textlayout::ParagraphBuilder>,
-    pub paragraphs:      HashMap<u32, skia_safe::textlayout::Paragraph>,
     pub font_collection: skia_safe::textlayout::FontCollection,
-    pub next_para_id:    u32,
-    // Task 28 Path D: host-side raster surfaces backing Compose's
-    // org.jetbrains.skia.Canvas(bitmap) — short-lived raster targets for
-    // vector-icon rasterization. Snapshots land in `images` via the same
-    // next_blob_id counter as other images. The LRU vec tracks insertion
-    // order so a soft cap can evict the oldest surface when Compose
-    // abandons it (Compose doesn't call Canvas.close on wasi).
-    bitmap_canvases:            HashMap<u32, skia_safe::Surface>,
-    bitmap_canvas_lru:          std::collections::VecDeque<u32>,
-    next_bitmap_canvas_id:      u32,
-    /// Holds the result of the last `prepare-rects-for-range` call so the
-    /// guest can pull rect fields out via indexed getters (avoiding the
-    /// need for `list<f32>` return marshaling in the WIT bindings). One
-    /// renderer-wide slot is sufficient: the guest always reads the cache
-    /// in the same WIT call burst, never interleaved with another prepare.
-    pub para_rect_cache: Vec<skia_safe::textlayout::TextBox>,
-    /// Task 50 — per-line metrics cache. Populated by
-    /// `prepare_line_metrics`; read by the 13 `get_cached_line_*` getters.
-    /// Fixes the multi-line cursor-render bug: without this, skiko-wasi's
-    /// `Paragraph.lineMetrics` returns an empty array, and Compose's
-    /// `SkiaParagraph.getCursorRect` falls back to line 0 metrics for any
-    /// offset → cursor blinks on line 1 regardless of selection position.
-    ///
-    /// Copies the numeric fields out of `skia_safe::textlayout::LineMetrics`
-    /// so we don't have to thread the source paragraph's lifetime.
-    pub para_line_metrics_cache: Vec<CachedLineMetrics>,
 }
 
 // Skia's RCHandle uses non-atomic refcounts so its types aren't auto-Send.
@@ -447,33 +261,8 @@ impl SkiaRenderer {
                 inset_top: 0, inset_bottom: 0, keyboard_base_px: 0,
                 base_matrix: skia_safe::Matrix::new_identity(),
                 current_orient: 0,
-                text_blobs:       HashMap::new(),
-                multi_blob_cache: HashMap::new(),
-                text_blob_runs:   Vec::new(),
-                images:           HashMap::new(),
-                shader_cache:     HashMap::new(),
-                next_blob_id:     1,
-                next_shader_id:   1,
-                recorders:        HashMap::new(),
-                pictures:         HashMap::new(),
-                recording_stack:  Vec::new(),
-                next_recorder_id: 1,
-                next_picture_id:  1,
-                drawables:        HashMap::new(),
-                next_drawable_id: 1,
                 typeface_cache:   HashMap::new(),
-                guest_typefaces:  HashMap::new(),
-                text_image_cache: HashMap::new(),
-                text_image_keys:  std::collections::VecDeque::with_capacity(TEXT_IMAGE_CACHE_CAP),
-                para_builders:    HashMap::new(),
-                paragraphs:       HashMap::new(),
                 font_collection:  Self::make_font_collection(),
-                next_para_id:     1,
-                para_rect_cache:  Vec::new(),
-                para_line_metrics_cache: Vec::new(),
-                bitmap_canvases:       HashMap::new(),
-                bitmap_canvas_lru:     std::collections::VecDeque::with_capacity(128),
-                next_bitmap_canvas_id: 1,
             });
         }
 
@@ -496,33 +285,8 @@ impl SkiaRenderer {
                 inset_top: 0, inset_bottom: 0, keyboard_base_px: 0,
                 base_matrix: skia_safe::Matrix::new_identity(),
                 current_orient: 0,
-                text_blobs:       HashMap::new(),
-                multi_blob_cache: HashMap::new(),
-                text_blob_runs:   Vec::new(),
-                images:           HashMap::new(),
-                shader_cache:     HashMap::new(),
-                next_blob_id:     1,
-                next_shader_id:   1,
-                recorders:        HashMap::new(),
-                pictures:         HashMap::new(),
-                recording_stack:  Vec::new(),
-                next_recorder_id: 1,
-                next_picture_id:  1,
-                drawables:        HashMap::new(),
-                next_drawable_id: 1,
                 typeface_cache:   HashMap::new(),
-                guest_typefaces:  HashMap::new(),
-                text_image_cache: HashMap::new(),
-                text_image_keys:  std::collections::VecDeque::with_capacity(TEXT_IMAGE_CACHE_CAP),
-                para_builders:    HashMap::new(),
-                paragraphs:       HashMap::new(),
                 font_collection:  Self::make_font_collection(),
-                next_para_id:     1,
-                para_rect_cache:  Vec::new(),
-                para_line_metrics_cache: Vec::new(),
-                bitmap_canvases:       HashMap::new(),
-                bitmap_canvas_lru:     std::collections::VecDeque::with_capacity(128),
-                next_bitmap_canvas_id: 1,
             })
         }
     }
@@ -603,33 +367,8 @@ impl SkiaRenderer {
             logical_width, logical_height, base_matrix,
             inset_top: 0, inset_bottom: 0, keyboard_base_px: 0,
             current_orient: orient,
-            text_blobs:       HashMap::new(),
-            multi_blob_cache: HashMap::new(),
-            text_blob_runs:   Vec::new(),
-            images:           HashMap::new(),
-            shader_cache:     HashMap::new(),
-            next_blob_id:     1,
-            next_shader_id:   1,
-            recorders:        HashMap::new(),
-            pictures:         HashMap::new(),
-            recording_stack:  Vec::new(),
-            next_recorder_id: 1,
-            next_picture_id:  1,
-            drawables:        HashMap::new(),
-            next_drawable_id: 1,
             typeface_cache:   HashMap::new(),
-            guest_typefaces:  HashMap::new(),
-            text_image_cache: HashMap::new(),
-            text_image_keys:  std::collections::VecDeque::with_capacity(TEXT_IMAGE_CACHE_CAP),
-            para_builders:    HashMap::new(),
-            paragraphs:       HashMap::new(),
             font_collection:  Self::make_font_collection(),
-            next_para_id:     1,
-            para_rect_cache:  Vec::new(),
-            para_line_metrics_cache: Vec::new(),
-            bitmap_canvases:       HashMap::new(),
-            bitmap_canvas_lru:     std::collections::VecDeque::with_capacity(128),
-            next_bitmap_canvas_id: 1,
         })
     }
 
@@ -758,27 +497,8 @@ impl SkiaRenderer {
     /// tables. GPU-resident caches (`text_image_cache`, `images`) are NOT
     /// inherited because their textures live in the dying gr_context.
     pub fn inherit_caches_from(&mut self, old: &mut Self) {
-        self.text_blobs       = std::mem::take(&mut old.text_blobs);
-        self.multi_blob_cache = std::mem::take(&mut old.multi_blob_cache);
-        self.text_blob_runs   = std::mem::take(&mut old.text_blob_runs);
-        self.shader_cache     = std::mem::take(&mut old.shader_cache);
-        self.next_blob_id     = old.next_blob_id;
-        self.next_shader_id   = old.next_shader_id;
-        self.recorders        = std::mem::take(&mut old.recorders);
-        self.pictures         = std::mem::take(&mut old.pictures);
-        self.recording_stack  = std::mem::take(&mut old.recording_stack);
-        self.next_recorder_id = old.next_recorder_id;
-        self.next_picture_id  = old.next_picture_id;
-        self.drawables        = std::mem::take(&mut old.drawables);
-        self.next_drawable_id = old.next_drawable_id;
         self.typeface_cache   = std::mem::take(&mut old.typeface_cache);
-        self.para_builders    = std::mem::take(&mut old.para_builders);
-        self.paragraphs       = std::mem::take(&mut old.paragraphs);
-        self.next_para_id     = old.next_para_id;
         // bitmap_canvases hold a raster Surface (CPU-only), safe to inherit.
-        self.bitmap_canvases       = std::mem::take(&mut old.bitmap_canvases);
-        self.bitmap_canvas_lru     = std::mem::take(&mut old.bitmap_canvas_lru);
-        self.next_bitmap_canvas_id = old.next_bitmap_canvas_id;
         // font_collection holds a default-FontMgr; keep the freshly built
         // one to be safe (cheap to recreate).
     }
@@ -811,22 +531,9 @@ impl SkiaRenderer {
     }
 
     pub fn canvas(&mut self) -> &Canvas {
-        // If a picture recording is active, route draw calls into the
-        // recorder's canvas instead of the screen surface. The recorder owns
-        // an internal Canvas during begin_recording → finish; we look it up
-        // by the top-of-stack recorder id.
-        if let Some(&rid) = self.recording_stack.last() {
-            if let Some(rec) = self.recorders.get_mut(&rid) {
-                if let Some(c) = rec.recording_canvas() {
-                    // Lifetime extension: skia-safe returns &Canvas borrowed
-                    // from `self` through the recorder; that's the same
-                    // shape callers expect from `surface.canvas()`. Safe so
-                    // long as callers don't hold the borrow across another
-                    // `&mut self` call (mirrors the surface.canvas() rules).
-                    return unsafe { &*(c as *const skia_safe::Canvas) };
-                }
-            }
-        }
+        // The embedder-presented surface. (The legacy host-side recording
+        // stack is gone — 0.0.2 recordings are first-class table resources
+        // with their own canvases.)
         self.surface.canvas()
     }
 
@@ -957,61 +664,6 @@ impl SkiaRenderer {
         tf
     }
 
-    /// CPU-rasterise the blob then blit to the GPU canvas, caching the
-    /// SkImage so identical (blob content, paint colour) draws reuse the
-    /// same GPU texture. The content hash is computed in `create_text_blob`
-    /// from text + font params — distinct content always gets distinct keys
-    /// even when bounds collide.
-    fn blit_text_blob_cached(
-        &mut self,
-        blob: &skia_safe::TextBlob,
-        content_hash: u64,
-        x: f32, y: f32,
-        paint: &Paint,
-    ) {
-        let key = (content_hash, paint_cache_key(paint));
-
-        if !self.text_image_cache.contains_key(&key) {
-            let entry = match rasterize_text_blob(blob, paint) {
-                Some(e) => e,
-                None    => return,
-            };
-            if self.text_image_keys.len() >= TEXT_IMAGE_CACHE_CAP {
-                if let Some(old) = self.text_image_keys.pop_front() {
-                    self.text_image_cache.remove(&old);
-                }
-            }
-            self.text_image_cache.insert(key, entry);
-            self.text_image_keys.push_back(key);
-        }
-        // Use canvas() helper so the image lands on the recording canvas
-        // when a Picture is being recorded, not the screen surface.
-        let image = self.text_image_cache.get(&key).unwrap().image.clone();
-        let ox = self.text_image_cache.get(&key).unwrap().offset_x;
-        let oy = self.text_image_cache.get(&key).unwrap().offset_y;
-        self.canvas().draw_image(&image, (x + ox, y + oy), None);
-    }
-
-    pub fn draw_paragraph(&mut self, id: u32, x: f32, y: f32) {
-        // Skia's Paragraph (RefHandle) isn't Clone. We need to paint via
-        // self.canvas() which respects the recording stack. Hold the paragraph
-        // and the recorder-or-surface canvas as raw pointers briefly so the
-        // borrow checker doesn't see overlapping borrows. Safe because we
-        // never re-enter `self` during the paint call.
-        let para_ptr: *const skia_safe::textlayout::Paragraph =
-            match self.paragraphs.get(&id) {
-                Some(p) => p as *const _,
-                None => return,
-            };
-        let canvas_ptr: *const Canvas = self.canvas() as *const Canvas;
-        unsafe { (&*para_ptr).paint(&*canvas_ptr, (x, y)); }
-    }
-    #[allow(dead_code)]
-    fn _old_draw_paragraph(&mut self, id: u32, x: f32, y: f32) {
-        if let Some(p) = self.paragraphs.get(&id) {
-            p.paint(self.surface.canvas(), (x, y));
-        }
-    }
 }
 
 /// Task 41 — Compose Multiplatform's GenericFontFamiliesMapping for

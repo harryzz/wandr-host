@@ -774,7 +774,7 @@ impl ApplicationHandler for App {
                                     "codeonly" => ("KeyZ".to_string(), String::new()),
                                     _ => ("KeyZ".to_string(), t),
                                 };
-                                let ev4 = input::KeyEventV4 {
+                                let ev4 = input::KeyEvent {
                                     down: true, repeat: false,
                                     code, text,
                                     alt: false, ctrl: false, meta: false, shift: false,
@@ -1044,7 +1044,7 @@ impl ApplicationHandler for App {
                     };
                     let text = event.text.as_ref().map(|t| t.to_string()).unwrap_or_default();
                     // wasi:input-handlers key-handler supersedes everything.
-                    let ev4 = input::KeyEventV4 {
+                    let ev4 = input::KeyEvent {
                         down: kind == 0,
                         repeat: event.repeat,
                         code: w3c_code.clone(),

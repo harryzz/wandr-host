@@ -43,13 +43,12 @@ impl PointerMeta {
     }
 }
 
-pub type KeyEventV4 = ih2::key::exports::wasi::input_handlers::key_handler::KeyEvent;
+pub type KeyEvent = ih2::key::exports::wasi::input_handlers::key_handler::KeyEvent;
 pub type PointerEventV5 = ih2::pointer::exports::wasi::input_handlers::pointer_handler::PointerEvent;
 pub type PointerKindV5 = ih2::pointer::exports::wasi::input_handlers::pointer_handler::Kind;
 pub type PointerDeviceV5 = ih2::pointer::exports::wasi::input_handlers::pointer_handler::PointerDevice;
 pub type ButtonV5 = ih2::pointer::exports::wasi::input_handlers::pointer_handler::Button;
 pub type ButtonsV5 = ih2::pointer::exports::wasi::input_handlers::pointer_handler::Buttons;
-pub type KeyEventV5 = ih2::key::exports::wasi::input_handlers::key_handler::KeyEvent;
 
 fn buttons_v5(mask: u8) -> ButtonsV5 {
     let mut b = ButtonsV5::empty();
@@ -93,20 +92,6 @@ fn touch_suppressed() -> bool {
     } else {
         false
     }
-}
-
-/// Enriched dispatch: also delivers pointer-id (multi-touch) and pressure.
-/// Calls both v1 (for backward compat) and v2 (for callers that want the
-/// extras). Single-touch / mouse callers should pass pointer_id=0.
-pub fn dispatch_pointer_v2(
-    store: &mut Store<HostState>,
-    guest_input: &GuestInput,
-    kind: u8,
-    pointer_id: u32,
-    x: f32, y: f32,
-    pressure: f32,
-) -> anyhow::Result<()> {
-    dispatch_pointer_routed(store, guest_input, kind, pointer_id, x, y, pressure, [false; 4], PointerMeta::default())
 }
 
 /// Pointer dispatch with wasi:input-handlers routing: a bound
@@ -176,7 +161,7 @@ pub fn dispatch_pointer_routed(
 pub fn dispatch_key_routed(
     guest_input: &GuestInput,
     store: &mut Store<HostState>,
-    ev: &KeyEventV4,
+    ev: &KeyEvent,
 ) -> anyhow::Result<bool> {
     if let Some(kh) = &guest_input.key2 {
         kh.wasi_input_handlers_key_handler().call_on_key(store, ev)?;
@@ -226,7 +211,7 @@ pub fn dispatch_android_key(
 ) -> anyhow::Result<()> {
     let shift = (meta_state & AMETA_SHIFT_ON) != 0;
     let (code_point, _key_id) = map_android_keycode(key_code, shift);
-    let ev = KeyEventV4 {
+    let ev = KeyEvent {
         down: kind == 0,
         repeat: false,
         code: android_keycode_to_w3c(key_code),

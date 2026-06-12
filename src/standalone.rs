@@ -987,7 +987,7 @@ fn run_cwasm_loop(
             match ev {
                 crate::ime_inbound::InboundEvent::KeyEvent { code_point, key_id, action } => {
                     // wasi:input-handlers key-handler supersedes legacy.
-                    let ev4 = crate::input::KeyEventV4 {
+                    let ev4 = crate::input::KeyEvent {
                         down: action == 0,
                         repeat: false,
                         code: crate::input::key_id_to_w3c(key_id).to_string(),
