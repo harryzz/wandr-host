@@ -435,6 +435,39 @@ impl wit_draw::HostGraphics for HostState {
         Ok(self.table.push(CanvasRes::Recording(recorder))?)
     }
 
+    fn combine_paths(
+        &mut self,
+        _self_: Resource<GraphicsRes>,
+        a: String,
+        b: String,
+        op: wit_draw::PathOp,
+    ) -> wasmtime::Result<Option<String>> {
+        let (pa, pb) = match (
+            skia_safe::Path::from_svg(&a),
+            skia_safe::Path::from_svg(&b),
+        ) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Ok(None),
+        };
+        let skop = match op {
+            wit_draw::PathOp::Difference => skia_safe::PathOp::Difference,
+            wit_draw::PathOp::Intersect => skia_safe::PathOp::Intersect,
+            wit_draw::PathOp::Union => skia_safe::PathOp::Union,
+            wit_draw::PathOp::Xor => skia_safe::PathOp::XOR,
+            wit_draw::PathOp::ReverseDifference => skia_safe::PathOp::ReverseDifference,
+        };
+        Ok(pa.op(&pb, skop).map(|result| {
+            // skia path-op results use the EvenOdd fill rule, but an SVG
+            // path string carries no fill rule — re-parsing defaults to
+            // Winding and would re-fill the hole (e.g. collapsing a border
+            // ring into a solid fill). Convert to an equivalent
+            // Winding-fill path (reverses inner contours) so the SVG
+            // round-trip renders right.
+            let winding = result.as_winding().unwrap_or(result);
+            winding.to_svg()
+        }))
+    }
+
     fn drop(&mut self, rep: Resource<GraphicsRes>) -> wasmtime::Result<()> {
         self.table.delete(rep)?;
         Ok(())
