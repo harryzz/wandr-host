@@ -10,8 +10,12 @@ use crate::HostState;
 use crate::audio_impl as old;
 use crate::wasi_audio_bindings::wasi::audio::pcm as wit;
 
-/// Playback stream = a legacy output track handle.
-pub struct PlaybackRes(pub u32);
+/// Playback stream = a legacy output track handle, plus the cumulative
+/// frames accepted by `write` (the `position` clock = written − buffered).
+pub struct PlaybackRes {
+    pub handle: u32,
+    pub written: u64,
+}
 /// Capture stream = a legacy capture handle (shared handle space).
 pub struct CaptureRes(pub u32);
 
@@ -50,28 +54,43 @@ impl wit::HostPlayback for HostState {
         }
         Ok(self
             .table
-            .push(PlaybackRes(h))
+            .push(PlaybackRes { handle: h, written: 0 })
             .map_err(|_| wit::AudioError::Unavailable)?)
     }
 
     fn write(&mut self, self_: Resource<PlaybackRes>, samples: Vec<f32>) -> u32 {
-        let h = match self.table.get(&self_) {
-            Ok(r) => r.0,
+        let r = match self.table.get_mut(&self_) {
+            Ok(r) => r,
             Err(_) => return 0,
         };
-        old::write_pcm_f32(h, &samples)
+        let accepted = old::write_pcm_f32(r.handle, &samples);
+        // `write` returns FRAMES accepted; accumulate for the position clock.
+        r.written = r.written.saturating_add(accepted as u64);
+        accepted
     }
 
     fn buffered_frames(&mut self, self_: Resource<PlaybackRes>) -> u32 {
         let h = match self.table.get(&self_) {
-            Ok(r) => r.0,
+            Ok(r) => r.handle,
             Err(_) => return 0,
         };
         old::pending_frames(h)
     }
 
+    fn position(&mut self, self_: Resource<PlaybackRes>) -> u64 {
+        let r = match self.table.get(&self_) {
+            Ok(r) => r,
+            Err(_) => return 0,
+        };
+        // Frames consumed by the device = accepted − still-buffered. Monotonic
+        // and never exceeds what was written (saturating guards the transient
+        // where the ring reads slightly ahead of this thread's view).
+        let pending = old::pending_frames(r.handle) as u64;
+        r.written.saturating_sub(pending)
+    }
+
     fn start(&mut self, self_: Resource<PlaybackRes>) -> Result<(), wit::AudioError> {
-        let h = self.table.get(&self_).map_err(|_| wit::AudioError::Unavailable)?.0;
+        let h = self.table.get(&self_).map_err(|_| wit::AudioError::Unavailable)?.handle;
         if old::start(h) {
             Ok(())
         } else {
@@ -80,7 +99,7 @@ impl wit::HostPlayback for HostState {
     }
 
     fn pause(&mut self, self_: Resource<PlaybackRes>) -> Result<(), wit::AudioError> {
-        let h = self.table.get(&self_).map_err(|_| wit::AudioError::Unavailable)?.0;
+        let h = self.table.get(&self_).map_err(|_| wit::AudioError::Unavailable)?.handle;
         if old::pause(h) {
             Ok(())
         } else {
@@ -90,7 +109,7 @@ impl wit::HostPlayback for HostState {
 
     fn drop(&mut self, rep: Resource<PlaybackRes>) -> wasmtime::Result<()> {
         let r = self.table.delete(rep)?;
-        old::close(r.0);
+        old::close(r.handle);
         Ok(())
     }
 }
