@@ -1398,6 +1398,11 @@ mod binder_path {
         }
     }
 
+    // AAudio-path flush/drain not wired (this path is legacy/calls; the
+    // audioclient path is the default). Callers treat false as "unsupported".
+    pub fn flush(_track: u32) -> bool { false }
+    pub fn drain(_track: u32) -> bool { false }
+
     pub fn pending_frames(track: u32) -> u32 {
         with_track(track, |st| {
             let read_ctr  = unsafe { &*st.read_ctr_ptr };
@@ -1729,6 +1734,24 @@ mod audioclient_path {
         cap_pump().lock().unwrap().remove(&track);
         audioclient::close(track)
     }
+    pub fn flush(track: u32) -> bool {
+        // Drop any jitter-buffer backlog (call tracks) too, so flush clears
+        // everything.
+        if let Some(s) = pump().lock().unwrap().get_mut(&track) {
+            s.buf.clear();
+            s.started = false;
+            s.server_started = false;
+        }
+        // IAudioTrack.flush() is ONLY valid when the track is stopped/paused —
+        // flushing mid-play wedges it (underrun → AF drops the track). Pause
+        // first so flush works at any time; the caller re-`start`s to resume.
+        audioclient::pause(track);
+        audioclient::flush(track)
+    }
+    pub fn drain(track: u32) -> bool {
+        // IAudioTrack.stop() plays out the ring, then stops (vs pause = stop now).
+        audioclient::stop(track)
+    }
     pub fn pending_frames(track: u32) -> u32 {
         // For a jitter-buffered call track, report the BUFFER backlog, not the ring fill
         // — the pump keeps the ring topped with silence, so reporting the ring would
@@ -1859,6 +1882,22 @@ pub fn close(track: u32) {
     { if use_audioclient() { audioclient_path::close(track); return; } binder_path::close(track); }
     #[cfg(not(target_os = "android"))]
     { let _ = track; }
+}
+
+/// Discard buffered (unplayed) frames now (wasi:audio playback.flush / seek).
+pub fn flush(track: u32) -> bool {
+    #[cfg(target_os = "android")]
+    { if use_audioclient() { return audioclient_path::flush(track); } return binder_path::flush(track); }
+    #[cfg(not(target_os = "android"))]
+    { let _ = track; false }
+}
+
+/// Play out buffered frames then stop (wasi:audio playback.drain).
+pub fn drain(track: u32) -> bool {
+    #[cfg(target_os = "android")]
+    { if use_audioclient() { return audioclient_path::drain(track); } return binder_path::drain(track); }
+    #[cfg(not(target_os = "android"))]
+    { let _ = track; false }
 }
 
 pub fn pending_frames(track: u32) -> u32 {

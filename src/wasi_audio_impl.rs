@@ -107,6 +107,26 @@ impl wit::HostPlayback for HostState {
         }
     }
 
+    fn flush(&mut self, self_: Resource<PlaybackRes>) {
+        let r = match self.table.get_mut(&self_) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let h = r.handle;
+        // Dropped frames count as neither played nor pending — subtract them
+        // from `written` so `position` (= written − buffered) stays continuous
+        // instead of jumping forward by the discarded backlog.
+        let dropped = old::pending_frames(h) as u64;
+        old::flush(h);
+        r.written = r.written.saturating_sub(dropped);
+    }
+
+    fn drain(&mut self, self_: Resource<PlaybackRes>) {
+        if let Ok(r) = self.table.get(&self_) {
+            old::drain(r.handle);
+        }
+    }
+
     fn drop(&mut self, rep: Resource<PlaybackRes>) -> wasmtime::Result<()> {
         let r = self.table.delete(rep)?;
         old::close(r.handle);
