@@ -522,6 +522,19 @@ fn run_cwasm_loop(
         Ok(_)  => log::info!("standalone: preopened /system/fonts → /system-fonts (read-only)"),
         Err(e) => log::warn!("standalone: preopen /system/fonts failed: {e:#}"),
     }
+    // Task 108 M3 — read-only shared music library at `/music` (the user's
+    // /data/media/0/Music). Only preopened if it exists, so devices without it
+    // pay nothing. Read-only; a media player enumerates + decodes it guest-side.
+    // (Single shared mount for now; a per-app capability gate can come later.)
+    {
+        const MUSIC_DIR: &str = "/data/media/0/Music";
+        if std::path::Path::new(MUSIC_DIR).is_dir() {
+            match wasi_builder.preopened_dir(MUSIC_DIR, "/music", DirPerms::READ, FilePerms::READ) {
+                Ok(_) => log::info!("standalone: preopened {MUSIC_DIR} → /music (read-only)"),
+                Err(e) => log::warn!("standalone: preopen {MUSIC_DIR} failed: {e:#}"),
+            }
+        }
+    }
     // Task 67 — writable /state for guest persistence (e.g. the Signal engine's
     // account + protocol snapshot + history). Read-write; created on demand.
     if let Some(state) = loaded.state_dir() {
