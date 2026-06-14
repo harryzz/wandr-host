@@ -148,6 +148,13 @@ pub enum InboundEvent {
     /// drain calls the guest's `on-focus-changed` export (inert if not exported).
     FocusChanged { change: u32 },
 
+    /// Task 108 M2 — the media-session arbiter routed a transport intent
+    /// (lockscreen tap / headset button) to this guest and pushed
+    /// `media-session-action <action> <seek|->`. The standalone drain calls the
+    /// guest's `wasi:media-session/session-handler.on-action` export (inert if not
+    /// exported). `action` is the wire token; `seek_time_s` is the optional target.
+    MediaSessionAction { action: String, seek_time_s: Option<f64> },
+
     /// wandr-arbiter-audio (M3) — the arbiter started/ended a comms session on
     /// this host and pushed `audio-policy set-mode <comm|normal>`. The host (the
     /// call owner, which holds the binder connection) applies it globally via
@@ -431,6 +438,25 @@ fn parse_and_queue(line: &str) {
                 }
             }
             None => log::warn!("ime-inbound: bad on-focus-changed token in {line:?}"),
+        }
+    } else if let Some(rest) = line.strip_prefix("media-session-action ") {
+        // Task 108 M2 — transport intent routed to the active session's guest.
+        // `<action> <seek|->`; seek is "-" when not applicable.
+        let mut toks = rest.split_whitespace();
+        match toks.next() {
+            Some(action) => {
+                let seek_time_s = match toks.next() {
+                    Some("-") | None => None,
+                    Some(v) => v.parse::<f64>().ok(),
+                };
+                if let Ok(mut q) = queue().lock() {
+                    q.push_back(InboundEvent::MediaSessionAction {
+                        action: action.to_string(),
+                        seek_time_s,
+                    });
+                }
+            }
+            None => log::warn!("ime-inbound: bad media-session-action in {line:?}"),
         }
     } else if let Some(rest) = line.strip_prefix("audio-policy set-mode ") {
         // wandr-arbiter-audio M3 — comms session mode (the call owner applies it).

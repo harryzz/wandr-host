@@ -252,6 +252,12 @@ pub struct InstantiatedApp {
     /// event on a topic the guest subscribed to (`package.toml [events]`); `None`
     /// for guests that don't receive events.
     pub events_incoming: Option<crate::events_incoming_bindings::EventsIncoming>,
+    /// Task 108 M2 — `Some(...)` if the component exports
+    /// `wasi:media-session/session-handler`. The host's `ime_inbound` drain calls
+    /// `on-action(details)` on these when the arbiter routes a transport intent
+    /// (lockscreen tap / headset button) here; `None` for guests that don't
+    /// publish a media session.
+    pub media_session_handler: Option<crate::media_session_events_bindings::MediaSessionEvents>,
 }
 
 impl LoadedApp {
@@ -285,6 +291,8 @@ impl LoadedApp {
             .map_err(|e| anyhow!("KeyguardHost::add_to_linker: {e:#}"))?; // keyguard M3
         crate::audio_focus_host_bindings::AudioFocusHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("AudioFocusHost::add_to_linker: {e:#}"))?; // wandr-arbiter-audio M2
+        crate::media_session_host_bindings::MediaSessionHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+            .map_err(|e| anyhow!("MediaSessionHost::add_to_linker: {e:#}"))?; // task 108 M2 wasi:media-session
         #[cfg(feature = "wasi-canvas")]
         crate::wasi_canvas_002_impl::add_to_linker(&mut linker)
             .map_err(|e| anyhow!("wasi-canvas-0.0.2 add_to_linker: {e:#}"))?; // R3 side-by-side
@@ -352,11 +360,18 @@ impl LoadedApp {
         if events_incoming.is_some() {
             log::info!("loader: app exports wandr:events/incoming-handler — event-bus delivery enabled");
         }
+        // Task 108 M2 — optional media-session transport handler (same .ok() probe).
+        let media_session_handler =
+            crate::media_session_events_bindings::MediaSessionEvents::new(&mut *store, &instance).ok();
+        if media_session_handler.is_some() {
+            log::info!("loader: app exports wasi:media-session/session-handler — transport intents enabled");
+        }
         Ok(InstantiatedApp {
             ime_events, guest_input,
             shell_events,
             shell_pacing, alarm_events, bg_tick,
             notify_events, audio_focus_events, events_incoming,
+            media_session_handler,
         })
     }
 
@@ -398,6 +413,8 @@ impl LoadedApp {
             .map_err(|e| anyhow!("KeyguardHost::add_to_linker: {e:#}"))?; // keyguard M3
         crate::audio_focus_host_bindings::AudioFocusHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("AudioFocusHost::add_to_linker: {e:#}"))?; // wandr-arbiter-audio M2
+        crate::media_session_host_bindings::MediaSessionHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+            .map_err(|e| anyhow!("MediaSessionHost::add_to_linker: {e:#}"))?; // task 108 M2 wasi:media-session
         #[cfg(feature = "wasi-canvas")]
         crate::wasi_canvas_002_impl::add_to_linker(&mut linker)
             .map_err(|e| anyhow!("wasi-canvas-0.0.2 add_to_linker: {e:#}"))?; // R3 side-by-side

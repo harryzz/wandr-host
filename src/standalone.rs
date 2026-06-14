@@ -568,6 +568,8 @@ fn run_cwasm_loop(
     let notify_events = inst.notify_events;
     // wandr-arbiter-audio M2 — Some(...) only if the guest exports wandr:audio-focus/focus-handler.
     let audio_focus_events = inst.audio_focus_events;
+    // Task 108 M2 — Some(...) only if the guest exports wasi:media-session/session-handler.
+    let media_session_handler = inst.media_session_handler;
     // Task 90 event bus — Some(...) only if the guest exports wandr:events/incoming-handler.
     // The `evt-subscribe` send is DEFERRED until after the control socket is bound
     // (below), so the arbiter's retained-value-on-subscribe delivery isn't dropped
@@ -1154,6 +1156,41 @@ fn run_cwasm_loop(
                         },
                         None => log::warn!(
                             "focus-inbound: on-focus-changed({change}) but guest exports no wandr:audio-focus/focus-handler"
+                        ),
+                    }
+                }
+                crate::ime_inbound::InboundEvent::MediaSessionAction { action, seek_time_s } => {
+                    // Task 108 M2 — the media-session arbiter routed a transport
+                    // intent here (lockscreen tap / headset button). Call the
+                    // guest's on-action (it applies play/pause/seek/skip). Inert
+                    // if the guest exports no session-handler.
+                    use crate::media_session_events_bindings::exports::wasi::media_session::session_handler::{Action, ActionDetails};
+                    let act = match action.as_str() {
+                        "play" => Some(Action::Play),
+                        "pause" => Some(Action::Pause),
+                        "stop" => Some(Action::Stop),
+                        "seek-to" => Some(Action::SeekTo),
+                        "seek-forward" => Some(Action::SeekForward),
+                        "seek-backward" => Some(Action::SeekBackward),
+                        "previous-track" => Some(Action::PreviousTrack),
+                        "next-track" => Some(Action::NextTrack),
+                        _ => None,
+                    };
+                    match (act, media_session_handler.as_ref()) {
+                        (Some(action), Some(msh)) => {
+                            let details = ActionDetails { action, seek_time_s };
+                            dirty = true;
+                            match msh
+                                .wasi_media_session_session_handler()
+                                .call_on_action(&mut store, details)
+                            {
+                                Ok(()) => log::info!("media-session-inbound: dispatched on-action({action:?})"),
+                                Err(e) => log::warn!("media-session-inbound: on-action failed: {e:#}"),
+                            }
+                        }
+                        (None, _) => log::warn!("media-session-inbound: bad action {action:?}"),
+                        (_, None) => log::warn!(
+                            "media-session-inbound: on-action({action}) but guest exports no wasi:media-session/session-handler"
                         ),
                     }
                 }

@@ -399,6 +399,29 @@ mod audio_focus_events_bindings {
     });
 }
 
+/// Task 108 M2 — host-import side of `wasi:media-session`. The host implements
+/// `session` (set-metadata/set-playback-state/set-position/clear → forwarded to
+/// the arbiter's media-session module; see `media_session_host_impl.rs`) and
+/// `add_to_linker`s it onto every guest. The chrome read side
+/// (`wandr:chrome/now-playing`) is implemented in the same module.
+mod media_session_host_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../proposals/wasi-media-session/wit",
+        world: "media-session-host",
+    });
+}
+
+/// Task 108 M2 — export side: typed `call_on_action` for guests that export
+/// `wasi:media-session/session-handler`. Bound conditionally per instance (like
+/// `alarm_events`); other guests yield `None` (inert).
+mod media_session_events_bindings {
+    wasmtime::component::bindgen!({
+        path: "../../proposals/wasi-media-session/wit",
+        world: "media-session-events",
+    });
+}
+mod media_session_host_impl;
+
 // markdown_bindings module deleted (task 39 — replaced by generic
 // dep wiring via wasmtime introspection in app_loader.rs). Per-dep
 // `bindgen!` modules are no longer needed; any cross-app dep wires
