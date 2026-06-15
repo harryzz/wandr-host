@@ -1676,11 +1676,25 @@ mod audioclient_path {
         // legacy path does), then open + apply the comms route for calls.
         crate::audio_policy_impl::ensure_initialized();
         let (usage, content_type) = usage_content(cfg.class);
+        // Role-based ring (task 108 M4): a large ring CAN'T be kept shallow (AF
+        // removes the track on underrun) and deep fill = high latency = laggy seek,
+        // so a big ring only suits the BACKGROUND (no interactive seeking). Pick the
+        // ring size by the app's CURRENT role at (re)open time: FOREGROUND → server
+        // default (~80 ms, responsive); BACKGROUND → 96000 (2 s, the guest fills it
+        // deep + slows its tick → CPU sleeps). The guest reopens on the bg↔fg
+        // transition (close+reopen+seek-to-pos) so the right size is chosen.
+        // NONE flag throughout (it grants the large ring on the normal mixer too).
+        let frame_count = match cfg.class {
+            StreamClass::Media if !crate::app_role::is_foreground() => 96_000,
+            _ => 0,
+        };
         let h = audioclient::open_output(audioclient::OutputConfig {
             sample_rate: cfg.sample_rate,
             channels: channels(&cfg),
             usage,
             content_type,
+            flags: 0,
+            frame_count,
         });
         if h != 0 && matches!(cfg.class, StreamClass::VoiceCall) {
             crate::audio_policy_impl::set_media_strategy_route(super::comms_route_speaker());

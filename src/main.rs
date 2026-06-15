@@ -531,6 +531,8 @@ fn probe_audioclient(secs: u64, hz: f32, vol: f32) {
         channels: 2,
         usage: 1,        // AUDIO_USAGE_MEDIA
         content_type: 2, // AUDIO_CONTENT_TYPE_MUSIC
+        flags: 0,
+        frame_count: 0,
     });
     if h == 0 {
         eprintln!("probe-audioclient: open_output FAILED (see logcat tag 'audioclient')");
@@ -620,6 +622,8 @@ fn probe_audioclient_blocking(secs: u64, hz: f32) {
         channels: 2,
         usage: 1,        // AUDIO_USAGE_MEDIA
         content_type: 2, // AUDIO_CONTENT_TYPE_MUSIC
+        flags: 0,
+        frame_count: 0,
     });
     if h == 0 {
         eprintln!("probe-blocking: open_output FAILED (see logcat 'audioclient')");
