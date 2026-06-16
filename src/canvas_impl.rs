@@ -108,6 +108,15 @@ pub struct SkiaRenderer {
         std::sync::Arc<winit::window::Window>,
     >>,
 
+    /// The winit window (desktop only) — kept so `present_softbuffer` can
+    /// reconcile the CPU buffer to the window's LIVE physical size before
+    /// attaching it. Under fractional HiDPI (e.g. a 4K monitor at 150%) the
+    /// real surface size is reported asynchronously after map, so a buffer
+    /// sized to a stale `width/height` would disagree with the compositor's
+    /// scaled surface and crash weston's RDP pixman scaler (OOB read).
+    #[cfg(not(target_os = "android"))]
+    window: Option<std::sync::Arc<winit::window::Window>>,
+
     surface:    Surface,
     /// Physical GL surface size (the EGL surface dimensions).
     pub width:  u32,
@@ -280,6 +289,7 @@ impl SkiaRenderer {
             };
             Ok(Self {
                 sb_surface,
+                window: Some(window),
                 surface, width: size.width, height: size.height,
                 logical_width: size.width, logical_height: size.height,
                 inset_top: 0, inset_bottom: 0, keyboard_base_px: 0,
@@ -563,6 +573,24 @@ impl SkiaRenderer {
     #[cfg(not(target_os = "android"))]
     fn present_softbuffer(&mut self) {
         use std::num::NonZeroU32;
+        // Reconcile the buffer to the window's LIVE physical size BEFORE
+        // attaching it. winit reports the real surface size asynchronously
+        // (ScaleFactorChanged/Resized after map), so under fractional HiDPI a
+        // frame drawn at the stale size must not be presented: a buffer whose
+        // dimensions disagree with the compositor's scaled surface makes
+        // weston's RDP pixman scaler read out of bounds and SIGSEGV. On a
+        // mismatch, resize to match and re-render next frame instead.
+        if let Some(win) = self.window.clone() {
+            let phys = win.inner_size();
+            if phys.width == 0 || phys.height == 0 {
+                return; // not configured yet — nothing safe to present
+            }
+            if phys.width != self.width || phys.height != self.height {
+                self.resize(phys.width, phys.height);
+                win.request_redraw();
+                return;
+            }
+        }
         let (w, h) = (self.width, self.height);
         let (Some(nw), Some(nh)) = (NonZeroU32::new(w), NonZeroU32::new(h)) else { return };
         let Some(sb) = self.sb_surface.as_mut() else { return };

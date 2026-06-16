@@ -558,6 +558,23 @@ impl ApplicationHandler for App {
         // Desktop dev window size: `WANDR_DESKTOP_SIZE=WxH` (e.g. 480x960
         // for a phone-shaped viewport). winit/WM default otherwise.
         let mut attrs = Window::default_attributes().with_title("WASM Android Runtime");
+        // Desktop window frame (WSLg/Wayland). The ONLY frame source here is
+        // winit's client-side `sctk_adwaita` decorations — weston advertises no
+        // `xdg-decoration` (server-side) protocol. Those decorations are stable
+        // at 100% display scale (weston blits our SHM buffers 1:1), but under a
+        // FRACTIONAL-scaled output (e.g. a 4K monitor at 150%) weston's RDP
+        // pixman scaler intermittently SIGSEGVs while scaling the thin
+        // decoration subsurface strips, dropping the connection. Keep the frame
+        // by default (the long-standing behavior); `WANDR_DESKTOP_DECORATIONS=0`
+        // drops it for a crash-proof borderless window on fractional-scale
+        // sessions. (Paired with the live-size reconcile in `present_softbuffer`.)
+        #[cfg(not(target_os = "android"))]
+        {
+            let decorated = std::env::var("WANDR_DESKTOP_DECORATIONS")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            attrs = attrs.with_decorations(decorated);
+        }
         #[cfg(not(target_os = "android"))]
         if let Ok(spec) = std::env::var("WANDR_DESKTOP_SIZE") {
             if let Some((w, h)) = spec.split_once('x') {
