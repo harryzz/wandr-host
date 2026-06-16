@@ -93,6 +93,18 @@ unsafe impl Send for WasiDrawable {}
 
 // ─── Renderer state ──────────────────────────────────────────────────────────
 
+/// Desktop GPU present state: a glutin GL context + window surface whose default
+/// framebuffer (FBO 0) is wrapped by skia as the render target. Presenting via
+/// `swap_buffers` hands the compositor a GPU buffer (dmabuf under WSLg), so the
+/// window can keep client-side decorations without tripping weston's RDP pixman
+/// scaler on fractional-scaled SHM surfaces.
+#[cfg(not(target_os = "android"))]
+struct DesktopGl {
+    gl_context: glutin::context::PossiblyCurrentContext,
+    gl_surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
+    gr_context: skia_safe::gpu::DirectContext,
+}
+
 pub struct SkiaRenderer {
     // Drop order matters: gr_context + surface must drop before egl so that
     // Skia's GL cleanup happens while the EGL context is still bound.
@@ -116,6 +128,12 @@ pub struct SkiaRenderer {
     /// scaled surface and crash weston's RDP pixman scaler (OOB read).
     #[cfg(not(target_os = "android"))]
     window: Option<std::sync::Arc<winit::window::Window>>,
+
+    /// Desktop GPU present (preferred): a glutin GL context whose default
+    /// framebuffer backs `surface`. `Some` = present via `swap_buffers` (GPU
+    /// path, frame-safe at fractional scale); `None` = softbuffer CPU fallback.
+    #[cfg(not(target_os = "android"))]
+    gl: Option<DesktopGl>,
 
     surface:    Surface,
     /// Physical GL surface size (the EGL surface dimensions).
@@ -277,6 +295,28 @@ impl SkiaRenderer {
 
         #[cfg(not(target_os = "android"))]
         {
+            // GPU-first: present via a skia GL surface (glutin) so frames reach
+            // the compositor as GPU buffers, dodging weston's crashing SHM
+            // pixman scaler at fractional scale. Fall back to the softbuffer CPU
+            // blit if GL init fails (older WSLg / no GL available).
+            match Self::try_init_gl(&window, size) {
+                Ok((gl, surface)) => {
+                    log::info!("desktop present: GL via glutin ({}x{})", size.width, size.height);
+                    return Ok(Self {
+                        gl: Some(gl),
+                        sb_surface: None,
+                        window: Some(window),
+                        surface, width: size.width, height: size.height,
+                        logical_width: size.width, logical_height: size.height,
+                        inset_top: 0, inset_bottom: 0, keyboard_base_px: 0,
+                        base_matrix: skia_safe::Matrix::new_identity(),
+                        current_orient: 0,
+                        typeface_cache:   HashMap::new(),
+                        font_collection:  Self::make_font_collection(),
+                    });
+                }
+                Err(e) => log::warn!("desktop GL init failed ({e:#}) — softbuffer fallback"),
+            }
             let surface = skia_safe::surfaces::raster_n32_premul(
                 (size.width as i32, size.height as i32)
             ).ok_or_else(|| anyhow::anyhow!("raster surface failed"))?;
@@ -288,6 +328,7 @@ impl SkiaRenderer {
                 Err(e) => { log::warn!("softbuffer context failed: {e}"); None }
             };
             Ok(Self {
+                gl: None,
                 sb_surface,
                 window: Some(window),
                 surface, width: size.width, height: size.height,
@@ -513,7 +554,9 @@ impl SkiaRenderer {
         // one to be safe (cheap to recreate).
     }
 
-    #[cfg(target_os = "android")]
+    /// Wrap the current GL context's default framebuffer (FBO 0) as a skia
+    /// render-target surface. Shared by the Android EGL path and the desktop
+    /// glutin path (pure skia — no platform specifics).
     fn make_gl_surface(
         gr: &mut skia_safe::gpu::DirectContext,
         w: i32, h: i32,
@@ -531,6 +574,73 @@ impl SkiaRenderer {
             skia_safe::ColorType::RGBA8888,
             None, None,
         ).ok_or_else(|| anyhow::anyhow!("wrap_backend_render_target failed"))
+    }
+
+    /// Build the desktop GPU present path: a glutin EGL/GLX context + window
+    /// surface on `window`, with skia bound to its default framebuffer. Returns
+    /// the GL state and the skia surface, or an error (caller falls back to
+    /// softbuffer). All `unsafe` calls are FFI into the platform GL loader on
+    /// the single event-loop thread.
+    #[cfg(not(target_os = "android"))]
+    fn try_init_gl(
+        window: &std::sync::Arc<winit::window::Window>,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> Result<(DesktopGl, Surface)> {
+        use glutin::config::ConfigTemplateBuilder;
+        use glutin::context::{ContextApi, ContextAttributesBuilder};
+        use glutin::prelude::*;
+        use glutin::surface::{SurfaceAttributesBuilder, WindowSurface};
+        use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+        use std::num::NonZeroU32;
+
+        let (nw, nh) = (
+            NonZeroU32::new(size.width.max(1)).unwrap(),
+            NonZeroU32::new(size.height.max(1)).unwrap(),
+        );
+        let raw_window = window.window_handle()?.as_raw();
+        let raw_display = window.display_handle()?.as_raw();
+
+        // EGL display (WSLg/Wayland + Xwayland both expose EGL).
+        let gl_display = unsafe {
+            glutin::display::Display::new(raw_display, glutin::display::DisplayApiPreference::Egl)?
+        };
+        let template = ConfigTemplateBuilder::new()
+            .with_alpha_size(8)
+            .compatible_with_native_window(raw_window)
+            .build();
+        let config = unsafe { gl_display.find_configs(template)? }
+            .reduce(|best, c| {
+                use glutin::config::GlConfig;
+                if c.num_samples() < best.num_samples() { c } else { best }
+            })
+            .ok_or_else(|| anyhow::anyhow!("no GL config"))?;
+
+        // Prefer a GLES2 context (matches the skia GLES backend used on device).
+        let ctx_attrs = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::Gles(None))
+            .build(Some(raw_window));
+        let not_current = unsafe { gl_display.create_context(&config, &ctx_attrs)? };
+
+        let surf_attrs =
+            SurfaceAttributesBuilder::<WindowSurface>::new().build(raw_window, nw, nh);
+        let gl_surface = unsafe { gl_display.create_window_surface(&config, &surf_attrs)? };
+        let gl_context = not_current.make_current(&gl_surface)?;
+        // Present is paced by the guest's frame-pacing; don't double-block on vsync.
+        let _ = gl_surface.set_swap_interval(
+            &gl_context,
+            glutin::surface::SwapInterval::DontWait,
+        );
+
+        let interface = skia_safe::gpu::gl::Interface::new_load_with(|name| {
+            let Ok(cname) = std::ffi::CString::new(name) else { return std::ptr::null() };
+            gl_display.get_proc_address(cname.as_c_str())
+        })
+        .ok_or_else(|| anyhow::anyhow!("skia GL interface load failed"))?;
+        let mut gr_context = skia_safe::gpu::direct_contexts::make_gl(interface, None)
+            .ok_or_else(|| anyhow::anyhow!("GrContext (desktop GL) failed"))?;
+        let surface = Self::make_gl_surface(&mut gr_context, size.width as i32, size.height as i32)?;
+
+        Ok((DesktopGl { gl_context, gl_surface, gr_context }, surface))
     }
 
     fn make_font_collection() -> skia_safe::textlayout::FontCollection {
@@ -563,7 +673,18 @@ impl SkiaRenderer {
             );
         }
         #[cfg(not(target_os = "android"))]
-        self.present_softbuffer();
+        {
+            use glutin::prelude::GlSurface;
+            if let Some(gl) = self.gl.as_mut() {
+                gl.gr_context.flush_and_submit();
+                let _ = gl.gl_surface.swap_buffers(&gl.gl_context);
+                gl.gr_context.purge_unlocked_resources(
+                    skia_safe::gpu::PurgeResourceOptions::AllResources,
+                );
+            } else {
+                self.present_softbuffer();
+            }
+        }
     }
 
     /// Desktop present: copy the skia raster surface into the softbuffer
@@ -632,8 +753,25 @@ impl SkiaRenderer {
         }
         #[cfg(not(target_os = "android"))]
         {
-            if let Some(s) = skia_safe::surfaces::raster_n32_premul(
-                (w as i32, h as i32)) {
+            if self.gl.is_some() {
+                // GL path: resize the glutin surface, then re-wrap FBO 0.
+                use glutin::prelude::GlSurface;
+                use std::num::NonZeroU32;
+                let new_surface = if let (Some(nw), Some(nh)) =
+                    (NonZeroU32::new(w), NonZeroU32::new(h))
+                {
+                    let gl = self.gl.as_mut().unwrap();
+                    gl.gl_surface.resize(&gl.gl_context, nw, nh);
+                    Self::make_gl_surface(&mut gl.gr_context, w as i32, h as i32).ok()
+                } else {
+                    None
+                };
+                if let Some(s) = new_surface {
+                    self.surface = s;
+                }
+            } else if let Some(s) =
+                skia_safe::surfaces::raster_n32_premul((w as i32, h as i32))
+            {
                 self.surface = s;
             }
         }

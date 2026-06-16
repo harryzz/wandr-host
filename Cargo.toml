@@ -110,9 +110,13 @@ audioclient      = { package = "audioclient-rs", path = "../../external/audiocli
 [target.'cfg(not(target_os = "android"))'.dependencies]
 env_logger = "0.11"
 winit      = { version = "0.30", features = [] }
-# Desktop present path: the renderer draws into a skia CPU raster surface;
-# softbuffer blits it to the winit window (no GL - reliable under
-# WSLg/Wayland/X11). Android presents via EGL instead.
+# Desktop present: GL-first (skia GL surface on a glutin EGL/GLX context), so
+# frames go to the compositor as GPU buffers (dmabuf) — bypassing weston's RDP
+# software pixman scaler, which SIGSEGVs on fractional-scaled (e.g. 4K@150%)
+# SHM surfaces and forced the old softbuffer path to drop the window frame.
+glutin       = "0.32"
+# Softbuffer is kept as a FALLBACK when GL init fails (the previous reliable
+# CPU-blit path under WSLg/Wayland/X11).
 softbuffer = "0.4.8"
 
 [build-dependencies]
