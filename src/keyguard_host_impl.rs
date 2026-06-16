@@ -25,4 +25,21 @@ impl Host for crate::HostState {
             Err(e) => log::warn!("keyguard-host: unlock forward failed: {e:#} (arbiter down?)"),
         }
     }
+
+    // ── Power menu (task 110) — forward each button tap to the arbiter. ──
+    fn pm_dismiss(&mut self) {
+        let _ = send_oneshot("pm-dismiss\n");
+    }
+    fn pm_lock(&mut self) {
+        let _ = send_oneshot("pm-lock\n");
+    }
+    fn pm_power_off(&mut self) {
+        let _ = send_oneshot("pm-poweroff\n");
+    }
+    fn pm_restart(&mut self) {
+        let _ = send_oneshot("pm-restart\n");
+    }
+    fn pm_emergency(&mut self) {
+        let _ = send_oneshot("pm-emergency\n");
+    }
 }

@@ -975,13 +975,14 @@ fn run_cwasm_loop(
                         crate::audio_policy_impl::forward_volume_key(ev.key_code == 24);
                     }
                 } else if ev.key_code == 26 {
-                    // Task 81 — KEYCODE_POWER. With ART off there's no PMS to wake
-                    // the panel, so forward to the arbiter (single display-power
-                    // authority) to toggle setPowerMode; swallow it from the guest.
-                    // The arbiter dedups the per-host fan-in (every host's
-                    // InputReader sees the key). On key-down only.
+                    // Task 81/110 — KEYCODE_POWER. Forward DOWN + UP to the arbiter,
+                    // which times the press (single decider; dedups the per-host
+                    // fan-in): a short press toggles the panel, a hold ≥1 s opens
+                    // the power menu. Swallowed from the guest.
                     if ev.kind == 10 {
-                        crate::audio_policy_impl::forward_power_key();
+                        crate::audio_policy_impl::forward_power_down();
+                    } else if ev.kind == 11 {
+                        crate::audio_policy_impl::forward_power_up();
                     }
                 } else {
                     let action = if ev.kind == 10 { 0u8 } else { 1u8 };

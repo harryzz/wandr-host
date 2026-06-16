@@ -734,3 +734,28 @@ pub fn forward_power_key() {
 }
 #[cfg(not(target_os = "android"))]
 pub fn forward_power_key() {}
+
+/// Task 110 — forward POWER key DOWN/UP to the arbiter, which times the press
+/// (the single decider; dedups the multi-host fan-in): short press = panel
+/// toggle, hold ≥1 s = power menu.
+#[cfg(target_os = "android")]
+fn forward_line(line: &[u8]) {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    if let Ok(mut s) = UnixStream::connect(crate::arbiter_sock::arbiter_sock_path()) {
+        let _ = s.write_all(line);
+        let _ = s.flush();
+    }
+}
+#[cfg(target_os = "android")]
+pub fn forward_power_down() {
+    forward_line(b"power-down\n");
+}
+#[cfg(target_os = "android")]
+pub fn forward_power_up() {
+    forward_line(b"power-up\n");
+}
+#[cfg(not(target_os = "android"))]
+pub fn forward_power_down() {}
+#[cfg(not(target_os = "android"))]
+pub fn forward_power_up() {}
