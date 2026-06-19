@@ -237,6 +237,9 @@ pub fn run_with_engine(engine: &Engine, app_id: Option<&str>, mode: OverlayMode)
     }
 
     let loader = app_loader::default_for_target();
+    // Whether this host was launched for a specific installed app (via the arbiter)
+    // vs. a dev bring-up with no app. Decides the load-failure behavior below.
+    let is_launched_app = app_id.is_some();
     let app_ref = match app_id {
         Some(id) => AppRef::Installed { app_id: id, version: None },
         None => AppRef::DevCwasm { candidates: &[Path::new(CWASM_PATH)] },
@@ -270,10 +273,24 @@ pub fn run_with_engine(engine: &Engine, app_id: Option<&str>, mode: OverlayMode)
             run_cwasm_loop(engine, loaded, renderer, sf, mode, rotates, is_locked, fg_layer)
         }
         Err(e) => {
-            log::warn!(
-                "standalone: load failed ({e:#}) — falling back to test-frame loop"
-            );
-            run_test_loop(renderer)
+            if is_launched_app {
+                // A launched/installed app failed to load (bad cwasm, ABI drift, missing
+                // dep, …). Do NOT take over the panel with the fullscreen test-frame loop:
+                // it paints a black screen + white rect over the (separate, still-alive)
+                // status-bar/taskbar overlays and keeps input focus, so the user is stuck
+                // with no way to switch or kill it. Exit instead — the arbiter observes the
+                // app's death and restores the launcher + chrome (normal app-death recovery).
+                log::error!(
+                    "standalone: app load failed ({e:#}) — exiting so the arbiter can recover \
+                     (no test-frame takeover for launched apps)"
+                );
+                Err(e)
+            } else {
+                // Dev bring-up: no cwasm deployed at CWASM_PATH. The test frame is the
+                // intended "renderer works" indicator (run `wandr-host` with no app).
+                log::warn!("standalone: no cwasm deployed ({e:#}) — test-frame loop");
+                run_test_loop(renderer)
+            }
         }
     };
 

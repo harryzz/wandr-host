@@ -782,9 +782,12 @@ impl SkiaRenderer {
         self.egl.make_current();
         {
             let c = self.surface.canvas();
-            c.clear(Color::from_argb(255, 10, 20, 60));
+            // Don't paint a fullscreen black backdrop: clear transparent (shows whatever
+            // is composited behind this layer if the buffer has alpha) and draw only a
+            // small indicator badge in the top-left corner instead of a big rect.
+            c.clear(Color::TRANSPARENT);
             c.draw_rect(
-                Rect::from_xywh(50.0, 50.0, 200.0, 100.0),
+                Rect::from_xywh(8.0, 8.0, 40.0, 40.0),
                 &Paint::new(skia_safe::Color4f::new(1.0, 1.0, 1.0, 1.0), None),
             );
         }
