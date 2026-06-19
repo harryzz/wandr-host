@@ -143,6 +143,11 @@ default = ["wasi-canvas"]
 # wasmtime::GuestProfiler firefox-profiler-JSON dump. Off by default so
 # production APK builds stay unaffected.
 profile = ["wasmtime/call-hook"]
+# Cross-AOT: enable ALL cranelift ISA backends so a beefy build machine can
+# precompile a guest FOR the device (aarch64) instead of the host arch, via
+# WANDR_AOT_TARGET. Opt-in so the on-device binary stays lean (host ISA only).
+# Build the desktop cross-compiler with: cargo build --features cross-aot --target x86_64-...
+cross-aot = ["wasmtime/all-arch"]
 # wasi:canvas draft host implementation (proposals/wasi-canvas) — a second
 # canvas package over the same SkiaRenderer, coexisting with my:skiko-gfx.
 # Off by default until the proving consumer (slint-wandr port) lands.

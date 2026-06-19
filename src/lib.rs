@@ -497,6 +497,14 @@ impl App {
     // pub(crate) so the task-33 standalone path (src/standalone.rs) builds an
     // identically-configured Engine — the cwasm contract depends on it.
     pub(crate) fn make_engine() -> Engine {
+        Engine::new(&Self::make_config()).expect("wasmtime engine init")
+    }
+
+    // The engine Config — shared by the runtime engine, the standalone path, AND the
+    // installer's precompile, so the cwasm contract stays identical across all of them.
+    // (Cross-AOT sets only `.target()` on a clone of this; target is part of wasmtime's
+    // precompile_compatibility_hash, so a matching-target cwasm built off-device loads here.)
+    pub(crate) fn make_config() -> wasmtime::Config {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
         config.wasm_gc(true);
@@ -517,7 +525,7 @@ impl App {
         // (see tasks/23-profiling-hooks.md "Out of scope"); for now the
         // `profile` cargo feature wires only the ResourceLimiter +
         // call-hook trio, which don't require engine config changes.
-        Engine::new(&config).expect("wasmtime engine init")
+        config
     }
 
     fn from_parts(engine: Engine, loaded: Option<LoadedApp>) -> Self {
@@ -1270,7 +1278,22 @@ pub fn run() {
 /// smoke testing.
 pub fn install_wandrpkg(wandrpkg_dir: &Path) -> anyhow::Result<app_installer::InstalledApp> {
     use app_installer::{AppInstaller, PackageBundle};
-    let engine = App::make_engine();
+    // Cross-AOT: on a beefy PC, set WANDR_AOT_TARGET=<device triple> (e.g.
+    // aarch64-linux-android) to precompile FOR the device instead of the host arch. The
+    // cwasm + cache-key are written for that target; pushed to the device they load without
+    // recompiling (the device can't fit the ~2 GB compile of a large component). Target is
+    // part of wasmtime's precompile_compatibility_hash, so the device's loader accepts it
+    // iff the triple matches its native one.
+    let engine = match std::env::var("WANDR_AOT_TARGET") {
+        Ok(triple) if !triple.is_empty() => {
+            let mut config = App::make_config();
+            config.target(&triple)
+                .map_err(|e| anyhow::anyhow!("WANDR_AOT_TARGET '{triple}': {e:#}"))?;
+            log::info!("install: cross-AOT target = {triple}");
+            Engine::new(&config)?
+        }
+        _ => App::make_engine(),
+    };
     let installer = app_installer::default_for_target();
     let bundle = PackageBundle::from_dir(wandrpkg_dir);
     log::info!("install: bundle={} root={}", wandrpkg_dir.display(), installer.root.display());
