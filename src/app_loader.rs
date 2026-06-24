@@ -887,7 +887,7 @@ fn wire_dep_into_linker(
     let mut wired_ifaces = 0usize;
 
     for (export_name, item) in component_type.exports(&engine) {
-        match item {
+        match item.ty {
             ComponentItem::ComponentInstance(inst_ty) => {
                 // `get_export` returns (ComponentItem, ComponentExportIndex);
                 // we only need the index to look up funcs inside.
@@ -901,7 +901,7 @@ fn wire_dep_into_linker(
                     .map_err(|e| anyhow!("linker.instance({export_name:?}): {e:#}"))?;
                 wired_ifaces += 1;
                 for (fn_name, fn_item) in inst_ty.exports(&engine) {
-                    if !matches!(fn_item, ComponentItem::ComponentFunc(_)) {
+                    if !matches!(fn_item.ty, ComponentItem::ComponentFunc(_)) {
                         // Resources / types / nested instances — not
                         // registered as call-able linker entries.
                         continue;
