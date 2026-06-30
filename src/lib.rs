@@ -844,11 +844,26 @@ impl ApplicationHandler for App {
                         // reproduces the .onTapGesture dispatch crash without a real click, with
                         // the wasm backtrace (under WANDR_DEBUG_INFO) visible on stderr.
                         if n == 2 && std::env::var("WANDR_DEBUG_SYNTH_TAP").is_ok() {
-                            match input::dispatch_pointer_routed(
-                                s, &self.guest_input, 0, 0, 200.0, 300.0, 1.0, [false; 4],
+                            // Optional WANDR_DEBUG_SYNTH_TAP_XY="x,y" to fire at a specific location
+                            // (default 200,300) — used to verify location-based gesture hit-testing.
+                            let (tx, ty) = std::env::var("WANDR_DEBUG_SYNTH_TAP_XY").ok()
+                                .and_then(|s| {
+                                    let mut it = s.split(',');
+                                    Some((it.next()?.trim().parse::<f32>().ok()?,
+                                          it.next()?.trim().parse::<f32>().ok()?))
+                                })
+                                .unwrap_or((200.0, 300.0));
+                            let down = input::dispatch_pointer_routed(
+                                s, &self.guest_input, 0, 0, tx, ty, 1.0, [false; 4],
                                 input::PointerMeta::mouse(1, 1),
-                            ) {
-                                Ok(_) => log::info!("synth-tap: dispatched down"),
+                            );
+                            // A tap = down then up at the same point (no movement → not a drag).
+                            let up = input::dispatch_pointer_routed(
+                                s, &self.guest_input, 1, 0, tx, ty, 0.0, [false; 4],
+                                input::PointerMeta::mouse(1, 0),
+                            );
+                            match down.and(up) {
+                                Ok(_) => log::info!("synth-tap: dispatched down+up at {tx},{ty}"),
                                 Err(e) => log::error!("synth-tap FAILED: {e:?}"),
                             }
                         }
@@ -856,23 +871,32 @@ impl ApplicationHandler for App {
                         // moves @frames 3..10 (15px/step diagonally), up @frame 11 — to exercise
                         // DragGesture deterministically without depending on desktop window focus.
                         if std::env::var("WANDR_DEBUG_SYNTH_DRAG").is_ok() {
+                            // Optional WANDR_DEBUG_SYNTH_DRAG_XY="x,y" = the START point (default
+                            // 200,300); moves step +15px diagonally from there.
+                            let (sx, sy) = std::env::var("WANDR_DEBUG_SYNTH_DRAG_XY").ok()
+                                .and_then(|s| {
+                                    let mut it = s.split(',');
+                                    Some((it.next()?.trim().parse::<f32>().ok()?,
+                                          it.next()?.trim().parse::<f32>().ok()?))
+                                })
+                                .unwrap_or((200.0, 300.0));
                             if n == 2 {
                                 let _ = input::dispatch_pointer_routed(
-                                    s, &self.guest_input, 0, 0, 200.0, 300.0, 1.0, [false; 4],
+                                    s, &self.guest_input, 0, 0, sx, sy, 1.0, [false; 4],
                                     input::PointerMeta::mouse(1, 1),
                                 );
-                                log::info!("synth-drag: down");
+                                log::info!("synth-drag: down at {sx},{sy}");
                             } else if (3..=10).contains(&n) {
                                 let k = (n - 2) as f32;
                                 let _ = input::dispatch_pointer_routed(
                                     s, &self.guest_input, 2, 0,
-                                    200.0 + k * 15.0, 300.0 + k * 15.0, 1.0, [false; 4],
+                                    sx + k * 15.0, sy + k * 15.0, 1.0, [false; 4],
                                     input::PointerMeta::mouse(0, 1),
                                 );
                                 log::info!("synth-drag: move {n}");
                             } else if n == 11 {
                                 let _ = input::dispatch_pointer_routed(
-                                    s, &self.guest_input, 1, 0, 335.0, 435.0, 0.0, [false; 4],
+                                    s, &self.guest_input, 1, 0, sx + 135.0, sy + 135.0, 0.0, [false; 4],
                                     input::PointerMeta::mouse(1, 0),
                                 );
                                 log::info!("synth-drag: up");
