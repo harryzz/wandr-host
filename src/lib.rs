@@ -852,6 +852,32 @@ impl ApplicationHandler for App {
                                 Err(e) => log::error!("synth-tap FAILED: {e:?}"),
                             }
                         }
+                        // Debug: WANDR_DEBUG_SYNTH_DRAG=1 injects a synthetic DRAG — down @frame 2,
+                        // moves @frames 3..10 (15px/step diagonally), up @frame 11 — to exercise
+                        // DragGesture deterministically without depending on desktop window focus.
+                        if std::env::var("WANDR_DEBUG_SYNTH_DRAG").is_ok() {
+                            if n == 2 {
+                                let _ = input::dispatch_pointer_routed(
+                                    s, &self.guest_input, 0, 0, 200.0, 300.0, 1.0, [false; 4],
+                                    input::PointerMeta::mouse(1, 1),
+                                );
+                                log::info!("synth-drag: down");
+                            } else if (3..=10).contains(&n) {
+                                let k = (n - 2) as f32;
+                                let _ = input::dispatch_pointer_routed(
+                                    s, &self.guest_input, 2, 0,
+                                    200.0 + k * 15.0, 300.0 + k * 15.0, 1.0, [false; 4],
+                                    input::PointerMeta::mouse(0, 1),
+                                );
+                                log::info!("synth-drag: move {n}");
+                            } else if n == 11 {
+                                let _ = input::dispatch_pointer_routed(
+                                    s, &self.guest_input, 1, 0, 335.0, 435.0, 0.0, [false; 4],
+                                    input::PointerMeta::mouse(1, 0),
+                                );
+                                log::info!("synth-drag: up");
+                            }
+                        }
                         // Always extract Kotlin exception message on error
                         // so late-firing throws are visible in logcat, not
                         // just suppressed past frame 5.
