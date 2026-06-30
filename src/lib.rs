@@ -510,6 +510,12 @@ impl App {
         config.wasm_gc(true);
         config.wasm_function_references(true);
         config.wasm_exceptions(true);
+        // [gdb-watch] Desktop-only, env-gated: emit JIT DWARF so wasmtime registers the compiled
+        // code with gdb's JIT interface -> gdb can symbolize guest (wasm) frames. Env-gated so the
+        // device AOT cwasm contract (compiled without it) is unaffected. Pure debugging aid.
+        if std::env::var_os("WANDR_DEBUG_INFO").is_some() {
+            config.debug_info(true);
+        }
         // Compose's composition + layout passes on a real Material3 tree get
         // deeply recursive (Composer/snapshot diffing + LayoutNode placement).
         // Default 1 MiB wasm stack overflows; bump to 4 MiB. async_stack_size
