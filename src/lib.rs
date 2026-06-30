@@ -839,6 +839,19 @@ impl ApplicationHandler for App {
                                 }
                             }
                         }
+                        // Debug: WANDR_DEBUG_SYNTH_TAP=1 fires one synthetic pointer-down at
+                        // frame 2 (view graph rendered, before the WSLg GL connection drops) —
+                        // reproduces the .onTapGesture dispatch crash without a real click, with
+                        // the wasm backtrace (under WANDR_DEBUG_INFO) visible on stderr.
+                        if n == 2 && std::env::var("WANDR_DEBUG_SYNTH_TAP").is_ok() {
+                            match input::dispatch_pointer_routed(
+                                s, &self.guest_input, 0, 0, 200.0, 300.0, 1.0, [false; 4],
+                                input::PointerMeta::mouse(1, 1),
+                            ) {
+                                Ok(_) => log::info!("synth-tap: dispatched down"),
+                                Err(e) => log::error!("synth-tap FAILED: {e:?}"),
+                            }
+                        }
                         // Always extract Kotlin exception message on error
                         // so late-firing throws are visible in logcat, not
                         // just suppressed past frame 5.
