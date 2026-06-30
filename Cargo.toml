@@ -15,7 +15,7 @@ name = "wasm-android-host"
 path = "src/main.rs"
 
 [dependencies]
-wasmtime           = { version = "46", features = ["component-model"] }
+wasmtime           = { version = "46", features = ["component-model", "all-arch"] }
 wasmtime-wasi      = { version = "46" }
 # Task 66 — host-delegated TLS for guests with Signal's pinned CA trusted.
 # wasmtime-wasi-tls provides the wasi:tls@0.2.0-draft host impl; the
