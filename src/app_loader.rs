@@ -954,14 +954,29 @@ fn wire_dep_into_linker(
     // Build a dep-local linker. Today's deps only import WASI — no
     // skiko, no cross-dep references. If a future dep imports skiko
     // (e.g. wants to draw), add that bind here.
+    //
+    // Task 115: like the main linker, p2 goes ASYNC under p3-async — the
+    // consumer's instantiate makes the whole STORE async-required, so the
+    // dep's own wasi host fns (called later, while our runtime drives) must
+    // not be the sync impls (`in_tokio` nest-panic), and the dep must be
+    // instantiated through the async entrypoint.
     let mut dep_linker: Linker<HostState> = Linker::new(&engine);
+    #[cfg(not(feature = "p3-async"))]
     wasmtime_wasi::p2::add_to_linker_sync(&mut dep_linker)
         .map_err(|e| anyhow!("dep linker wasi add: {e:#}"))?;
+    #[cfg(feature = "p3-async")]
+    wasmtime_wasi::p2::add_to_linker_async(&mut dep_linker)
+        .map_err(|e| anyhow!("dep linker wasi add (async): {e:#}"))?;
 
     // Instantiate the dep into the consumer's store. Its exports
     // become reachable via `instance.get_export` / `instance.get_func`.
+    #[cfg(not(feature = "p3-async"))]
     let instance = dep_linker.instantiate(&mut *store, &dep.component)
         .map_err(|e| anyhow!("instantiate dep `{}`: {e:#}", dep.name))?;
+    #[cfg(feature = "p3-async")]
+    let instance = crate::async_app::rt()
+        .block_on(dep_linker.instantiate_async(&mut *store, &dep.component))
+        .map_err(|e| anyhow!("instantiate dep `{}` (async): {e:#}", dep.name))?;
 
     // Walk the dep's component type. Top-level exports are usually
     // ComponentInstance (i.e. an interface like
@@ -1007,8 +1022,22 @@ fn wire_dep_into_linker(
                     // closure for `'static`-safe registration. The 2nd
                     // closure arg (the function's static type) is unused;
                     // wasmtime validates at call time.
+                    //
+                    // Task 115: under p3-async the store is async-required
+                    // once the consumer instantiates, so the forward into the
+                    // dep must be `call_async` from an async host fn — the
+                    // sync `func.call` traps with "store configuration
+                    // requires that `*_async` functions are used" (this took
+                    // out the IME + Demo, the two dep-consuming apps, at M4).
+                    #[cfg(not(feature = "p3-async"))]
                     consumer_inst.func_new(fn_name, move |mut store, _ty, params, results| {
                         func.call(&mut store, params, results)
+                    }).map_err(|e| anyhow!(
+                        "linker proxy {export_name:?}.{fn_name:?}: {e:#}"
+                    ))?;
+                    #[cfg(feature = "p3-async")]
+                    consumer_inst.func_new_async(fn_name, move |mut store, _ty, params, results| {
+                        Box::new(async move { func.call_async(&mut store, params, results).await })
                     }).map_err(|e| anyhow!(
                         "linker proxy {export_name:?}.{fn_name:?}: {e:#}"
                     ))?;
