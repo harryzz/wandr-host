@@ -591,6 +591,16 @@ fn run_cwasm_loop(
     }
 
     let inst = loaded.instantiate(&mut store)?;
+    // Task 115 — a WASI-0.3-importing guest (e.g. the Signal engine composite)
+    // has native async tasks that advance only while the host drives the store
+    // event loop; its naps must pump instead of plain-sleep. Sync guests keep
+    // the plain sleep (nothing to drive).
+    #[cfg(feature = "p3-async")]
+    let pump_naps = loaded.requires_async_drive();
+    #[cfg(feature = "p3-async")]
+    if pump_naps {
+        log::info!("standalone: guest imports WASI 0.3 — naps will pump the CM-async event loop");
+    }
     let ime_events = inst.ime_events;
     // Arbiter Inc. 3c — Some(...) only if the guest exports wandr:alarm/alarm-handler.
     let alarm_events = inst.alarm_events;
@@ -1067,8 +1077,8 @@ fn run_cwasm_loop(
                             crate::ime_bindings::wandr::ime::types::InputType::Text
                         }
                     };
-                    if let Err(e) = ie.wandr_ime_ime()
-                        .call_on_editor_attached(&mut store, wit_input_type)
+                    if let Err(e) = crate::guest_call!(ie.wandr_ime_ime()
+                        .call_on_editor_attached(&mut store, wit_input_type))
                     {
                         log::warn!(
                             "ime-inbound: on-editor-attached failed: {e:#}"
@@ -1094,7 +1104,7 @@ fn run_cwasm_loop(
                         );
                         continue;
                     };
-                    if let Err(e) = ie.wandr_ime_ime().call_on_editor_detached(&mut store) {
+                    if let Err(e) = crate::guest_call!(ie.wandr_ime_ime().call_on_editor_detached(&mut store)) {
                         log::warn!("ime-inbound: on-editor-detached failed: {e:#}");
                     } else {
                         log::info!("ime-inbound: dispatched on-editor-detached");
@@ -1106,7 +1116,7 @@ fn run_cwasm_loop(
                     // doesn't export it (alarm_events == None).
                     dirty = true; // doing guest work this iteration warrants a frame
                     match alarm_events.as_ref() {
-                        Some(ae) => match ae.wandr_alarm_alarm_handler().call_on_alarm(&mut store, id) {
+                        Some(ae) => match crate::guest_call!(ae.wandr_alarm_alarm_handler().call_on_alarm(&mut store, id)) {
                             Ok(()) => log::info!("alarm-inbound: dispatched on-alarm({id})"),
                             Err(e) => log::warn!("alarm-inbound: on-alarm({id}) failed: {e:#}"),
                         },
@@ -1120,9 +1130,9 @@ fn run_cwasm_loop(
                     // (the arbiter also foregrounded us); call on-notification-click.
                     dirty = true;
                     match notify_events.as_ref() {
-                        Some(ne) => match ne
+                        Some(ne) => match crate::guest_call!(ne
                             .wandr_notify_notify_handler()
-                            .call_on_notification_click(&mut store, id)
+                            .call_on_notification_click(&mut store, id))
                         {
                             Ok(()) => log::info!("notify-inbound: dispatched on-notification-click({id})"),
                             Err(e) => log::warn!("notify-inbound: on-notification-click({id}) failed: {e:#}"),
@@ -1144,7 +1154,7 @@ fn run_cwasm_loop(
                                 content_type: None,
                                 data,
                             };
-                            match ei.wandr_events_incoming_handler().call_handle(&mut store, &msg) {
+                            match crate::guest_call!(ei.wandr_events_incoming_handler().call_handle(&mut store, &msg)) {
                                 Ok(()) => log::info!("event-inbound: dispatched handle(topic={topic:?})"),
                                 Err(e) => log::warn!("event-inbound: handle(topic={topic:?}) failed: {e:#}"),
                             }
@@ -1178,9 +1188,9 @@ fn run_cwasm_loop(
                     };
                     dirty = true;
                     match audio_focus_events.as_ref() {
-                        Some(fe) => match fe
+                        Some(fe) => match crate::guest_call!(fe
                             .wandr_audio_focus_focus_handler()
-                            .call_on_focus_changed(&mut store, fc)
+                            .call_on_focus_changed(&mut store, fc))
                         {
                             Ok(()) => log::info!("focus-inbound: dispatched on-focus-changed({change})"),
                             Err(e) => log::warn!("focus-inbound: on-focus-changed({change}) failed: {e:#}"),
@@ -1211,9 +1221,9 @@ fn run_cwasm_loop(
                         (Some(action), Some(msh)) => {
                             let details = ActionDetails { action, seek_time_s };
                             dirty = true;
-                            match msh
+                            match crate::guest_call!(msh
                                 .wasi_media_session_session_handler()
-                                .call_on_action(&mut store, details)
+                                .call_on_action(&mut store, details))
                             {
                                 Ok(()) => log::info!("media-session-inbound: dispatched on-action({action:?})"),
                                 Err(e) => log::warn!("media-session-inbound: on-action failed: {e:#}"),
@@ -1408,11 +1418,11 @@ fn run_cwasm_loop(
             // runaway 0; the ceiling reuses IDLE_CAP_MS so a quiet service can't spin.
             const BG_TICK_MIN_MS: u64 = 16;
             const BG_TICK_DEFAULT_MS: u64 = 200;
-            let delay = bg_tick
+            let delay = crate::guest_call!(bg_tick
                 .as_ref()
                 .unwrap()
                 .wandr_background_background()
-                .call_bg_tick(&mut store)
+                .call_bg_tick(&mut store))
                 .unwrap_or(BG_TICK_DEFAULT_MS as u32)
                 .clamp(BG_TICK_MIN_MS as u32, IDLE_CAP_MS as u32) as u64;
             next_bg_tick_at =
@@ -1455,8 +1465,8 @@ fn run_cwasm_loop(
             // my:skiko-gfx probe; neither bound ⇒ 0 (render every interval —
             // the legacy unconditional path, rate-limited by the fps cap below).
             let guest_delay = if let Some(fp) = shell_pacing.as_ref() {
-                fp.wandr_ui_shell_frame_pacing()
-                    .call_next_frame_delay(&mut store)
+                crate::guest_call!(fp.wandr_ui_shell_frame_pacing()
+                    .call_next_frame_delay(&mut store))
                     .unwrap_or(0)
                     .min(IDLE_CAP_MS as u32) as u64
             } else {
@@ -1528,6 +1538,22 @@ fn run_cwasm_loop(
             nap = nap.min(next_bg_tick_at.saturating_duration_since(now_nap));
         }
         if !nap.is_zero() {
+            // Task 115 — for a CM-async guest the nap doubles as the event-loop
+            // pump: socket reads + keepalive timers advance while we'd
+            // otherwise just sleep. Same wake cadence either way (tokio parks
+            // the thread); an idle guest stays quiescent.
+            #[cfg(feature = "p3-async")]
+            {
+                if pump_naps {
+                    if let Err(e) = crate::async_app::pump_nap(&mut store, nap) {
+                        log::warn!("standalone: nap pump failed: {e:#}");
+                        std::thread::sleep(nap);
+                    }
+                } else {
+                    std::thread::sleep(nap);
+                }
+            }
+            #[cfg(not(feature = "p3-async"))]
             std::thread::sleep(nap);
         }
     }

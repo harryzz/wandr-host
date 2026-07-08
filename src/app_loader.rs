@@ -265,6 +265,12 @@ impl LoadedApp {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .map_err(|e| anyhow!("wasmtime_wasi::p2::add_to_linker_sync: {e:#}"))?;
+        // Task 115 — WASI 0.3 (native-async sockets/io/clocks), ADDITIVE next to
+        // p2 (dual-serve: p2 stays for every existing guest). Matching one of
+        // these async host imports is what makes an instance async-required.
+        #[cfg(feature = "p3-async")]
+        wasmtime_wasi::p3::add_to_linker(&mut linker)
+            .map_err(|e| anyhow!("wasmtime_wasi::p3::add_to_linker: {e:#}"))?;
         crate::signal_tls::add_to_linker(&mut linker) // task 66 — wasi:tls (Signal CA)
             .map_err(|e| anyhow!("signal_tls::add_to_linker: {e:#}"))?;
         crate::alarm_host_bindings::AlarmHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
@@ -309,9 +315,17 @@ impl LoadedApp {
         // wrappers (skiko + optional ime_events) over the same
         // Instance. `bindings::SkikoUi::instantiate(...)` would combine
         // both steps but only return SkikoUi.
+        #[cfg(not(feature = "p3-async"))]
         let instance = linker
             .instantiate(&mut *store, &self.entry)
             .map_err(|e| anyhow!("linker.instantiate failed: {e:#}"))?;
+        // Task 115 — with async_support on the config, instantiation goes
+        // through the async variant for every app (harmless for sync guests;
+        // required for async-flavored ones). Same driving runtime as all calls.
+        #[cfg(feature = "p3-async")]
+        let instance = crate::async_app::rt()
+            .block_on(linker.instantiate_async(&mut *store, &self.entry))
+            .map_err(|e| anyhow!("linker.instantiate_async failed: {e:#}"))?;
         // Optional — IME apps (whose world `include`s
         // `wandr:ime/ime-events`) satisfy these exports; non-IME apps
         // don't. `.ok()` swallows the bind-failure into None.
@@ -383,10 +397,14 @@ impl LoadedApp {
     pub fn instantiate_command(
         &self,
         store: &mut Store<HostState>,
-    ) -> Result<wasmtime_wasi::p2::bindings::sync::Command> {
+    ) -> Result<CliCommand> {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .map_err(|e| anyhow!("wasmtime_wasi::p2::add_to_linker_sync: {e:#}"))?;
+        // Task 115 — WASI 0.3, additive (see `instantiate`).
+        #[cfg(feature = "p3-async")]
+        wasmtime_wasi::p3::add_to_linker(&mut linker)
+            .map_err(|e| anyhow!("wasmtime_wasi::p3::add_to_linker: {e:#}"))?;
         crate::signal_tls::add_to_linker(&mut linker) // task 66 — wasi:tls (Signal CA)
             .map_err(|e| anyhow!("signal_tls::add_to_linker: {e:#}"))?;
         crate::alarm_host_bindings::AlarmHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
@@ -427,10 +445,40 @@ impl LoadedApp {
             wire_dep_into_linker(&mut linker, store, dep)?;
         }
 
-        wasmtime_wasi::p2::bindings::sync::Command::instantiate(store, &self.entry, &linker)
-            .map_err(|e| anyhow!("Command::instantiate failed: {e:#}"))
+        #[cfg(not(feature = "p3-async"))]
+        return wasmtime_wasi::p2::bindings::sync::Command::instantiate(store, &self.entry, &linker)
+            .map_err(|e| anyhow!("Command::instantiate failed: {e:#}"));
+        #[cfg(feature = "p3-async")]
+        return crate::async_app::rt()
+            .block_on(wasmtime_wasi::p2::bindings::Command::instantiate_async(
+                store,
+                &self.entry,
+                &linker,
+            ))
+            .map_err(|e| anyhow!("Command::instantiate_async failed: {e:#}"));
+    }
+
+    /// Task 115 — does this component import any WASI 0.3 interface? Such an
+    /// instance matches async host functions and becomes async-required; the
+    /// standalone loop then pumps its store event loop during naps so the
+    /// guest's native async tasks advance between frames.
+    #[cfg(feature = "p3-async")]
+    pub fn requires_async_drive(&self) -> bool {
+        let ty = self.entry.component_type();
+        let found = ty
+            .imports(&self.engine)
+            .any(|(name, _)| name.starts_with("wasi:") && name.contains("@0.3"));
+        found
     }
 }
+
+/// The `wasi:cli/command` wrapper type for one-shot consumers — sync bindings
+/// normally; the async flavor under `p3-async` (its `call_run` is `async fn`,
+/// invoked through `guest_call!`).
+#[cfg(not(feature = "p3-async"))]
+pub type CliCommand = wasmtime_wasi::p2::bindings::sync::Command;
+#[cfg(feature = "p3-async")]
+pub type CliCommand = wasmtime_wasi::p2::bindings::Command;
 
 pub trait AppLoader {
     fn load(&self, engine: &Engine, r: AppRef<'_>) -> Result<LoadedApp>;

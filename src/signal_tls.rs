@@ -55,6 +55,11 @@ pub fn add_to_linker(linker: &mut wasmtime::component::Linker<crate::HostState>)
     let mut opts = wasmtime_wasi_tls::p2::LinkOptions::default();
     opts.tls(true);
     wasmtime_wasi_tls::p2::add_to_linker(linker, &opts)?;
+    // Task 115 — the 0.3 (p3, native-async) twin, additive next to p2
+    // (dual-serve). Shares the same WasiTlsCtx / SignalTlsProvider trust store:
+    // both variants resolve the provider through WasiTlsView.
+    #[cfg(feature = "p3-async")]
+    wasmtime_wasi_tls::p3::add_to_linker(linker)?;
     Ok(())
 }
 

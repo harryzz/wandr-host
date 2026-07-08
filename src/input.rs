@@ -149,7 +149,7 @@ pub fn dispatch_pointer_routed(
             buttons: buttons_v5(meta.buttons),
             alt: mods[0], ctrl: mods[1], meta: mods[2], shift: mods[3],
         };
-        ph.wasi_input_handlers_pointer_handler().call_on_pointer(store, ev)?;
+        crate::guest_call!(ph.wasi_input_handlers_pointer_handler().call_on_pointer(store, ev))?;
         return Ok(());
     }
     Ok(())
@@ -164,7 +164,7 @@ pub fn dispatch_key_routed(
     ev: &KeyEvent,
 ) -> anyhow::Result<bool> {
     if let Some(kh) = &guest_input.key2 {
-        kh.wasi_input_handlers_key_handler().call_on_key(store, ev)?;
+        crate::guest_call!(kh.wasi_input_handlers_key_handler().call_on_key(store, ev))?;
         return Ok(true);
     }
     Ok(false)
@@ -178,7 +178,7 @@ pub fn dispatch_frame(
     nanos: u64,
 ) -> anyhow::Result<()> {
     if let Some(fh) = &guest_input.frame2 {
-        fh.wasi_input_handlers_frame_handler().call_on_frame(store, nanos)?;
+        crate::guest_call!(fh.wasi_input_handlers_frame_handler().call_on_frame(store, nanos))?;
     }
     Ok(())
 }
@@ -190,7 +190,7 @@ pub fn dispatch_resize_routed(
     w: u32, h: u32,
 ) -> anyhow::Result<()> {
     if let Some(fh) = &guest_input.frame2 {
-        fh.wasi_input_handlers_frame_handler().call_on_resize(store, w, h)?;
+        crate::guest_call!(fh.wasi_input_handlers_frame_handler().call_on_resize(store, w, h))?;
     }
     Ok(())
 }
@@ -378,8 +378,8 @@ pub fn dispatch_lifecycle(
     state: u32,
 ) -> anyhow::Result<()> {
     if let Some(sh) = shell {
-        sh.wandr_ui_shell_shell_events()
-            .call_on_lifecycle_changed(store, shell_state(state))?;
+        crate::guest_call!(sh.wandr_ui_shell_shell_events()
+            .call_on_lifecycle_changed(store, shell_state(state)))?;
     }
     Ok(())
 }
@@ -390,8 +390,8 @@ pub fn dispatch_scheduled_callback(
     callback_id: u32,
 ) -> anyhow::Result<()> {
     if let Some(sh) = shell {
-        sh.wandr_ui_shell_shell_events()
-            .call_on_scheduled_callback(store, callback_id)?;
+        crate::guest_call!(sh.wandr_ui_shell_shell_events()
+            .call_on_scheduled_callback(store, callback_id))?;
     }
     Ok(())
 }

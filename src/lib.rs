@@ -71,6 +71,9 @@ mod sf_surface;
 mod lifecycle_standalone;
 #[cfg(target_os = "android")]
 pub mod standalone;
+/// Task 115 — CM-async (p3) driving helpers: the shared current-thread tokio
+/// runtime + the nap pump. See the module docs.
+pub mod async_app;
 // Task 36 step 7: one-shot CLI launch path for wasi:cli/command consumers.
 #[cfg(target_os = "android")]
 pub mod run_once;
@@ -88,9 +91,19 @@ pub mod run_once;
 /// ime-events, so any IME app's component satisfies these typed
 /// bindings.
 mod ime_bindings {
+    #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
         path: "../../wit/ime.wit",
         world: "ime-events",
+    });
+    // Task 115 — async twin: export call methods become `async fn` (call_async
+    // under the hood); imports/Host traits untouched. Call sites go through
+    // `guest_call!`. Same pattern on every export-probe world below.
+    #[cfg(feature = "p3-async")]
+    wasmtime::component::bindgen!({
+        path: "../../wit/ime.wit",
+        world: "ime-events",
+        exports: { default: async },
     });
 }
 
@@ -140,15 +153,29 @@ mod ui_shell_bindings {
 /// Probe-only export worlds (wired to dispatch in Phase B).
 pub mod ui_shell_export_bindings {
     pub mod events {
+        #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
             path: "../../wit/ui-shell.wit",
             world: "shell-events-world",
         });
+        #[cfg(feature = "p3-async")]
+        wasmtime::component::bindgen!({
+            path: "../../wit/ui-shell.wit",
+            world: "shell-events-world",
+            exports: { default: async },
+        });
     }
     pub mod pacing {
+        #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
             path: "../../wit/ui-shell.wit",
             world: "frame-pacing-world",
+        });
+        #[cfg(feature = "p3-async")]
+        wasmtime::component::bindgen!({
+            path: "../../wit/ui-shell.wit",
+            world: "frame-pacing-world",
+            exports: { default: async },
         });
     }
 }
@@ -206,27 +233,55 @@ mod wasi_audio_impl;
 /// dispatch prefers 0.0.2 > 0.0.1 > legacy, exclusively.
 pub mod input_handlers_002_bindings {
     pub mod pointer {
+        #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
             path: "../../proposals/wasi-input-handlers/wit",
             world: "pointer-handler-world",
         });
+        #[cfg(feature = "p3-async")]
+        wasmtime::component::bindgen!({
+            path: "../../proposals/wasi-input-handlers/wit",
+            world: "pointer-handler-world",
+            exports: { default: async },
+        });
     }
     pub mod key {
+        #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
             path: "../../proposals/wasi-input-handlers/wit",
             world: "key-handler-world",
         });
+        #[cfg(feature = "p3-async")]
+        wasmtime::component::bindgen!({
+            path: "../../proposals/wasi-input-handlers/wit",
+            world: "key-handler-world",
+            exports: { default: async },
+        });
     }
     pub mod frame {
+        #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
             path: "../../proposals/wasi-input-handlers/wit",
             world: "frame-handler-world",
         });
+        #[cfg(feature = "p3-async")]
+        wasmtime::component::bindgen!({
+            path: "../../proposals/wasi-input-handlers/wit",
+            world: "frame-handler-world",
+            exports: { default: async },
+        });
     }
     pub mod gesture {
+        #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
             path: "../../proposals/wasi-input-handlers/wit",
             world: "gesture-handler-world",
+        });
+        #[cfg(feature = "p3-async")]
+        wasmtime::component::bindgen!({
+            path: "../../proposals/wasi-input-handlers/wit",
+            world: "gesture-handler-world",
+            exports: { default: async },
         });
     }
 }
@@ -321,9 +376,16 @@ mod events_host_bindings {
 /// fans an event on a subscribed topic. Bound conditionally per instance (like
 /// `alarm_events`); guests that don't export it yield `None` (inert).
 mod events_incoming_bindings {
+    #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
         path: "../../wit/events.wit",
         world: "events-incoming",
+    });
+    #[cfg(feature = "p3-async")]
+    wasmtime::component::bindgen!({
+        path: "../../wit/events.wit",
+        world: "events-incoming",
+        exports: { default: async },
     });
 }
 
@@ -331,9 +393,16 @@ mod events_incoming_bindings {
 /// `wandr:alarm/alarm-handler`. Bound conditionally per instance (like
 /// `ime_bindings`); guests that don't export it yield `None` (inert).
 mod alarm_events_bindings {
+    #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
         path: "../../wit/alarm.wit",
         world: "alarm-events",
+    });
+    #[cfg(feature = "p3-async")]
+    wasmtime::component::bindgen!({
+        path: "../../wit/alarm.wit",
+        world: "alarm-events",
+        exports: { default: async },
     });
 }
 
@@ -343,9 +412,16 @@ mod alarm_events_bindings {
 /// backgrounded background-service. Bound conditionally per instance (like
 /// `alarm_events`); other guests yield `None` (inert).
 mod background_events_bindings {
+    #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
         path: "../../wit/background.wit",
         world: "background-events",
+    });
+    #[cfg(feature = "p3-async")]
+    wasmtime::component::bindgen!({
+        path: "../../wit/background.wit",
+        world: "background-events",
+        exports: { default: async },
     });
 }
 
@@ -373,9 +449,16 @@ mod keyguard_host_bindings {
 /// guests that export `wandr:notify/notify-handler`. Bound conditionally per
 /// instance (like `alarm_events`); other guests yield `None` (inert).
 mod notify_events_bindings {
+    #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
         path: "../../wit/notify.wit",
         world: "notify-events",
+    });
+    #[cfg(feature = "p3-async")]
+    wasmtime::component::bindgen!({
+        path: "../../wit/notify.wit",
+        world: "notify-events",
+        exports: { default: async },
     });
 }
 
@@ -393,9 +476,16 @@ mod audio_focus_host_bindings {
 /// guests that export `wandr:audio-focus/focus-handler`. Bound conditionally per
 /// instance (like `alarm_events`); other guests yield `None` (inert).
 mod audio_focus_events_bindings {
+    #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
         path: "../../wit/audio-focus.wit",
         world: "audio-focus-events",
+    });
+    #[cfg(feature = "p3-async")]
+    wasmtime::component::bindgen!({
+        path: "../../wit/audio-focus.wit",
+        world: "audio-focus-events",
+        exports: { default: async },
     });
 }
 
@@ -415,9 +505,16 @@ mod media_session_host_bindings {
 /// `wasi:media-session/session-handler`. Bound conditionally per instance (like
 /// `alarm_events`); other guests yield `None` (inert).
 mod media_session_events_bindings {
+    #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
         path: "../../proposals/wasi-media-session/wit",
         world: "media-session-events",
+    });
+    #[cfg(feature = "p3-async")]
+    wasmtime::component::bindgen!({
+        path: "../../proposals/wasi-media-session/wit",
+        world: "media-session-events",
+        exports: { default: async },
     });
 }
 mod media_session_host_impl;
@@ -426,6 +523,25 @@ mod media_session_host_impl;
 // dep wiring via wasmtime introspection in app_loader.rs). Per-dep
 // `bindgen!` modules are no longer needed; any cross-app dep wires
 // up automatically via `wire_dep_into_linker`'s component-type walk.
+
+/// Task 115 — invoke a guest export call expression under either flavor.
+/// With `p3-async` the bindgen export twins make `call_x(...)` an `async fn`
+/// (call_async under the hood), so the expression is a future: run it on the
+/// shared driving runtime. Without the feature it's the plain sync call.
+/// Every guest-export call site in the host goes through this.
+#[cfg(feature = "p3-async")]
+macro_rules! guest_call {
+    ($e:expr) => {
+        crate::async_app::rt().block_on($e)
+    };
+}
+#[cfg(not(feature = "p3-async"))]
+macro_rules! guest_call {
+    ($e:expr) => {
+        $e
+    };
+}
+pub(crate) use guest_call;
 
 use winit::{
     application::ApplicationHandler,
@@ -531,6 +647,18 @@ impl App {
         // bump async first.
         config.async_stack_size(8 * 1024 * 1024);
         config.max_wasm_stack(4 * 1024 * 1024);
+        // Task 115 — native CM-async + WASI 0.3. `wasm_component_model_async`
+        // is a wasm feature flag: it changes the precompile hash exactly like
+        // the epoch_interruption note below, so it lives behind the p3-async
+        // cargo feature (desktop JIT first; device cwasm recompile is M4).
+        // `async_support` does NOT force async entrypoints per store —
+        // asyncness is per-instance from matched host imports, so existing
+        // sync apps run unchanged (proven in repros/cma-cross-call-spike).
+        #[cfg(feature = "p3-async")]
+        {
+            config.async_support(true);
+            config.wasm_component_model_async(true);
+        }
         // Note: `epoch_interruption(true)` would be needed here to drive
         // GuestProfiler sampling, but it changes the AOT cwasm contract —
         // the pre-compiled cwasm currently on the device was compiled

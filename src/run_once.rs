@@ -134,7 +134,7 @@ pub fn run_with_engine(engine: &Engine, app_id: &str) -> Result<()> {
     //   inner Err  = guest returned an "error" exit status (the WASI
     //                command convention for non-zero exit)
     //   inner Ok   = guest returned normally (zero exit)
-    let result = command.wasi_cli_run().call_run(&mut store);
+    let result = crate::guest_call!(command.wasi_cli_run().call_run(&mut store));
     match &result {
         Ok(Ok(())) => log::info!("run_once: call_run returned Ok — guest exited cleanly"),
         Ok(Err(())) => log::warn!("run_once: call_run returned Err — guest exited with WASI error"),

@@ -154,6 +154,13 @@ cross-aot = ["wasmtime/all-arch"]
 # canvas package over the same SkiaRenderer, coexisting with my:skiko-gfx.
 # Off by default until the proving consumer (slint-wandr port) lands.
 wasi-canvas = []
+# Task 115 — native Component-Model async + WASI 0.3 (p3) sockets/tls, additive
+# next to the p2 surface (dual-serve; p2 stays for every existing guest). Off by
+# default: `wasm_component_model_async` changes the AOT precompile hash, so the
+# device cwasm contract is untouched until M4 flips it deliberately. Guest calls
+# route through `guest_call!` (block_on(call_async)) when this is on; proven in
+# repros/cma-cross-call-spike (sync apps coexist unchanged on the same engine).
+p3-async = ["wasmtime/component-model-async", "wasmtime-wasi/p3", "wasmtime-wasi-tls/p3", "tokio/time"]
 
 [package.metadata.android]
 package = "com.example.wasmruntime"
