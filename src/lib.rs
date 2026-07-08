@@ -651,14 +651,12 @@ impl App {
         // is a wasm feature flag: it changes the precompile hash exactly like
         // the epoch_interruption note below, so it lives behind the p3-async
         // cargo feature (desktop JIT first; device cwasm recompile is M4).
-        // `async_support` does NOT force async entrypoints per store —
-        // asyncness is per-instance from matched host imports, so existing
-        // sync apps run unchanged (proven in repros/cma-cross-call-spike).
+        // Async entrypoints are NOT forced per store (wasmtime 46:
+        // `Config::async_support` is a deprecated no-op; asyncness is
+        // per-instance from matched host imports), so existing sync apps run
+        // unchanged (proven in repros/cma-cross-call-spike gate C).
         #[cfg(feature = "p3-async")]
-        {
-            config.async_support(true);
-            config.wasm_component_model_async(true);
-        }
+        config.wasm_component_model_async(true);
         // Note: `epoch_interruption(true)` would be needed here to drive
         // GuestProfiler sampling, but it changes the AOT cwasm contract —
         // the pre-compiled cwasm currently on the device was compiled
