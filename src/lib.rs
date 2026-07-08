@@ -462,6 +462,14 @@ pub struct HostState {
     pub frame_snapshot: profiling::FrameSnapshotState,
 }
 
+// Task 115: wasmtime's async APIs (`call_async` / `run_concurrent`) require the
+// store data to be `Send`. Keep that invariant honest at compile time — a new
+// `!Send` field here would silently block the p3-async path.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<HostState>();
+};
+
 impl WasiView for HostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView { ctx: &mut self.wasi, table: &mut self.table }

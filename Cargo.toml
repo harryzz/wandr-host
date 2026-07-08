@@ -15,8 +15,10 @@ name = "wasm-android-host"
 path = "src/main.rs"
 
 [dependencies]
-wasmtime           = { version = "46", features = ["component-model", "all-arch"] }
-wasmtime-wasi      = { version = "46" }
+# Exact-pinned (=46.0.0) while riding the RC-status p3 wasi:sockets/wasi:tls
+# surface (task 115) — patch bumps may churn those APIs; bump deliberately.
+wasmtime           = { version = "=46.0.0", features = ["component-model", "all-arch"] }
+wasmtime-wasi      = { version = "=46.0.0" }
 # Task 66 — host-delegated TLS for guests with Signal's pinned CA trusted.
 # wasmtime-wasi-tls provides the wasi:tls@0.2.0-draft host impl; the
 # rustls/tokio-rustls/webpki-roots/rustls-pemfile stack builds the custom
@@ -24,7 +26,7 @@ wasmtime-wasi      = { version = "46" }
 # mirror wasmtime/crates/wasi-tls so there's one copy of each at the trait edge.
 # tokio (rt) here so the provider's tokio-rustls types resolve on all targets;
 # the android section already pulls tokio for binder — features union.
-wasmtime-wasi-tls  = { version = "46" }
+wasmtime-wasi-tls  = { version = "=46.0.0" }
 rustls             = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-rustls       = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots       = "0.26"
