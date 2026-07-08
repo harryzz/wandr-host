@@ -615,6 +615,13 @@ pub struct App {
     buttons_held:    u8,
     // Live modifier state (winit reports it as a separate event stream).
     modifiers:       winit::keyboard::ModifiersState,
+    /// Task 115 — the guest imports WASI 0.3: its native async tasks advance
+    /// ONLY while the host pumps the store event loop (`run_concurrent`);
+    /// `call_async` alone does not poll unrelated pending host futures
+    /// (proven in repros/cma-cross-call-spike gate B). The desktop loop pumps
+    /// briefly after each frame.
+    #[cfg(feature = "p3-async")]
+    pump_cm_async:   bool,
 }
 
 impl App {
@@ -669,6 +676,12 @@ impl App {
     }
 
     fn from_parts(engine: Engine, loaded: Option<LoadedApp>) -> Self {
+        #[cfg(feature = "p3-async")]
+        let pump_cm_async = loaded.as_ref().is_some_and(|l| l.requires_async_drive());
+        #[cfg(feature = "p3-async")]
+        if pump_cm_async {
+            log::info!("desktop: guest imports WASI 0.3 — per-frame CM-async pump enabled");
+        }
         Self {
             window: None,
             engine,
@@ -680,6 +693,8 @@ impl App {
             last_cursor: (0.0, 0.0),
             buttons_held: 0,
             modifiers: winit::keyboard::ModifiersState::default(),
+            #[cfg(feature = "p3-async")]
+            pump_cm_async,
         }
     }
 
@@ -1035,6 +1050,21 @@ impl ApplicationHandler for App {
                             log::error!("render_frame fatal: {msg}");
                             event_loop.exit();
                             return;
+                        }
+                    }
+                    // Task 115 — per-frame CM-async pump: the guest's native
+                    // async tasks (DNS/TLS/keepalive) advance only inside
+                    // run_concurrent; call_async does NOT poll unrelated
+                    // pending host futures. A short pump per frame keeps the
+                    // engine's transport live on the desktop dev loop (the
+                    // standalone path pumps during its naps instead).
+                    #[cfg(feature = "p3-async")]
+                    if self.pump_cm_async {
+                        if let Err(e) = crate::async_app::pump_nap(
+                            &mut *s,
+                            std::time::Duration::from_millis(2),
+                        ) {
+                            log::warn!("desktop: CM-async pump failed: {e:#}");
                         }
                     }
                 } else if let Some(r) = self.renderer_mut() {

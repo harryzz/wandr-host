@@ -263,11 +263,20 @@ pub struct InstantiatedApp {
 impl LoadedApp {
     pub fn instantiate(&self, store: &mut Store<HostState>) -> Result<InstantiatedApp> {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
+        // Task 115 — with p3-async on, p2 links its ASYNC host impls: the sync
+        // ones internally enter wasmtime-wasi's own tokio helper (`in_tokio`),
+        // which panics ("cannot start a runtime from within a runtime") when a
+        // guest hits filesystem/socket p2 fns while we drive the store from
+        // async_app::rt(). Async p2 fns are awaited natively instead. Every
+        // app then takes the uniform instantiate_async/call_async path.
+        #[cfg(not(feature = "p3-async"))]
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .map_err(|e| anyhow!("wasmtime_wasi::p2::add_to_linker_sync: {e:#}"))?;
+        #[cfg(feature = "p3-async")]
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+            .map_err(|e| anyhow!("wasmtime_wasi::p2::add_to_linker_async: {e:#}"))?;
         // Task 115 — WASI 0.3 (native-async sockets/io/clocks), ADDITIVE next to
-        // p2 (dual-serve: p2 stays for every existing guest). Matching one of
-        // these async host imports is what makes an instance async-required.
+        // p2 (dual-serve: p2 stays for every existing guest).
         #[cfg(feature = "p3-async")]
         wasmtime_wasi::p3::add_to_linker(&mut linker)
             .map_err(|e| anyhow!("wasmtime_wasi::p3::add_to_linker: {e:#}"))?;
@@ -380,6 +389,29 @@ impl LoadedApp {
         if media_session_handler.is_some() {
             log::info!("loader: app exports wasi:media-session/session-handler — transport intents enabled");
         }
+        // Task 115 (p3) — a CM-async guest's spawn point: if the composite
+        // re-exports `wandr:signal/engine-start`, call its async `start` once,
+        // right here, BEFORE the first frame (it loads persisted state and
+        // spawns the engine's native async receive/keepalive loop; a
+        // sync-lifted UI export could never make this call — CannotBlockSyncTask).
+        #[cfg(feature = "p3-async")]
+        {
+            let iface = instance.get_export_index(&mut *store, None, "wandr:signal/engine-start@0.1.0");
+            if let Some(iface) = iface {
+                let start = instance
+                    .get_export_index(&mut *store, Some(&iface), "start")
+                    .and_then(|idx| instance.get_typed_func::<(), ()>(&mut *store, idx).ok());
+                match start {
+                    Some(f) => {
+                        crate::async_app::rt()
+                            .block_on(f.call_async(&mut *store, ()))
+                            .map_err(|e| anyhow!("engine-start.start failed: {e:#}"))?;
+                        log::info!("loader: called async engine-start.start — CM-async engine running");
+                    }
+                    None => log::warn!("loader: engine-start exported but no callable `start`"),
+                }
+            }
+        }
         Ok(InstantiatedApp {
             ime_events, guest_input,
             shell_events,
@@ -399,8 +431,13 @@ impl LoadedApp {
         store: &mut Store<HostState>,
     ) -> Result<CliCommand> {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
+        // Task 115 — async p2 under p3-async, same rationale as `instantiate`.
+        #[cfg(not(feature = "p3-async"))]
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .map_err(|e| anyhow!("wasmtime_wasi::p2::add_to_linker_sync: {e:#}"))?;
+        #[cfg(feature = "p3-async")]
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+            .map_err(|e| anyhow!("wasmtime_wasi::p2::add_to_linker_async: {e:#}"))?;
         // Task 115 — WASI 0.3, additive (see `instantiate`).
         #[cfg(feature = "p3-async")]
         wasmtime_wasi::p3::add_to_linker(&mut linker)
