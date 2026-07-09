@@ -129,6 +129,13 @@ softbuffer = "0.4.8"
 # PipeWire exposes only a Dummy Output (a null sink), so default_host() would
 # pick it and play to nowhere. See src/audio_desktop.rs.
 cpal = { version = "0.18", features = ["pulseaudio"] }
+# Desktop wandr:video backend — cross-platform camera capture (nokhwa: v4l2 Linux /
+# MediaFoundation Windows / AVFoundation macOS) + software VP8/VP9 via ffmpeg
+# (libvpx). ffmpeg-next 7.1 matches system ffmpeg 7.1 (libavcodec 61); only
+# codec+format+software-scaling (no libavfilter/libavdevice dev headers needed).
+# See src/video_desktop.rs; proven in repros/nokhwa-camera-probe.
+nokhwa = { version = "0.10", features = ["input-native"] }
+ffmpeg-next = { version = "7.1", default-features = false, features = ["codec", "format", "software-scaling"] }
 
 [build-dependencies]
 cc = "1"

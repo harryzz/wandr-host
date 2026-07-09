@@ -25,6 +25,20 @@ fn main() {
             }
         }
     }
+    // Desktop `--run-once <app-id>`: one-shot a wasi:cli/command guest from
+    // WANDR_APPS_ROOT (e.g. wandr.video.test), same as the device path. Headless
+    // — no winit window. Mirrors the android main's --run-once branch.
+    if let Some(i) = args.iter().position(|a| a == "--run-once") {
+        let Some(app_id) = args.get(i + 1) else {
+            eprintln!("wandr-host --run-once: requires <app-id>");
+            std::process::exit(2);
+        };
+        if let Err(e) = wasm_android_host::run_once::run(app_id) {
+            eprintln!("wandr-host --run-once: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     wasm_android_host::run();
 }
 

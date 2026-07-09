@@ -39,6 +39,9 @@ mod connectivity_wifi_impl;
 pub mod crypto;
 mod crypto_host_impl;
 pub mod video;
+// Desktop wandr:video backend (nokhwa + ffmpeg VP8/VP9); android uses NDK/MediaCodec.
+#[cfg(not(target_os = "android"))]
+pub mod video_desktop;
 mod video_host_impl;
 mod events_host_impl;
 mod notify_host_impl;
@@ -80,7 +83,8 @@ pub mod standalone;
 /// runtime + the nap pump. See the module docs.
 pub mod async_app;
 // Task 36 step 7: one-shot CLI launch path for wasi:cli/command consumers.
-#[cfg(target_os = "android")]
+// Also the desktop `--run-once` entry (e.g. wandr.video.test) — cross-platform
+// (engine + app_loader + wasi:cli command), no android-only deps.
 pub mod run_once;
 
 /// Task 49 step 1b — typed bindings for the IME-events export side of

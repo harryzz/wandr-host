@@ -40,38 +40,47 @@ pub fn run(app_id: &str) -> Result<()> {
 /// the parent before `fork()` is reused (COW-shared with siblings),
 /// instead of each child re-allocating a fresh one.
 pub fn run_with_engine(engine: &Engine, app_id: &str) -> Result<()> {
-    android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Debug),
-    );
-    // Surface guest WASI stderr to logcat — this is the difference vs
-    // `wasmtime run`'s stdio path that's been blamed for the Kotlin/Wasm
-    // command-adapter throw bug (see `feedback_kotlin_wasm_println_throws_wasmtime`).
-    // Worth checking whether routing through `LogcatStderr` changes the
-    // throw behavior on-device.
-    crate::wasi_stderr::redirect_stderr_to_logcat();
+    #[cfg(target_os = "android")]
+    {
+        android_logger::init_once(
+            android_logger::Config::default().with_max_level(log::LevelFilter::Debug),
+        );
+        // Surface guest WASI stderr to logcat — the difference vs `wasmtime run`'s
+        // stdio path blamed for the Kotlin/Wasm command-adapter throw bug (see
+        // `feedback_kotlin_wasm_println_throws_wasmtime`).
+        crate::wasi_stderr::redirect_stderr_to_logcat();
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = env_logger::builder().try_init(); // main() didn't call run()
+    }
     log::info!("run_once: starting — app_id={app_id}");
 
-    // Binder init is needed for any HAL access the dep / consumer might
-    // make. Cheap if no one uses it.
+    // Binder init is needed for any HAL access the dep / consumer might make
+    // (android only; cheap if no one uses it).
+    #[cfg(target_os = "android")]
     if let Err(e) = crate::binder::init() {
         log::warn!("run_once: binder init: {e}");
     }
 
-    // SurfaceFlinger surface: built even though the smoke consumer never
-    // draws, because HostState carries a non-Option SkiaRenderer (refactor
-    // deferred — see plan). The screen-flash for the ~1s smoke is the
-    // cost of avoiding a ~220-site refactor. For a long-lived CLI
-    // consumer this is wasteful; revisit Option<SkiaRenderer> if more
-    // CLI shapes appear.
-    let sf = crate::sf_surface::SfSurface::create(SHIM_SO)?;
-    log::info!(
-        "run_once: surface {}x{} transform 0x{:x} (ANativeWindow={:p})",
-        sf.width, sf.height, sf.transform, sf.native_window,
-    );
-    let renderer = crate::canvas_impl::SkiaRenderer::from_native_window(
-        sf.native_window, sf.width as u32, sf.height as u32,
-        || sf.query_transform_hint(),
-    )?;
+    // HostState carries a non-Option SkiaRenderer even for guests that never
+    // draw (refactor deferred). Android builds an SF surface + GL renderer;
+    // desktop uses a headless CPU raster surface (no window, no flash).
+    #[cfg(target_os = "android")]
+    let (sf, renderer) = {
+        let sf = crate::sf_surface::SfSurface::create(SHIM_SO)?;
+        log::info!(
+            "run_once: surface {}x{} transform 0x{:x} (ANativeWindow={:p})",
+            sf.width, sf.height, sf.transform, sf.native_window,
+        );
+        let renderer = crate::canvas_impl::SkiaRenderer::from_native_window(
+            sf.native_window, sf.width as u32, sf.height as u32,
+            || sf.query_transform_hint(),
+        )?;
+        (sf, renderer)
+    };
+    #[cfg(not(target_os = "android"))]
+    let renderer = crate::canvas_impl::SkiaRenderer::new_headless(640, 480)?;
 
     let loader = app_loader::default_for_target();
     let loaded = loader.load(engine, AppRef::Installed { app_id, version: None })
@@ -80,7 +89,10 @@ pub fn run_with_engine(engine: &Engine, app_id: &str) -> Result<()> {
 
     let mut wasi_builder = WasiCtxBuilder::new();
     wasi_builder.inherit_stdin().inherit_stdout();
+    #[cfg(target_os = "android")]
     wasi_builder.stderr(crate::wasi_stderr::LogcatStderr);
+    #[cfg(not(target_os = "android"))]
+    wasi_builder.inherit_stderr();
     // Pass the app id as argv[0] so a curious consumer can see who it
     // thinks it is. Smoke consumer doesn't read argv.
     wasi_builder.args(&[app_id]);
@@ -92,7 +104,8 @@ pub fn run_with_engine(engine: &Engine, app_id: &str) -> Result<()> {
             Err(e) => log::warn!("run_once: preopen {} failed: {e:#}", assets.display()),
         }
     }
-    // Task 41 — /system/fonts/ preopen for system-fonts dep (always on).
+    // Task 41 — /system/fonts/ preopen for system-fonts dep (android layout).
+    #[cfg(target_os = "android")]
     match wasi_builder.preopened_dir("/system/fonts", "/system-fonts", DirPerms::READ, FilePerms::READ) {
         Ok(_)  => log::info!("run_once: preopened /system/fonts → /system-fonts (read-only)"),
         Err(e) => log::warn!("run_once: preopen /system/fonts failed: {e:#}"),
@@ -143,8 +156,9 @@ pub fn run_with_engine(engine: &Engine, app_id: &str) -> Result<()> {
 
     // Drop the store first so the renderer's EGL/SF resources are
     // released before the SfSurface's Drop tears down the binder
-    // connection.
+    // connection (android only; desktop is a plain raster surface).
     drop(store);
+    #[cfg(target_os = "android")]
     drop(sf);
 
     match result {

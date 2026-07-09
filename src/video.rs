@@ -137,54 +137,10 @@ pub(crate) fn device_rotation_deg() -> u32 {
 #[cfg(target_os = "android")]
 pub use android::{ensure_binder_threadpool, VideoDecoder, VideoEncoder};
 
+// Desktop (Linux/WSLg/Win/mac) backend: nokhwa camera + ffmpeg software VP8/VP9.
+// The cross-platform peer of the android NDK/MediaCodec path below.
 #[cfg(not(target_os = "android"))]
-pub use desktop::{ensure_binder_threadpool, VideoDecoder, VideoEncoder};
-
-// ── desktop stubs (the host also builds for JIT dev; camera/codec are
-//    android-only, so open just fails) ─────────────────────────────────────
-#[cfg(not(target_os = "android"))]
-mod desktop {
-    use super::*;
-
-    pub fn ensure_binder_threadpool() -> bool {
-        false
-    }
-
-    pub struct VideoEncoder;
-    impl VideoEncoder {
-        pub fn open(_config: &EncoderConfig) -> Result<Self, VideoError> {
-            log::warn!("video: wandr:video is android-only (no camera/MediaCodec on desktop)");
-            Err(VideoError::CodecInitFailed)
-        }
-        pub fn next_frame(&mut self) -> Option<EncodedFrame> {
-            None
-        }
-        pub fn request_keyframe(&mut self) {}
-        pub fn set_bitrate(&mut self, _bps: u32) {}
-        pub fn set_preview_rect(&mut self, _rect: super::VideoRect) {}
-        pub fn set_preview_visible(&mut self, _visible: bool) {}
-        pub fn display_rotation(&self) -> u32 {
-            0
-        }
-    }
-
-    pub struct VideoDecoder;
-    impl VideoDecoder {
-        pub fn open(_config: &DecoderConfig) -> Result<Self, VideoError> {
-            log::warn!("video: wandr:video is android-only (no MediaCodec on desktop)");
-            Err(VideoError::CodecInitFailed)
-        }
-        pub fn submit(&mut self, _data: &[u8], _timestamp: u32) -> Result<(), VideoError> {
-            Err(VideoError::BadFrame)
-        }
-        pub fn decoded_frames(&self) -> u64 {
-            0
-        }
-        pub fn set_rect(&mut self, _rect: super::VideoRect) {}
-        pub fn set_visible(&mut self, _visible: bool) {}
-        pub fn set_rotation(&mut self, _degrees: u32) {}
-    }
-}
+pub use crate::video_desktop::{ensure_binder_threadpool, VideoDecoder, VideoEncoder};
 
 // ── NDK FFI (shared with video_probe.rs) ──────────────────────────────────
 #[cfg(target_os = "android")]

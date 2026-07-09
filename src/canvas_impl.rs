@@ -342,6 +342,29 @@ impl SkiaRenderer {
         }
     }
 
+    /// Headless renderer (no window, no GL) backed by a CPU raster surface.
+    /// Used by desktop `--run-once` for `wasi:cli/command` guests (e.g.
+    /// wandr.video.test) that never draw but must satisfy `HostState`'s
+    /// non-Option renderer. `present()` no-ops with window/sb_surface = None.
+    #[cfg(not(target_os = "android"))]
+    pub fn new_headless(width: u32, height: u32) -> Result<Self> {
+        let surface = skia_safe::surfaces::raster_n32_premul(
+            (width.max(1) as i32, height.max(1) as i32),
+        ).ok_or_else(|| anyhow::anyhow!("headless raster surface failed"))?;
+        Ok(Self {
+            gl: None,
+            sb_surface: None,
+            window: None,
+            surface, width, height,
+            logical_width: width, logical_height: height,
+            inset_top: 0, inset_bottom: 0, keyboard_base_px: 0,
+            base_matrix: skia_safe::Matrix::new_identity(),
+            current_orient: 0,
+            typeface_cache:   HashMap::new(),
+            font_collection:  Self::make_font_collection(),
+        })
+    }
+
     /// Build a renderer directly on a raw `ANativeWindow*`, bypassing winit.
     /// Used by the task-33 standalone (no-`NativeActivity`) mode, where the
     /// window comes from SurfaceFlinger via the `libsf_surface` shim. The
