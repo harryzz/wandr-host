@@ -12,6 +12,11 @@ mod power_impl;
 mod thermal_impl;
 mod sensors_impl;
 pub mod audio_impl;
+/// Desktop (non-Android) wasi:audio/pcm backend via cpal (Signal calls +
+/// audio.player on Linux/WSLg, Windows, macOS). Fills the `cfg(not android)`
+/// bodies of the audio_impl dispatch functions.
+#[cfg(not(target_os = "android"))]
+pub mod audio_desktop;
 pub mod audio_policy_impl;
 pub mod audio_caps;
 pub mod audio_routing;
@@ -622,6 +627,15 @@ pub struct App {
     /// briefly after each frame.
     #[cfg(feature = "p3-async")]
     pump_cm_async:   bool,
+    /// Task 108 — guests that export `wandr:background/background` run their
+    /// engine in bg-tick, NOT render (audio.player scans the library, decodes,
+    /// and feeds the audio ring here). The standalone loop pumps this; the
+    /// desktop dev loop must too, or the engine never starts. `Some` iff the
+    /// component exports the interface; discarded before this fix.
+    bg_tick:         Option<crate::background_events_bindings::BackgroundEvents>,
+    /// Next bg-tick deadline (guest-authored cadence, host-clamped). Init to now
+    /// so the first tick fires immediately once the store exists.
+    bg_tick_at:      std::time::Instant,
 }
 
 impl App {
@@ -695,6 +709,8 @@ impl App {
             modifiers: winit::keyboard::ModifiersState::default(),
             #[cfg(feature = "p3-async")]
             pump_cm_async,
+            bg_tick: None,
+            bg_tick_at: std::time::Instant::now(),
         }
     }
 
@@ -836,6 +852,23 @@ impl ApplicationHandler for App {
                         Err(e) => log::warn!("preopen {} failed: {e:#}", noto.display()),
                     }
                 }
+                // Desktop parity with the device's /data/media/0/Music → /music
+                // preopen (standalone.rs). audio.player scans /music/<album>/*.
+                // Source dir: WANDR_DESKTOP_MUSIC, else $HOME/Music. Read-only,
+                // best-effort (only preopened when it exists).
+                let music = std::env::var_os("WANDR_DESKTOP_MUSIC")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Music")));
+                if let Some(dir) = music {
+                    if dir.is_dir() {
+                        match wasi_builder.preopened_dir(&dir, "/music", DirPerms::READ, FilePerms::READ) {
+                            Ok(_)  => log::info!("preopened {} → /music (read-only)", dir.display()),
+                            Err(e) => log::warn!("preopen {} failed: {e:#}", dir.display()),
+                        }
+                    } else {
+                        log::info!("audio: no music dir at {} (set WANDR_DESKTOP_MUSIC)", dir.display());
+                    }
+                }
             }
             let wasi = wasi_builder.build();
             let host = HostState {
@@ -884,6 +917,14 @@ impl ApplicationHandler for App {
             self.store    = Some(store);
             self.guest_input = inst.guest_input;
             self.shell_events = inst.shell_events;
+            // Task 108 — keep the bg-tick binding so the desktop loop can pump
+            // the guest's background engine (audio.player); reset the deadline so
+            // the first tick fires on the next frame.
+            if inst.bg_tick.is_some() {
+                log::info!("desktop: guest exports wandr:background/background — bg-tick pump enabled");
+            }
+            self.bg_tick = inst.bg_tick;
+            self.bg_tick_at = std::time::Instant::now();
         } else {
             log::info!("no WASM component — running in renderer-test mode");
             self.test_renderer = Some(renderer);
@@ -949,6 +990,26 @@ impl ApplicationHandler for App {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_nanos() as u64;
+
+                    // Task 108 — pump the guest's background engine on its
+                    // authored cadence BEFORE rendering. audio.player scans the
+                    // library, decodes, and feeds the audio ring here (not in
+                    // render); without this the desktop UI is empty + silent.
+                    // Mirrors the standalone loop's bg-tick pump.
+                    if self.bg_tick.is_some() && std::time::Instant::now() >= self.bg_tick_at {
+                        const BG_TICK_MIN_MS: u32 = 16;
+                        const BG_TICK_DEFAULT_MS: u32 = 200;
+                        const BG_TICK_MAX_MS: u32 = 1000;
+                        let delay = crate::guest_call!(self.bg_tick
+                            .as_ref()
+                            .unwrap()
+                            .wandr_background_background()
+                            .call_bg_tick(&mut *s))
+                            .unwrap_or(BG_TICK_DEFAULT_MS)
+                            .clamp(BG_TICK_MIN_MS, BG_TICK_MAX_MS) as u64;
+                        self.bg_tick_at = std::time::Instant::now()
+                            + std::time::Duration::from_millis(delay);
+                    }
 
                     // Drain any scheduler callbacks whose deadline has passed.
                     let due = s.data_mut().scheduler.drain_due(std::time::Instant::now());

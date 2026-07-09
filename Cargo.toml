@@ -120,6 +120,15 @@ glutin       = "0.32"
 # Softbuffer is kept as a FALLBACK when GL init fails (the previous reliable
 # CPU-blit path under WSLg/Wayland/X11).
 softbuffer = "0.4.8"
+# Desktop audio backend for wasi:audio/pcm (Signal calls + audio.player). cpal
+# is the cross-platform I/O layer (Windows WASAPI, macOS CoreAudio, Linux). The
+# `pulseaudio` feature adds cpal's native PulseAudio host (pure-Rust `pulseaudio`
+# crate — no libpulse), which `default_host()` prefers over ALSA. This is the
+# working path under WSLg: cpal → $PULSE_SERVER (unix:/mnt/wslg/PulseServer) →
+# RDP → Windows. We deliberately do NOT enable `pipewire`: on WSLg the local
+# PipeWire exposes only a Dummy Output (a null sink), so default_host() would
+# pick it and play to nowhere. See src/audio_desktop.rs.
+cpal = { version = "0.18", features = ["pulseaudio"] }
 
 [build-dependencies]
 cc = "1"

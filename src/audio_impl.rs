@@ -1840,7 +1840,7 @@ pub fn create_track(cfg: TrackConfig) -> u32 {
     #[cfg(target_os = "android")]
     { if use_audioclient() { return audioclient_path::create_track(cfg); } return binder_path::create_track(cfg); }
     #[cfg(not(target_os = "android"))]
-    { let _ = cfg; 0 }
+    { crate::audio_desktop::create_track(cfg) }
 }
 
 /// Open an output track for an explicit intent [`crate::audio_routing::Route`]
@@ -1854,7 +1854,7 @@ pub fn create_track_routed(cfg: TrackConfig, route: crate::audio_routing::Route)
         return binder_path::open_routed(cfg, route);
     }
     #[cfg(not(target_os = "android"))]
-    { let _ = (cfg, route); 0 }
+    { let _ = route; crate::audio_desktop::create_track(cfg) }
 }
 
 pub fn write_pcm_f32(track: u32, samples: &[f32]) -> u32 {
@@ -1874,28 +1874,28 @@ pub fn write_pcm_f32(track: u32, samples: &[f32]) -> u32 {
         return binder_path::write_pcm_f32(track, samples);
     }
     #[cfg(not(target_os = "android"))]
-    { let _ = (track, samples); 0 }
+    { crate::audio_desktop::write_pcm_f32(track, samples) }
 }
 
 pub fn start(track: u32) -> bool {
     #[cfg(target_os = "android")]
     { if use_audioclient() { return audioclient_path::start(track); } return binder_path::start(track); }
     #[cfg(not(target_os = "android"))]
-    { let _ = track; false }
+    { crate::audio_desktop::start(track) }
 }
 
 pub fn pause(track: u32) -> bool {
     #[cfg(target_os = "android")]
     { if use_audioclient() { return audioclient_path::pause(track); } return binder_path::pause(track); }
     #[cfg(not(target_os = "android"))]
-    { let _ = track; false }
+    { crate::audio_desktop::pause(track) }
 }
 
 pub fn close(track: u32) {
     #[cfg(target_os = "android")]
     { if use_audioclient() { audioclient_path::close(track); return; } binder_path::close(track); }
     #[cfg(not(target_os = "android"))]
-    { let _ = track; }
+    { crate::audio_desktop::close(track); }
 }
 
 /// Discard buffered (unplayed) frames now (wasi:audio playback.flush / seek).
@@ -1903,7 +1903,7 @@ pub fn flush(track: u32) -> bool {
     #[cfg(target_os = "android")]
     { if use_audioclient() { return audioclient_path::flush(track); } return binder_path::flush(track); }
     #[cfg(not(target_os = "android"))]
-    { let _ = track; false }
+    { crate::audio_desktop::flush(track) }
 }
 
 /// Play out buffered frames then stop (wasi:audio playback.drain).
@@ -1911,28 +1911,28 @@ pub fn drain(track: u32) -> bool {
     #[cfg(target_os = "android")]
     { if use_audioclient() { return audioclient_path::drain(track); } return binder_path::drain(track); }
     #[cfg(not(target_os = "android"))]
-    { let _ = track; false }
+    { crate::audio_desktop::drain(track) }
 }
 
 pub fn pending_frames(track: u32) -> u32 {
     #[cfg(target_os = "android")]
     { if use_audioclient() { return audioclient_path::pending_frames(track); } return binder_path::pending_frames(track); }
     #[cfg(not(target_os = "android"))]
-    { let _ = track; 0 }
+    { crate::audio_desktop::pending_frames(track) }
 }
 
 pub fn open_capture(cfg: TrackConfig) -> u32 {
     #[cfg(target_os = "android")]
     { if use_audioclient() { return audioclient_path::create_capture(cfg); } return binder_path::create_capture(cfg); }
     #[cfg(not(target_os = "android"))]
-    { let _ = cfg; 0 }
+    { crate::audio_desktop::open_capture(cfg) }
 }
 
 pub fn read_pcm_f32(capture: u32, max_frames: u32) -> Vec<f32> {
     #[cfg(target_os = "android")]
     { if use_audioclient() { return audioclient_path::read_pcm_f32(capture, max_frames); } return binder_path::read_pcm_f32(capture, max_frames); }
     #[cfg(not(target_os = "android"))]
-    { let _ = (capture, max_frames); Vec::new() }
+    { crate::audio_desktop::read_pcm_f32(capture, max_frames) }
 }
 
 /// Task 98 — exercise the WIT audio path end-to-end through the backend-dispatch
