@@ -301,7 +301,7 @@ impl SkiaRenderer {
             // blit if GL init fails (older WSLg / no GL available).
             match Self::try_init_gl(&window, size) {
                 Ok((gl, surface)) => {
-                    log::info!("desktop present: GL via glutin ({}x{})", size.width, size.height);
+                    log::info!("desktop present: GL via glutin ({}x{}) scale={}", size.width, size.height, window.scale_factor());
                     return Ok(Self {
                         gl: Some(gl),
                         sb_surface: None,

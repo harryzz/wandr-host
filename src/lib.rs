@@ -741,7 +741,29 @@ impl ApplicationHandler for App {
         #[cfg(not(target_os = "android"))]
         if let Ok(spec) = std::env::var("WANDR_DESKTOP_SIZE") {
             if let Some((w, h)) = spec.split_once('x') {
-                if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                if let (Ok(mut w), Ok(mut h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                    // Clamp to the monitor work area. A request taller/wider than
+                    // the screen (common phone-shaped sizes like 1440x2880 on a
+                    // 1080p display) produces a window the compositor CLAMPS —
+                    // but winit keeps reporting the requested (unclamped) size,
+                    // so the guest lays out for the full request and looks
+                    // oversized in the visible window until a manual maximize
+                    // (which finally emits a real `Resized`). Keep the phone
+                    // ASPECT while fitting the screen so the guest's logical
+                    // size == the on-screen window.
+                    if let Some(mon) = event_loop.primary_monitor() {
+                        let ms = mon.size();
+                        // Leave headroom for the title bar / WM chrome.
+                        let (cap_w, cap_h) = (ms.width.saturating_sub(16),
+                                              ms.height.saturating_sub(96));
+                        if cap_w > 0 && cap_h > 0 && (w > cap_w || h > cap_h) {
+                            let scale = (cap_w as f64 / w as f64)
+                                .min(cap_h as f64 / h as f64);
+                            w = ((w as f64 * scale) as u32).max(1);
+                            h = ((h as f64 * scale) as u32).max(1);
+                            log::info!("[geom] WANDR_DESKTOP_SIZE {spec} clamped to {w}x{h} (monitor {}x{})", ms.width, ms.height);
+                        }
+                    }
                     attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h));
                 }
             }
@@ -894,6 +916,32 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
 
             WindowEvent::RedrawRequested => {
+                // Desktop startup-size reconcile. On Wayland/WSLg winit reports
+                // the real surface size ASYNCHRONOUSLY (after the compositor's
+                // first configure) and often does NOT emit a `Resized` for it,
+                // so the renderer + guest are stuck at the creation-time size
+                // (the requested WANDR_DESKTOP_SIZE, which the compositor may
+                // clamp) until the user manually maximizes. The softbuffer
+                // present path self-reconciled but the default GL path did not
+                // — hence "UI too large until maximize". Poll the live
+                // inner_size each frame and, on a mismatch, resize the buffer
+                // AND re-dispatch to the guest (mirrors the `Resized` handler).
+                #[cfg(not(target_os = "android"))]
+                if let (Some(win), Some(s)) = (self.window.clone(), self.store.as_mut()) {
+                    let phys = win.inner_size();
+                    let (rw, rh) = {
+                        let r = &s.data().renderer;
+                        (r.width, r.height)
+                    };
+                    if phys.width != 0 && phys.height != 0
+                        && (phys.width != rw || phys.height != rh)
+                    {
+                        log::info!("[geom] frame reconcile {rw}x{rh} -> {}x{}", phys.width, phys.height);
+                        s.data_mut().renderer.resize(phys.width, phys.height);
+                        let _ = input::dispatch_resize_routed(s, &self.guest_input, phys.width, phys.height);
+                        win.request_redraw();
+                    }
+                }
                 if let Some(s) = self.store.as_mut() {
                     let sh = self.shell_events.as_ref();
                     // No init() call needed — appMain() runs on the first render-frame.
@@ -1074,6 +1122,8 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Resized(size) => {
+                log::info!("[geom] Resized -> {}x{} (scale={:?})", size.width, size.height,
+                    self.window.as_ref().map(|w| w.scale_factor()));
                 if let Some(r) = self.renderer_mut() {
                     r.resize(size.width, size.height);
                 }
