@@ -123,6 +123,24 @@ impl LoadedApp {
             .map(str::to_string)
     }
 
+    /// The app's display name (for the desktop window title). The manifest
+    /// `label` (e.g. "Signal"), else its `app_id`, else a generic default for
+    /// dev loads that have no manifest.
+    pub fn label(&self) -> String {
+        let doc = self.install_dir.as_ref()
+            .and_then(|dir| fs::read_to_string(dir.join("package.toml")).ok())
+            .and_then(|src| src.parse::<toml::Value>().ok());
+        if let Some(doc) = doc {
+            if let Some(l) = doc.get("label").and_then(|v| v.as_str()) {
+                return l.to_string();
+            }
+            if let Some(a) = doc.get("app_id").and_then(|v| v.as_str()) {
+                return a.to_string();
+            }
+        }
+        "wandr".to_string()
+    }
+
     /// Task 64 follow-up: per-app render-rate cap. Reads `max_fps` from the
     /// installed `package.toml` (top-level key, NOT in the AOT cache-key —
     /// same as `orientation`). Returns 60 when absent / out of range / for

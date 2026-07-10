@@ -749,7 +749,10 @@ impl ApplicationHandler for App {
         }
         // Desktop dev window size: `WANDR_DESKTOP_SIZE=WxH` (e.g. 480x960
         // for a phone-shaped viewport). winit/WM default otherwise.
-        let mut attrs = Window::default_attributes().with_title("WASM Android Runtime");
+        // Window title = the app's manifest label (e.g. "Signal"); falls back to
+        // "wandr" for dev loads with no manifest.
+        let title = self.loaded.as_ref().map(|l| l.label()).unwrap_or_else(|| "wandr".to_string());
+        let mut attrs = Window::default_attributes().with_title(title);
         // Desktop window frame (WSLg/Wayland). The ONLY frame source here is
         // winit's client-side `sctk_adwaita` decorations — weston advertises no
         // `xdg-decoration` (server-side) protocol. Those decorations are stable
