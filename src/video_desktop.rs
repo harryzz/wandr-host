@@ -14,7 +14,8 @@
 //! >640x480 tears; the call path uses 640x480, which is intact. Real cameras
 //! (device/native) handle 720p+.
 
-use std::collections::VecDeque;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg::format::Pixel;
@@ -28,6 +29,75 @@ use nokhwa::utils::{
 use nokhwa::Camera;
 
 use crate::video::{Codec, DecoderConfig, EncodedFrame, EncoderConfig, VideoError, VideoRect};
+
+// ── PiP self-view registry ───────────────────────────────────────────────────
+// The encoder captures the LOCAL camera; the host composites that frame at the
+// preview rect (the self-view). Encoder + render loop run on the same store
+// thread, so a thread_local slot carries the latest RGBA frame + rect + visible
+// across — no locking (mirrors audio_desktop's thread_local stream registry).
+// Android instead composites via a SurfaceView child surface; this is the
+// desktop analog, drawn onto the same Skia surface as the guest UI.
+struct Preview {
+    rgba: Vec<u8>, // tightly-packed RGBA8888, w*h*4 (empty until the first frame)
+    w: u32,
+    h: u32,
+    rect: VideoRect,
+    visible: bool,
+}
+
+thread_local! {
+    static PREVIEWS: RefCell<HashMap<u32, Preview>> = RefCell::new(HashMap::new());
+    static PREVIEW_NEXT: Cell<u32> = const { Cell::new(1) };
+}
+
+/// Composite every visible PiP self-view onto `canvas` — called by the
+/// wasi:canvas host `present` AFTER the guest UI (above-ui) and before swap.
+/// Rects are absolute surface pixels; the frame is mirrored (front-camera
+/// self-view convention).
+pub fn composite_previews(canvas: &skia_safe::Canvas) {
+    PREVIEWS.with(|m| {
+        for p in m.borrow().values() {
+            if !p.visible || p.rgba.is_empty() || p.rect.w <= 0 || p.rect.h <= 0 {
+                continue;
+            }
+            let info = skia_safe::ImageInfo::new(
+                (p.w as i32, p.h as i32),
+                skia_safe::ColorType::RGBA8888,
+                skia_safe::AlphaType::Unpremul,
+                None,
+            );
+            let data = skia_safe::Data::new_copy(&p.rgba);
+            let Some(img) = skia_safe::images::raster_from_data(&info, data, (p.w * 4) as usize)
+            else {
+                continue;
+            };
+            let dst = skia_safe::Rect::from_xywh(
+                p.rect.x as f32, p.rect.y as f32, p.rect.w as f32, p.rect.h as f32,
+            );
+            let mut paint = skia_safe::Paint::default();
+            paint.set_anti_alias(true);
+            canvas.save();
+            canvas.reset_matrix();
+            // Mirror horizontally in place: x → (left+right) − x.
+            canvas.translate((dst.left + dst.right, 0.0));
+            canvas.scale((-1.0, 1.0));
+            canvas.draw_image_rect(&img, None, dst, &paint);
+            canvas.restore();
+        }
+    });
+}
+
+fn alloc_preview(rect: VideoRect) -> u32 {
+    let id = PREVIEW_NEXT.with(|n| {
+        let v = n.get();
+        n.set(v.wrapping_add(1).max(1));
+        v
+    });
+    PREVIEWS.with(|m| {
+        m.borrow_mut().insert(id, Preview { rgba: Vec::new(), w: 0, h: 0, rect, visible: true });
+    });
+    id
+}
 
 /// No binder off-Android (the Android path spins up an rsbinder threadpool for
 /// the camera/codec HAL; desktop nokhwa/ffmpeg need none).
@@ -80,6 +150,18 @@ pub struct VideoEncoder {
     pts: i64,
     force_keyframe: bool,
     pending: VecDeque<EncodedFrame>,
+    /// PiP self-view slot in PREVIEWS (Some iff opened with a preview rect).
+    preview_id: Option<u32>,
+}
+
+impl Drop for VideoEncoder {
+    fn drop(&mut self) {
+        if let Some(id) = self.preview_id {
+            PREVIEWS.with(|m| {
+                m.borrow_mut().remove(&id);
+            });
+        }
+    }
 }
 
 // The store is single-threaded on desktop (winit loop / run-once command); the
@@ -140,9 +222,12 @@ impl VideoEncoder {
             .map_err(|_| VideoError::CodecInitFailed)?;
         let rgb = FfVideoFrame::new(Pixel::RGB24, cam_w, cam_h);
 
+        // PiP self-view: register a slot the render loop composites (above-ui).
+        let preview_id = config.preview.map(alloc_preview);
+
         Ok(Self {
             camera, scaler, encoder, rgb, cam_w, cam_h, fps,
-            pts: 0, force_keyframe: false, pending: VecDeque::new(),
+            pts: 0, force_keyframe: false, pending: VecDeque::new(), preview_id,
         })
     }
 
@@ -171,6 +256,25 @@ impl VideoEncoder {
             for y in 0..self.cam_h as usize {
                 data[y * stride..y * stride + w3].copy_from_slice(&src[y * w3..y * w3 + w3]);
             }
+        }
+        // PiP self-view: hand the render loop the latest camera frame as RGBA.
+        if let Some(id) = self.preview_id {
+            let (w, h) = (self.cam_w, self.cam_h);
+            let rgb = img.as_raw();
+            let mut rgba = vec![0u8; (w * h * 4) as usize];
+            for i in 0..(w * h) as usize {
+                rgba[i * 4] = rgb[i * 3];
+                rgba[i * 4 + 1] = rgb[i * 3 + 1];
+                rgba[i * 4 + 2] = rgb[i * 3 + 2];
+                rgba[i * 4 + 3] = 255;
+            }
+            PREVIEWS.with(|m| {
+                if let Some(p) = m.borrow_mut().get_mut(&id) {
+                    p.rgba = rgba;
+                    p.w = w;
+                    p.h = h;
+                }
+            });
         }
         let mut yuv = FfVideoFrame::empty();
         if self.scaler.run(&self.rgb, &mut yuv).is_err() {
@@ -217,8 +321,25 @@ impl VideoEncoder {
         // reconfigure; the desktop path is best-effort (the device honors REMB).
     }
 
-    pub fn set_preview_rect(&mut self, _rect: VideoRect) {} // no desktop compositing yet
-    pub fn set_preview_visible(&mut self, _visible: bool) {}
+    pub fn set_preview_rect(&mut self, rect: VideoRect) {
+        if let Some(id) = self.preview_id {
+            PREVIEWS.with(|m| {
+                if let Some(p) = m.borrow_mut().get_mut(&id) {
+                    p.rect = rect;
+                }
+            });
+        }
+    }
+
+    pub fn set_preview_visible(&mut self, visible: bool) {
+        if let Some(id) = self.preview_id {
+            PREVIEWS.with(|m| {
+                if let Some(p) = m.borrow_mut().get_mut(&id) {
+                    p.visible = visible;
+                }
+            });
+        }
+    }
 
     pub fn display_rotation(&self) -> u32 {
         0 // desktop webcams are upright

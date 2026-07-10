@@ -1344,6 +1344,11 @@ impl wit_embedding::HostCanvasContext for HostState {
     }
 
     fn present(&mut self, _self_: Resource<CanvasContextRes>) -> wasmtime::Result<()> {
+        // PiP self-view (desktop): composite the local camera over the guest UI
+        // (above-ui) before swap. Android composites via a SurfaceView child
+        // surface instead; here it's drawn onto the same Skia surface.
+        #[cfg(not(target_os = "android"))]
+        crate::video_desktop::composite_previews(self.renderer.canvas());
         self.renderer.flush_and_swap();
         Ok(())
     }

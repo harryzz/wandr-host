@@ -25,6 +25,17 @@ fn main() {
             }
         }
     }
+    // Desktop `--camera-shot <outfile.png>`: verify PiP self-view compositing.
+    if let Some(i) = args.iter().position(|a| a == "--camera-shot") {
+        let _ = env_logger::builder().try_init();
+        let out = args.get(i + 1).map(String::as_str).unwrap_or("camera-shot.png");
+        if let Err(e) = wasm_android_host::camera_preview_shot(out) {
+            eprintln!("wandr-host --camera-shot: {e:#}");
+            std::process::exit(1);
+        }
+        println!("camera-shot: wrote {out}");
+        return;
+    }
     // Desktop `--run-once <app-id>`: one-shot a wasi:cli/command guest from
     // WANDR_APPS_ROOT (e.g. wandr.video.test), same as the device path. Headless
     // — no winit window. Mirrors the android main's --run-once branch.

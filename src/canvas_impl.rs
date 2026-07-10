@@ -365,6 +365,15 @@ impl SkiaRenderer {
         })
     }
 
+    /// Snapshot the current surface to PNG bytes (desktop diagnostics — e.g. the
+    /// `--camera-shot` PiP-compositing check). Raster surface = a plain readback.
+    #[cfg(not(target_os = "android"))]
+    pub fn snapshot_png(&mut self) -> Option<Vec<u8>> {
+        let image = self.surface.image_snapshot();
+        let data = image.encode_to_data(skia_safe::EncodedImageFormat::PNG)?;
+        Some(data.as_bytes().to_vec())
+    }
+
     /// Build a renderer directly on a raw `ANativeWindow*`, bypassing winit.
     /// Used by the task-33 standalone (no-`NativeActivity`) mode, where the
     /// window comes from SurfaceFlinger via the `libsf_surface` shim. The
