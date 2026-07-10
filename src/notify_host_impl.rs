@@ -13,7 +13,7 @@
 //! line (the arbiter decodes them; mirror of `wandr_arbiter_notify::pct_decode`).
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use crate::arbiter_sock::UnixStream;
 
 use crate::notify_host_bindings::wandr::notify::notifier::Host as NotifierHost;
 use crate::notify_host_bindings::wandr::notify::notify_feed::{Host as FeedHost, Notification};

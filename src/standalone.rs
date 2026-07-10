@@ -322,7 +322,7 @@ pub fn run_with_engine(engine: &Engine, app_id: Option<&str>, mode: OverlayMode)
 /// the fire-and-forget shape shared by the chrome-coherence reports.
 fn send_arbiter_oneshot(line: &str) -> std::io::Result<String> {
     use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
+    use crate::arbiter_sock::UnixStream;
     let mut stream = UnixStream::connect(crate::arbiter_sock::arbiter_sock_path())?;
     stream.write_all(line.as_bytes())?;
     stream.flush()?;

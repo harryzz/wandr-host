@@ -18,6 +18,10 @@ fn main() {
         .file("cpp/wasi_drawable.cpp")
         .include(skia_include)
         .flag_if_supported("-std=c++17")
+        // MSVC spells the C++17 switch differently; flag_if_supported drops
+        // whichever the active compiler rejects, so both gcc/clang and MSVC get
+        // C++17 (the Windows desktop host builds the shim with MSVC).
+        .flag_if_supported("/std:c++17")
         .flag_if_supported("-fno-exceptions")
         .flag_if_supported("-fno-rtti");
 
@@ -59,7 +63,13 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/wasi_drawable.cpp");
     println!("cargo:rerun-if-changed=cpp/wasi_drawable.h");
 
-    // ── Android sysroot link config (unchanged) ──────────────────────────────
+    // ── Android sysroot link config + AIDL codegen ───────────────────────────
+    // Gated to a non-Windows *host*: build scripts compile for the host, and the
+    // `rsbinder_aidl` codegen crate (a non-Windows build-dep) is only present
+    // then. Android is always cross-compiled from a Linux host, so this stays for
+    // both linux-desktop and android targets; on a Windows host it compiles out
+    // (Windows never targets Android, and the shim above already built).
+    #[cfg(not(windows))]
     if target_os == "android" {
         let ndk = std::env::var("ANDROID_NDK_HOME")
             .or_else(|_| std::env::var("NDK_HOME"))

@@ -383,11 +383,39 @@ impl wit_draw::HostGraphics for HostState {
         _self_: Resource<GraphicsRes>,
         bytes: Vec<u8>,
     ) -> wasmtime::Result<Result<Resource<ImageRes>, ()>> {
+        // Fast path: Skia's built-in codecs (Android device, most desktop Skia).
         let data = skia_safe::Data::new_copy(&bytes);
-        match skia_safe::Image::from_encoded(data) {
-            Some(img) => Ok(Ok(self.table.push(ImageRes(img))?)),
-            None => Ok(Err(())),
+        if let Some(img) = skia_safe::Image::from_encoded(data) {
+            return Ok(Ok(self.table.push(ImageRes(img))?));
         }
+        // Fallback (desktop only): some prebuilt Skia builds — notably the one
+        // linked into the Windows host — ship with no registered image decoders
+        // (the MSVC linker drops SkJpegDecoder et al., whose self-registration
+        // has no externally-referenced symbol), so `from_encoded` returns None
+        // for every encoded image. Decode with the pure-Rust `image` crate and
+        // hand Skia raw RGBA via raster_from_data — no dependency on Skia's codec
+        // registry. Android's Skia always has its codecs, so this is compiled out
+        // there (and `image` is a desktop-only dep).
+        #[cfg(not(target_os = "android"))]
+        {
+            if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                let rgba = dyn_img.to_rgba8();
+                let (w, h) = (rgba.width(), rgba.height());
+                let info = skia_safe::ImageInfo::new(
+                    (w as i32, h as i32),
+                    skia_safe::ColorType::RGBA8888,
+                    skia_safe::AlphaType::Unpremul,
+                    None,
+                );
+                let data = skia_safe::Data::new_copy(rgba.as_raw());
+                if let Some(img) =
+                    skia_safe::images::raster_from_data(&info, data, (w * 4) as usize)
+                {
+                    return Ok(Ok(self.table.push(ImageRes(img))?));
+                }
+            }
+        }
+        Ok(Err(()))
     }
 
     fn image_from_rgba8(

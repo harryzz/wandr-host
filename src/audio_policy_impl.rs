@@ -704,7 +704,7 @@ pub fn get_media_volume_level(_speaker: bool) -> f32 { 1.0 }
 #[cfg(target_os = "android")]
 pub fn forward_volume_key(up: bool) {
     use std::io::Write;
-    use std::os::unix::net::UnixStream;
+    use crate::arbiter_sock::UnixStream;
     // Include our pid so the arbiter can target this (live) host when there is
     // no Foreground slot (e.g. keyguard locked). During a call the arbiter
     // overrides this to the comms owner on the call route.
@@ -725,7 +725,7 @@ pub fn forward_volume_key(_up: bool) {}
 #[cfg(target_os = "android")]
 pub fn forward_power_key() {
     use std::io::Write;
-    use std::os::unix::net::UnixStream;
+    use crate::arbiter_sock::UnixStream;
     let line = format!("power-key {}\n", std::process::id());
     match UnixStream::connect(crate::arbiter_sock::arbiter_sock_path()) {
         Ok(mut s) => { let _ = s.write_all(line.as_bytes()); let _ = s.flush(); }
@@ -741,7 +741,7 @@ pub fn forward_power_key() {}
 #[cfg(target_os = "android")]
 fn forward_line(line: &[u8]) {
     use std::io::Write;
-    use std::os::unix::net::UnixStream;
+    use crate::arbiter_sock::UnixStream;
     if let Ok(mut s) = UnixStream::connect(crate::arbiter_sock::arbiter_sock_path()) {
         let _ = s.write_all(line);
         let _ = s.flush();

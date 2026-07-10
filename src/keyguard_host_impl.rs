@@ -4,7 +4,7 @@
 //! restores the covered app.
 
 use std::io::Write;
-use std::os::unix::net::UnixStream;
+use crate::arbiter_sock::UnixStream;
 
 use crate::keyguard_host_bindings::wandr::keyguard::keyguard::Host;
 

@@ -38,8 +38,14 @@ impl Host for crate::HostState {
         // relinking toybox ≈ 4% of a core, the statusbar's dominant idle cost.
         let t = unsafe { libc::time(std::ptr::null_mut()) };
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
-            log::warn!("status: localtime_r failed");
+        // localtime_r on unix; Windows' CRT spells it localtime_s (args reversed,
+        // returns errno_t). Both fill `tm` in local time.
+        #[cfg(unix)]
+        let failed = unsafe { libc::localtime_r(&t, &mut tm) }.is_null();
+        #[cfg(not(unix))]
+        let failed = unsafe { libc::localtime_s(&mut tm, &t) } != 0;
+        if failed {
+            log::warn!("status: localtime failed");
             return String::new();
         }
         format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)

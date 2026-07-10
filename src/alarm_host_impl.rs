@@ -14,7 +14,7 @@
 //! delivered `alarm-fired` (a headless poll kind is a Signal follow-up).
 
 use std::io::Write;
-use std::os::unix::net::UnixStream;
+use crate::arbiter_sock::UnixStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::alarm_host_bindings::wandr::alarm::scheduler::Host;

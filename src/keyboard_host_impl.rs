@@ -14,7 +14,7 @@
 //! `KeyEvent` — same code path a hardware key press takes.
 
 use std::io::Write;
-use std::os::unix::net::UnixStream;
+use crate::arbiter_sock::UnixStream;
 
 use crate::keyboard_send_bindings::wandr::ime::keyboard_send::Host;
 

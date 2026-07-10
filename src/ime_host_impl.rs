@@ -13,7 +13,7 @@
 //! can push events INTO running children. Step 2 is one-way only.
 
 use std::io::Write;
-use std::os::unix::net::UnixStream;
+use crate::arbiter_sock::UnixStream;
 
 use crate::ui_shell_bindings::wandr::ui_shell::ime::Host;
 

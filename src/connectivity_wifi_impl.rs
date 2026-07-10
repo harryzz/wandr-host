@@ -18,7 +18,7 @@
 //! the wire so they tokenise cleanly across the host→arbiter→daemon hops.
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use crate::arbiter_sock::UnixStream;
 
 use crate::wifi_host_bindings::wandr::connectivity::wifi::{
     Host, SavedNetwork, ScanResult, SecurityKind, WifiConfig,

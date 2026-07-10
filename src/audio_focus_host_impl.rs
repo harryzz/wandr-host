@@ -13,7 +13,7 @@
 //! side. Mirrors `alarm_host_impl` / `notify_host_impl`.
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use crate::arbiter_sock::UnixStream;
 
 use crate::audio_focus_host_bindings::wandr::audio_focus::focus::{
     FocusKind, FocusResult, Host,

@@ -27,6 +27,7 @@ mod pointer_icon_impl;
 mod input;
 mod binder;
 mod binder_aidl;
+#[cfg(unix)]
 mod binder_shared_memory;
 mod display_impl;
 pub mod ime_impl;
@@ -55,6 +56,7 @@ pub mod zygote;
 mod preload;
 #[cfg(target_os = "android")]
 mod app_role;
+#[cfg(unix)]
 mod eventfd_signal;
 mod assets_impl;
 mod theme_impl;

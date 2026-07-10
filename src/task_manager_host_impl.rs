@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use crate::arbiter_sock::UnixStream;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -36,8 +36,12 @@ static CPU_SAMPLES: Mutex<Option<HashMap<u32, (u64, Instant)>>> = Mutex::new(Non
 fn clk_tck() -> u64 {
     // SAFETY: sysconf with a static name is always safe; clamp the (always
     // positive on Linux) result and fall back to the universal 100.
-    let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if v > 0 { v as u64 } else { 100 }
+    #[cfg(unix)]
+    { let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }; if v > 0 { v as u64 } else { 100 } }
+    // Windows has no /proc and no sysconf; this task-manager path is unix-only,
+    // so the universal CLK_TCK fallback is never actually consumed there.
+    #[cfg(not(unix))]
+    { 100 }
 }
 
 /// Connect to the arbiter, write one line, read the WHOLE reply to EOF (the

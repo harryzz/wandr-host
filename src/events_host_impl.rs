@@ -11,7 +11,7 @@
 //! registers it with the arbiter (`evt-subscribe`); see `standalone.rs`.
 
 use std::io::Write;
-use std::os::unix::net::UnixStream;
+use crate::arbiter_sock::UnixStream;
 
 use crate::events_host_bindings::wandr::events::producer::Host;
 use crate::events_host_bindings::wandr::events::types::Message;

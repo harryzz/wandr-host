@@ -18,7 +18,7 @@
 //! bytes are base64'd (reusing `events_host_impl::b64_encode`).
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use crate::arbiter_sock::UnixStream;
 
 use crate::chrome_bindings::wandr::chrome::now_playing::{
     Action, Host as NowPlayingHost, NowPlayingInfo, PlaybackState as ChromePlaybackState,

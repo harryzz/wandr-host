@@ -128,7 +128,14 @@ softbuffer = "0.4.8"
 # RDP → Windows. We deliberately do NOT enable `pipewire`: on WSLg the local
 # PipeWire exposes only a Dummy Output (a null sink), so default_host() would
 # pick it and play to nowhere. See src/audio_desktop.rs.
-cpal = { version = "0.18", features = ["pulseaudio"] }
+# The `pulseaudio` feature is Linux-only (added in the cfg(linux) block below via
+# feature unification); on Windows it's useless (WASAPI) and its pure-Rust
+# `pulseaudio` crate doesn't build there, so the base dep here stays plain.
+cpal = { version = "0.18" }
+# Pure-Rust image decoders — desktop fallback for the wasi:canvas `decode-image`
+# verb when the linked Skia has no registered codecs (the Windows prebuilt). See
+# decode_image in wasi_canvas_002_impl.rs. Already transitively present via nokhwa.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 # Desktop wandr:video backend — cross-platform camera capture (nokhwa: v4l2 Linux /
 # MediaFoundation Windows / AVFoundation macOS) + software VP8/VP9 via ffmpeg
 # (libvpx). ffmpeg-next 7.1 matches system ffmpeg 7.1 (libavcodec 61); only
@@ -137,8 +144,20 @@ cpal = { version = "0.18", features = ["pulseaudio"] }
 nokhwa = { version = "0.10", features = ["input-native"] }
 ffmpeg-next = { version = "7.1", default-features = false, features = ["codec", "format", "software-scaling"] }
 
+# Linux-only: add cpal's pure-Rust PulseAudio host on top of the plain cpal above
+# (cargo unions features across target tables). This is the WSLg audio path
+# (cpal → $PULSE_SERVER). Windows/macOS deliberately stay on cpal's default host.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18", features = ["pulseaudio"] }
+
 [build-dependencies]
 cc = "1"
+
+# rsbinder-aidl is the AIDL codegen crate used by build.rs. Build scripts compile
+# for the HOST, and Android is cross-compiled from a Linux host — so this dep is
+# needed for both linux-desktop and android targets, and only excluded on a
+# Windows host (where build.rs cfg's the codegen out; the shim still builds).
+[target.'cfg(not(target_os = "windows"))'.build-dependencies]
 rsbinder-aidl = { git = "https://github.com/hiking90/rsbinder", rev = "5e999e04a" }   # task 76 #6 trial
 
 # Task 98 — rsbinder + recursive Box-array support (2 missing SerializeArray/
