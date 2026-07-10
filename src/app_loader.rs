@@ -141,12 +141,16 @@ fn expand_host_path(raw: &str) -> PathBuf {
 pub fn apply_mounts(builder: &mut WasiCtxBuilder, mounts: &[Mount]) {
     let mut seen = std::collections::HashSet::new();
     for m in mounts {
-        if !seen.insert(m.guest.as_str()) {
-            log::warn!("mounts: duplicate guest path {} — skipping", m.guest);
-            continue;
-        }
+        // Host-existence check BEFORE the dedup, so an absent host dir doesn't
+        // consume its guest path — lets an app list per-platform alternatives
+        // for the same guest (e.g. ~/Music and /data/media/0/Music → /music),
+        // where only the one that exists on this OS is mounted.
         if !m.host.is_dir() {
             log::info!("mounts: host dir {} absent — skipping {}", m.host.display(), m.guest);
+            continue;
+        }
+        if !seen.insert(m.guest.as_str()) {
+            log::warn!("mounts: duplicate guest path {} — skipping", m.guest);
             continue;
         }
         let (dperm, fperm) = if m.write {
