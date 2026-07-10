@@ -365,6 +365,15 @@ impl SkiaRenderer {
         })
     }
 
+    /// The window's display scale factor (1.0 on a 1:1 desktop; true HiDPI on a
+    /// retina display). Reported to guests as the UI density via
+    /// `wandr:ui-shell/metrics.get-density`, so a dioxus/Slint app scales to the
+    /// real display instead of the old hardcoded 2.0. Headless (no window) = 1.0.
+    #[cfg(not(target_os = "android"))]
+    pub fn scale_factor(&self) -> f64 {
+        self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0)
+    }
+
     /// Snapshot the current surface to PNG bytes (desktop diagnostics — e.g. the
     /// `--camera-shot` PiP-compositing check). Raster surface = a plain readback.
     #[cfg(not(target_os = "android"))]
