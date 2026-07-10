@@ -37,66 +37,112 @@ use crate::video::{Codec, DecoderConfig, EncodedFrame, EncoderConfig, VideoError
 // across — no locking (mirrors audio_desktop's thread_local stream registry).
 // Android instead composites via a SurfaceView child surface; this is the
 // desktop analog, drawn onto the same Skia surface as the guest UI.
-struct Preview {
+/// A composited video surface: the encoder's PiP self-view (mirrored) OR the
+/// decoder's remote stream (upright, possibly rotated). Both draw onto the same
+/// Skia surface as the guest UI (above-ui) — the desktop analog of Android's
+/// SurfaceView child surfaces. z-layer (behind/above-ui) isn't distinguished yet:
+/// everything composites above the UI.
+struct VideoSurface {
     rgba: Vec<u8>, // tightly-packed RGBA8888, w*h*4 (empty until the first frame)
     w: u32,
     h: u32,
     rect: VideoRect,
     visible: bool,
+    /// Mirror horizontally — the front-camera self-view convention; false for
+    /// remote video.
+    mirror: bool,
+    /// Degrees CW to rotate for upright display (the decoder's peer-CVO rotation;
+    /// 0 for the self-view preview).
+    rotation: u32,
 }
 
 thread_local! {
-    static PREVIEWS: RefCell<HashMap<u32, Preview>> = RefCell::new(HashMap::new());
-    static PREVIEW_NEXT: Cell<u32> = const { Cell::new(1) };
+    static SURFACES: RefCell<HashMap<u32, VideoSurface>> = RefCell::new(HashMap::new());
+    static SURFACE_NEXT: Cell<u32> = const { Cell::new(1) };
 }
 
-/// Composite every visible PiP self-view onto `canvas` — called by the
+/// Composite every visible video surface onto `canvas` — called by the
 /// wasi:canvas host `present` AFTER the guest UI (above-ui) and before swap.
-/// Rects are absolute surface pixels; the frame is mirrored (front-camera
-/// self-view convention).
-pub fn composite_previews(canvas: &skia_safe::Canvas) {
-    PREVIEWS.with(|m| {
-        for p in m.borrow().values() {
-            if !p.visible || p.rgba.is_empty() || p.rect.w <= 0 || p.rect.h <= 0 {
+/// Rects are absolute surface pixels.
+pub fn composite_video_surfaces(canvas: &skia_safe::Canvas) {
+    SURFACES.with(|m| {
+        for s in m.borrow().values() {
+            if !s.visible || s.rgba.is_empty() || s.rect.w <= 0 || s.rect.h <= 0 {
                 continue;
             }
             let info = skia_safe::ImageInfo::new(
-                (p.w as i32, p.h as i32),
+                (s.w as i32, s.h as i32),
                 skia_safe::ColorType::RGBA8888,
                 skia_safe::AlphaType::Unpremul,
                 None,
             );
-            let data = skia_safe::Data::new_copy(&p.rgba);
-            let Some(img) = skia_safe::images::raster_from_data(&info, data, (p.w * 4) as usize)
+            let data = skia_safe::Data::new_copy(&s.rgba);
+            let Some(img) = skia_safe::images::raster_from_data(&info, data, (s.w * 4) as usize)
             else {
                 continue;
             };
             let dst = skia_safe::Rect::from_xywh(
-                p.rect.x as f32, p.rect.y as f32, p.rect.w as f32, p.rect.h as f32,
+                s.rect.x as f32, s.rect.y as f32, s.rect.w as f32, s.rect.h as f32,
             );
             let mut paint = skia_safe::Paint::default();
             paint.set_anti_alias(true);
             canvas.save();
             canvas.reset_matrix();
-            // Mirror horizontally in place: x → (left+right) − x.
-            canvas.translate((dst.left + dst.right, 0.0));
-            canvas.scale((-1.0, 1.0));
+            // Peer CVO rotation, about the rect centre (no-op for the preview).
+            if s.rotation % 360 != 0 {
+                canvas.rotate(
+                    s.rotation as f32,
+                    Some(skia_safe::Point::new(dst.center_x(), dst.center_y())),
+                );
+            }
+            if s.mirror {
+                // Mirror horizontally in place: x → (left+right) − x.
+                canvas.translate((dst.left + dst.right, 0.0));
+                canvas.scale((-1.0, 1.0));
+            }
             canvas.draw_image_rect(&img, None, dst, &paint);
             canvas.restore();
         }
     });
 }
 
-fn alloc_preview(rect: VideoRect) -> u32 {
-    let id = PREVIEW_NEXT.with(|n| {
+fn alloc_surface(rect: VideoRect, mirror: bool, rotation: u32) -> u32 {
+    let id = SURFACE_NEXT.with(|n| {
         let v = n.get();
         n.set(v.wrapping_add(1).max(1));
         v
     });
-    PREVIEWS.with(|m| {
-        m.borrow_mut().insert(id, Preview { rgba: Vec::new(), w: 0, h: 0, rect, visible: true });
+    SURFACES.with(|m| {
+        m.borrow_mut().insert(id, VideoSurface {
+            rgba: Vec::new(), w: 0, h: 0, rect, visible: true, mirror, rotation,
+        });
     });
     id
+}
+
+/// Update a surface's pixels (from the encoder capture / decoder output).
+fn surface_set_frame(id: u32, rgba: Vec<u8>, w: u32, h: u32) {
+    SURFACES.with(|m| {
+        if let Some(s) = m.borrow_mut().get_mut(&id) {
+            s.rgba = rgba;
+            s.w = w;
+            s.h = h;
+        }
+    });
+}
+
+fn surface_with<F: FnOnce(&mut VideoSurface)>(id: u32, f: F) {
+    SURFACES.with(|m| {
+        if let Some(s) = m.borrow_mut().get_mut(&id) {
+            f(s);
+        }
+    });
+}
+
+fn surface_remove(id: u32) {
+    SURFACES.with(|m| {
+        m.borrow_mut().remove(&id);
+    });
 }
 
 /// No binder off-Android (the Android path spins up an rsbinder threadpool for
@@ -150,16 +196,14 @@ pub struct VideoEncoder {
     pts: i64,
     force_keyframe: bool,
     pending: VecDeque<EncodedFrame>,
-    /// PiP self-view slot in PREVIEWS (Some iff opened with a preview rect).
+    /// PiP self-view surface (Some iff opened with a preview rect).
     preview_id: Option<u32>,
 }
 
 impl Drop for VideoEncoder {
     fn drop(&mut self) {
         if let Some(id) = self.preview_id {
-            PREVIEWS.with(|m| {
-                m.borrow_mut().remove(&id);
-            });
+            surface_remove(id);
         }
     }
 }
@@ -223,7 +267,8 @@ impl VideoEncoder {
         let rgb = FfVideoFrame::new(Pixel::RGB24, cam_w, cam_h);
 
         // PiP self-view: register a slot the render loop composites (above-ui).
-        let preview_id = config.preview.map(alloc_preview);
+        // Self-view surface: mirrored, upright (rotation 0).
+        let preview_id = config.preview.map(|rect| alloc_surface(rect, true, 0));
 
         Ok(Self {
             camera, scaler, encoder, rgb, cam_w, cam_h, fps,
@@ -268,13 +313,7 @@ impl VideoEncoder {
                 rgba[i * 4 + 2] = rgb[i * 3 + 2];
                 rgba[i * 4 + 3] = 255;
             }
-            PREVIEWS.with(|m| {
-                if let Some(p) = m.borrow_mut().get_mut(&id) {
-                    p.rgba = rgba;
-                    p.w = w;
-                    p.h = h;
-                }
-            });
+            surface_set_frame(id, rgba, w, h);
         }
         let mut yuv = FfVideoFrame::empty();
         if self.scaler.run(&self.rgb, &mut yuv).is_err() {
@@ -323,21 +362,13 @@ impl VideoEncoder {
 
     pub fn set_preview_rect(&mut self, rect: VideoRect) {
         if let Some(id) = self.preview_id {
-            PREVIEWS.with(|m| {
-                if let Some(p) = m.borrow_mut().get_mut(&id) {
-                    p.rect = rect;
-                }
-            });
+            surface_with(id, |s| s.rect = rect);
         }
     }
 
     pub fn set_preview_visible(&mut self, visible: bool) {
         if let Some(id) = self.preview_id {
-            PREVIEWS.with(|m| {
-                if let Some(p) = m.borrow_mut().get_mut(&id) {
-                    p.visible = visible;
-                }
-            });
+            surface_with(id, |s| s.visible = visible);
         }
     }
 
@@ -346,11 +377,19 @@ impl VideoEncoder {
     }
 }
 
-// ── decoder (decode-to-buffer) ────────────────────────────────────────────────
+// ── decoder (decode-to-surface, or decode-to-buffer when rect is empty) ───────
 
 pub struct VideoDecoder {
     decoder: ffmpeg::decoder::Video,
     decoded: u64,
+    /// Compositing surface (Some iff opened with a real rect = decode-to-surface).
+    /// None = decode-to-buffer: frames are counted + dropped (the Phase-1 loopback
+    /// diagnostic; `wandr.video.test` Part 1).
+    surface_id: Option<u32>,
+    /// YUV→RGBA scaler, (re)built lazily to match the decoded frame's size (VP8
+    /// keyframes carry their own dimensions, which can change mid-stream).
+    scaler: Option<Scaler>,
+    scaler_dims: (u32, u32),
 }
 
 unsafe impl Send for VideoDecoder {}
@@ -366,10 +405,42 @@ impl VideoDecoder {
                 log::warn!("video_desktop: decoder open failed: {e:?}");
                 VideoError::CodecInitFailed
             })?;
-        if config.rect.map(|r| r.w > 0 && r.h > 0).unwrap_or(false) {
-            log::info!("video_desktop: decode-to-surface not yet supported — decode-to-buffer");
+        // A real rect = decode-to-SURFACE (composite on screen, upright per the
+        // peer's CVO rotation); empty/None = decode-to-buffer (count only).
+        let surface_id = config.rect.filter(|r| r.w > 0 && r.h > 0).map(|rect| {
+            log::info!("video_desktop: decode-to-surface {}x{} @ ({},{}) rot={}°",
+                rect.w, rect.h, rect.x, rect.y, config.rotation);
+            alloc_surface(rect, false, config.rotation)
+        });
+        Ok(Self { decoder, decoded: 0, surface_id, scaler: None, scaler_dims: (0, 0) })
+    }
+
+    /// Convert one decoded YUV frame to RGBA and hand it to the compositor.
+    fn composite_frame(&mut self, frame: &FfVideoFrame) {
+        let Some(id) = self.surface_id else { return };
+        let (w, h) = (frame.width(), frame.height());
+        if w == 0 || h == 0 {
+            return;
         }
-        Ok(Self { decoder, decoded: 0 })
+        if self.scaler.is_none() || self.scaler_dims != (w, h) {
+            match Scaler::get(frame.format(), w, h, Pixel::RGBA, w, h, Flags::BILINEAR) {
+                Ok(s) => { self.scaler = Some(s); self.scaler_dims = (w, h); }
+                Err(e) => { log::warn!("video_desktop: decode scaler: {e:?}"); return; }
+            }
+        }
+        let mut rgba_frame = FfVideoFrame::empty();
+        if self.scaler.as_mut().unwrap().run(frame, &mut rgba_frame).is_err() {
+            return;
+        }
+        // Tightly pack RGBA (drop the aligned row stride) for skia raster upload.
+        let stride = rgba_frame.stride(0);
+        let src = rgba_frame.data(0);
+        let w4 = w as usize * 4;
+        let mut rgba = vec![0u8; w4 * h as usize];
+        for y in 0..h as usize {
+            rgba[y * w4..y * w4 + w4].copy_from_slice(&src[y * stride..y * stride + w4]);
+        }
+        surface_set_frame(id, rgba, w, h);
     }
 
     pub fn submit(&mut self, data: &[u8], _timestamp: u32) -> Result<(), VideoError> {
@@ -378,6 +449,7 @@ impl VideoDecoder {
         let mut frame = FfVideoFrame::empty();
         while self.decoder.receive_frame(&mut frame).is_ok() {
             self.decoded += 1;
+            self.composite_frame(&frame);
         }
         Ok(())
     }
@@ -386,7 +458,27 @@ impl VideoDecoder {
         self.decoded
     }
 
-    pub fn set_rect(&mut self, _rect: VideoRect) {}
-    pub fn set_visible(&mut self, _visible: bool) {}
-    pub fn set_rotation(&mut self, _degrees: u32) {}
+    pub fn set_rect(&mut self, rect: VideoRect) {
+        if let Some(id) = self.surface_id {
+            surface_with(id, |s| s.rect = rect);
+        }
+    }
+    pub fn set_visible(&mut self, visible: bool) {
+        if let Some(id) = self.surface_id {
+            surface_with(id, |s| s.visible = visible);
+        }
+    }
+    pub fn set_rotation(&mut self, degrees: u32) {
+        if let Some(id) = self.surface_id {
+            surface_with(id, |s| s.rotation = degrees);
+        }
+    }
+}
+
+impl Drop for VideoDecoder {
+    fn drop(&mut self) {
+        if let Some(id) = self.surface_id {
+            surface_remove(id);
+        }
+    }
 }

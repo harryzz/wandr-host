@@ -1590,13 +1590,17 @@ pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
 
 /// Desktop `--camera-shot <outfile.png>`: open the camera encoder with a PiP
 /// self-view rect, warm it, composite the self-view over a fake "guest UI" onto a
-/// headless surface, and write a PNG. Verifies the PiP-compositing path
-/// (`video_desktop::composite_previews`) without a GUI guest.
+/// headless surface, and write a PNG. Verifies the compositing path
+/// (`video_desktop::composite_video_surfaces`) without a GUI guest.
 #[cfg(not(target_os = "android"))]
 pub fn camera_preview_shot(outfile: &str) -> anyhow::Result<()> {
-    use crate::video::{Codec, EncoderConfig, VideoEncoder, VideoRect, ZLayer};
+    use crate::video::{
+        Codec, DecoderConfig, EncoderConfig, VideoDecoder, VideoEncoder, VideoRect, ZLayer,
+    };
     let (w, h) = (960u32, 720u32);
-    // PiP in the bottom-right, with a margin — the call self-view placement.
+    // Remote video (decode-to-surface): the main area below the header bar.
+    let remote = VideoRect { x: 20, y: 100, w: (w - 40) as i32, h: (h - 140) as i32 };
+    // PiP self-view: bottom-right corner, over the remote video.
     let pip = VideoRect {
         x: (w * 3 / 5) as i32,
         y: (h * 3 / 5) as i32,
@@ -1607,10 +1611,20 @@ pub fn camera_preview_shot(outfile: &str) -> anyhow::Result<()> {
         codec: Codec::Vp8, width: 640, height: 480, bitrate_bps: 1_000_000, framerate: 30,
         facing_front: true, preview: Some(pip), preview_layer: ZLayer::AboveUi,
     }).map_err(|e| anyhow::anyhow!("camera encoder open: {e:?}"))?;
-    // Warm the camera (RDP-forwarded frames take a beat) + fill the preview slot.
-    for _ in 0..20 {
-        let _ = enc.next_frame();
+    // A decode-to-surface decoder fed the encoder's own frames (a loopback) —
+    // exercises the remote-video composite path with real camera content.
+    let mut dec = VideoDecoder::open(&DecoderConfig {
+        codec: Codec::Vp8, width: 640, height: 480,
+        rect: Some(remote), rotation: 0, layer: ZLayer::AboveUi,
+    }).map_err(|e| anyhow::anyhow!("decoder open: {e:?}"))?;
+    // Warm the camera (RDP frames take a beat) + fill both surfaces: camera →
+    // VP8 encode → VP8 decode → composite.
+    for _ in 0..30 {
+        if let Some(f) = enc.next_frame() {
+            let _ = dec.submit(&f.data, f.timestamp);
+        }
     }
+    log::info!("camera-shot: decoded {} frames to surface", dec.decoded_frames());
     let mut r = crate::canvas_impl::SkiaRenderer::new_headless(w, h)?;
     {
         // Fake "guest UI": a dark page + a header bar — proves above-ui order.
@@ -1621,7 +1635,7 @@ pub fn camera_preview_shot(outfile: &str) -> anyhow::Result<()> {
         p.set_color(skia_safe::Color::from_argb(255, 46, 52, 84));
         c.draw_rect(skia_safe::Rect::from_xywh(0.0, 0.0, w as f32, 90.0), &p);
     }
-    crate::video_desktop::composite_previews(r.canvas());
+    crate::video_desktop::composite_video_surfaces(r.canvas());
     let png = r.snapshot_png().ok_or_else(|| anyhow::anyhow!("snapshot_png failed"))?;
     std::fs::write(outfile, &png)?;
     log::info!("camera-shot: wrote {} ({} bytes)", outfile, png.len());

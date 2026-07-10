@@ -1348,7 +1348,7 @@ impl wit_embedding::HostCanvasContext for HostState {
         // (above-ui) before swap. Android composites via a SurfaceView child
         // surface instead; here it's drawn onto the same Skia surface.
         #[cfg(not(target_os = "android"))]
-        crate::video_desktop::composite_previews(self.renderer.canvas());
+        crate::video_desktop::composite_video_surfaces(self.renderer.canvas());
         self.renderer.flush_and_swap();
         Ok(())
     }
