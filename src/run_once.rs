@@ -117,6 +117,8 @@ pub fn run_with_engine(engine: &Engine, app_id: &str) -> Result<()> {
             Err(e) => log::warn!("run_once: preopen {} failed: {e:#}", state.display()),
         }
     }
+    // Docker-style per-app host→guest mounts from the manifest `[[mounts]]`.
+    crate::app_loader::apply_mounts(&mut wasi_builder, &loaded.mounts());
     crate::signal_tls::grant_network(&mut wasi_builder); // task 66
     let wasi = wasi_builder.build();
 

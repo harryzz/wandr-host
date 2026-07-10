@@ -857,6 +857,11 @@ impl ApplicationHandler for App {
                     Err(e) => log::warn!("preopen {} failed: {e:#}", state.display()),
                 }
             }
+            // Docker-style per-app host→guest mounts from the manifest
+            // `[[mounts]]` — e.g. audio.player declares `~/Music → /music`.
+            // Replaces the old hardcoded desktop music preopen; works on every
+            // platform and is declarative per app.
+            app_loader::apply_mounts(&mut wasi_builder, &loaded.mounts());
             // Desktop parity with the device's /system/fonts preopen (the
             // standalone path exposes it as /system-fonts; guests read e.g.
             // NotoColorEmoji.ttf for emoji fallback). Map the host's Noto
@@ -868,23 +873,6 @@ impl ApplicationHandler for App {
                     match wasi_builder.preopened_dir(noto, "/system-fonts", DirPerms::READ, FilePerms::READ) {
                         Ok(_)  => log::info!("preopened {} → /system-fonts (read-only)", noto.display()),
                         Err(e) => log::warn!("preopen {} failed: {e:#}", noto.display()),
-                    }
-                }
-                // Desktop parity with the device's /data/media/0/Music → /music
-                // preopen (standalone.rs). audio.player scans /music/<album>/*.
-                // Source dir: WANDR_DESKTOP_MUSIC, else $HOME/Music. Read-only,
-                // best-effort (only preopened when it exists).
-                let music = std::env::var_os("WANDR_DESKTOP_MUSIC")
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Music")));
-                if let Some(dir) = music {
-                    if dir.is_dir() {
-                        match wasi_builder.preopened_dir(&dir, "/music", DirPerms::READ, FilePerms::READ) {
-                            Ok(_)  => log::info!("preopened {} → /music (read-only)", dir.display()),
-                            Err(e) => log::warn!("preopen {} failed: {e:#}", dir.display()),
-                        }
-                    } else {
-                        log::info!("audio: no music dir at {} (set WANDR_DESKTOP_MUSIC)", dir.display());
                     }
                 }
             }

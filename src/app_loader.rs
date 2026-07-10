@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Engine, Store};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 use crate::app_installer::{
     engine_compatibility_hash_hex, format_cache_key, parse_resolved_deps_from_key,
@@ -63,6 +64,106 @@ pub struct LoadedApp {
     /// this for asset preopens (task 38: `<install_dir>/assets/` →
     /// `/assets` in WASI ctx) and similar install-local lookups.
     install_dir: Option<PathBuf>,
+}
+
+/// A host→guest directory mount declared in `package.toml` via a `[[mounts]]`
+/// block (docker-style), with its host path already expanded and ready to
+/// preopen. See [`LoadedApp::mounts`].
+pub struct Mount {
+    /// Expanded host path (`~` and `$VAR`/`${VAR}` resolved).
+    pub host: PathBuf,
+    /// Absolute preopen path the guest sees, e.g. `/music`.
+    pub guest: String,
+    /// `true` = read-write (`mode = "rw"`); `false` = read-only (the default).
+    pub write: bool,
+}
+
+/// Expand a manifest host path: a leading `~` / `~/…` → home dir (`HOME`, else
+/// `USERPROFILE` on Windows), and `$VAR` / `${VAR}` → environment (unset ⇒
+/// empty). Single left-to-right pass — expanded values are not re-scanned.
+fn expand_host_path(raw: &str) -> PathBuf {
+    let home = || {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|h| h.to_string_lossy().into_owned())
+    };
+    let base = if raw == "~" {
+        home().unwrap_or_default()
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        home().map(|h| format!("{h}/{rest}")).unwrap_or_else(|| rest.to_string())
+    } else {
+        raw.to_string()
+    };
+
+    let mut out = String::with_capacity(base.len());
+    let mut chars = base.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        let braced = matches!(chars.peek(), Some('{'));
+        if braced {
+            chars.next();
+        }
+        let mut name = String::new();
+        while let Some(&ch) = chars.peek() {
+            if braced {
+                if ch == '}' {
+                    chars.next();
+                    break;
+                }
+                name.push(ch);
+                chars.next();
+            } else if ch.is_ascii_alphanumeric() || ch == '_' {
+                name.push(ch);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if name.is_empty() {
+            out.push('$');
+            if braced {
+                out.push('{');
+            }
+            continue;
+        }
+        out.push_str(&std::env::var(&name).unwrap_or_default());
+    }
+    PathBuf::from(out)
+}
+
+/// Preopen each declared mount into the WASI context being built. Shared by the
+/// standalone / run-once / desktop cold-start paths. Non-existent host dirs are
+/// skipped (non-fatal) so an app that declares `~/Music` still runs on a machine
+/// without it; duplicate guest paths are skipped after the first.
+pub fn apply_mounts(builder: &mut WasiCtxBuilder, mounts: &[Mount]) {
+    let mut seen = std::collections::HashSet::new();
+    for m in mounts {
+        if !seen.insert(m.guest.as_str()) {
+            log::warn!("mounts: duplicate guest path {} — skipping", m.guest);
+            continue;
+        }
+        if !m.host.is_dir() {
+            log::info!("mounts: host dir {} absent — skipping {}", m.host.display(), m.guest);
+            continue;
+        }
+        let (dperm, fperm) = if m.write {
+            (DirPerms::all(), FilePerms::all())
+        } else {
+            (DirPerms::READ, FilePerms::READ)
+        };
+        match builder.preopened_dir(&m.host, &m.guest, dperm, fperm) {
+            Ok(_) => log::info!(
+                "mounts: {} → {} ({})",
+                m.host.display(), m.guest, if m.write { "rw" } else { "ro" },
+            ),
+            Err(e) => log::warn!(
+                "mounts: preopen {} → {} failed: {e:#}", m.host.display(), m.guest,
+            ),
+        }
+    }
 }
 
 impl LoadedApp {
@@ -139,6 +240,49 @@ impl LoadedApp {
             }
         }
         "wandr".to_string()
+    }
+
+    /// Host→guest directory mounts declared in the installed manifest via
+    /// `[[mounts]]` blocks (docker-style), each host path already expanded:
+    ///
+    /// ```toml
+    /// [[mounts]]
+    /// host  = "~/Music"   # ~ and $VAR / ${VAR} are expanded
+    /// guest = "/music"    # must be absolute
+    /// mode  = "ro"        # "ro" (default) | "rw"
+    /// ```
+    ///
+    /// Returns `[]` for dev loads (no manifest) or when none are declared.
+    /// Host-dir existence is checked later by [`apply_mounts`], not here.
+    pub fn mounts(&self) -> Vec<Mount> {
+        let Some(dir) = self.install_dir.as_ref() else {
+            return Vec::new();
+        };
+        let Some(doc) = fs::read_to_string(dir.join("package.toml"))
+            .ok()
+            .and_then(|s| s.parse::<toml::Value>().ok())
+        else {
+            return Vec::new();
+        };
+        let Some(arr) = doc.get("mounts").and_then(|v| v.as_array()) else {
+            return Vec::new();
+        };
+        arr.iter()
+            .filter_map(|m| {
+                let host = m.get("host").and_then(|v| v.as_str())?;
+                let guest = m.get("guest").and_then(|v| v.as_str())?;
+                if !guest.starts_with('/') {
+                    log::warn!("mounts: guest path {guest:?} must be absolute — skipped");
+                    return None;
+                }
+                let write = matches!(m.get("mode").and_then(|v| v.as_str()), Some("rw"));
+                Some(Mount {
+                    host: expand_host_path(host),
+                    guest: guest.to_string(),
+                    write,
+                })
+            })
+            .collect()
     }
 
     /// Task 64 follow-up: per-app render-rate cap. Reads `max_fps` from the
