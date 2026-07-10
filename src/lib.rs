@@ -555,7 +555,7 @@ pub(crate) use guest_call;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, TouchPhase, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, NamedKey, PhysicalKey},
     window::{Window, WindowId},
 };
@@ -640,6 +640,13 @@ pub struct App {
     /// Next bg-tick deadline (guest-authored cadence, host-clamped). Init to now
     /// so the first tick fires immediately once the store exists.
     bg_tick_at:      std::time::Instant,
+    /// Guest frame-pacing export (`wandr:ui-shell/frame-pacing`) — drives
+    /// on-demand rendering: the guest reports how long until it next needs a
+    /// frame, so an idle UI stops the render loop instead of spinning at vsync
+    /// (the desktop CPU-burn fix). `None` = no export → capped poll fallback.
+    shell_pacing:    Option<crate::ui_shell_export_bindings::pacing::FramePacingWorld>,
+    /// Next render deadline (from frame-pacing); `about_to_wait` sleeps until it.
+    next_render_at:  std::time::Instant,
 }
 
 impl App {
@@ -715,6 +722,8 @@ impl App {
             pump_cm_async,
             bg_tick: None,
             bg_tick_at: std::time::Instant::now(),
+            shell_pacing: None,
+            next_render_at: std::time::Instant::now(),
         }
     }
 
@@ -929,6 +938,13 @@ impl ApplicationHandler for App {
             }
             self.bg_tick = inst.bg_tick;
             self.bg_tick_at = std::time::Instant::now();
+            // On-demand rendering: keep the guest's frame-pacing export so the
+            // loop can sleep when the UI is idle (was discarded → constant redraw).
+            if inst.shell_pacing.is_some() {
+                log::info!("desktop: guest exports frame-pacing — on-demand rendering enabled");
+            }
+            self.shell_pacing = inst.shell_pacing;
+            self.next_render_at = std::time::Instant::now();
         } else {
             log::info!("no WASM component — running in renderer-test mode");
             self.test_renderer = Some(renderer);
@@ -936,6 +952,26 @@ impl ApplicationHandler for App {
         self.window = Some(window);
 
         if let Some(w) = &self.window { w.request_redraw(); }
+    }
+
+    /// On-demand render pacing. Sleep until the earliest of the guest's next-frame
+    /// deadline (frame-pacing) and the bg-tick deadline; request a redraw when one
+    /// is due. An idle guest reports a far deadline, so the loop parks instead of
+    /// spinning at vsync (the desktop CPU-burn fix). Input/resize events request
+    /// their own redraw, so interaction latency is unchanged.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_none() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut wake = self.next_render_at;
+        if self.bg_tick.is_some() {
+            wake = wake.min(self.bg_tick_at);
+        }
+        if now >= wake {
+            if let Some(w) = &self.window { w.request_redraw(); }
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake.max(now)));
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1180,10 +1216,33 @@ impl ApplicationHandler for App {
                             log::warn!("desktop: CM-async pump failed: {e:#}");
                         }
                     }
+
+                    // On-demand pacing: ask the guest how long until it next needs
+                    // a frame. Idle → far deadline → `about_to_wait` sleeps instead
+                    // of the old per-frame redraw (the CPU-burn fix). Floor ~60 fps
+                    // while animating; cap idle wakes so a static UI still repaints
+                    // ~1 Hz (a safety net against a missed dirty).
+                    const RENDER_FLOOR_MS: u64 = 16;
+                    const IDLE_CAP_MS: u64 = 1000;
+                    let guest_delay = if let Some(fp) = self.shell_pacing.as_ref() {
+                        crate::guest_call!(fp.wandr_ui_shell_frame_pacing()
+                            .call_next_frame_delay(&mut *s))
+                            .unwrap_or(0) as u64
+                    } else {
+                        0
+                    };
+                    self.next_render_at = std::time::Instant::now()
+                        + std::time::Duration::from_millis(
+                            guest_delay.clamp(RENDER_FLOOR_MS, IDLE_CAP_MS));
                 } else if let Some(r) = self.renderer_mut() {
                     r.draw_test_frame();
+                    // No guest → cap the test-frame loop at ~30 fps (not vsync spin).
+                    self.next_render_at = std::time::Instant::now()
+                        + std::time::Duration::from_millis(33);
                 }
-                if let Some(w) = &self.window { w.request_redraw(); }
+                // No unconditional request_redraw — `about_to_wait` drives the next
+                // frame from `next_render_at`/`bg_tick_at`; input/resize events
+                // request_redraw themselves for immediate response.
             }
 
             WindowEvent::Resized(size) => {
