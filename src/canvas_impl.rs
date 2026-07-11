@@ -641,10 +641,14 @@ impl SkiaRenderer {
         let raw_window = window.window_handle()?.as_raw();
         let raw_display = window.display_handle()?.as_raw();
 
-        // EGL display (WSLg/Wayland + Xwayland both expose EGL).
-        let gl_display = unsafe {
-            glutin::display::Display::new(raw_display, glutin::display::DisplayApiPreference::Egl)?
-        };
+        // GL display API: EGL on Linux/Windows (WSLg/Wayland/Xwayland/ANGLE all
+        // expose it); CGL on macOS, which has no EGL. glutin gates these variants
+        // per-platform, so `Egl` doesn't even exist as a variant on macOS.
+        #[cfg(not(target_os = "macos"))]
+        let api_pref = glutin::display::DisplayApiPreference::Egl;
+        #[cfg(target_os = "macos")]
+        let api_pref = glutin::display::DisplayApiPreference::Cgl;
+        let gl_display = unsafe { glutin::display::Display::new(raw_display, api_pref)? };
         let template = ConfigTemplateBuilder::new()
             .with_alpha_size(8)
             .compatible_with_native_window(raw_window)

@@ -142,7 +142,11 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # codec+format+software-scaling (no libavfilter/libavdevice dev headers needed).
 # See src/video_desktop.rs; proven in repros/nokhwa-camera-probe.
 nokhwa = { version = "0.10", features = ["input-native"] }
-ffmpeg-next = { version = "7.1", default-features = false, features = ["codec", "format", "software-scaling"] }
+# 8.1 spans ffmpeg 7.x AND 8.x (version-gated bindings) — Linux/Debian + the
+# Windows BtbN prebuilt are on 7.x, macOS Homebrew ships 8.x. Bumped from 7.1 so
+# the same crate binds whatever ffmpeg the platform provides (7.1 hard-failed on
+# ffmpeg 8: it tried to bind the removed libavcodec/avfft.h).
+ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-scaling"] }
 
 # Linux-only: add cpal's pure-Rust PulseAudio host on top of the plain cpal above
 # (cargo unions features across target tables). This is the WSLg audio path
