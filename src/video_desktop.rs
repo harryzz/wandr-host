@@ -16,6 +16,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg::format::Pixel;
@@ -183,8 +185,31 @@ fn rtp_ts(idx: i64, fps: u32) -> u32 {
 
 // ── encoder ──────────────────────────────────────────────────────────────────
 
+/// The latest camera frame the background capture thread produced (tightly-packed
+/// RGB24). Read + consumed by `capture_encode` on the store thread.
+struct LatestFrame {
+    rgb: Vec<u8>,
+    w: u32,
+    h: u32,
+    seq: u64,
+}
+
+/// Move-into-thread wrapper for the !Send nokhwa `Camera`. The camera is owned
+/// and touched ONLY by the capture thread, so crossing the spawn boundary once
+/// (and never sharing it) is sound.
+struct SendCamera(Camera);
+unsafe impl Send for SendCamera {}
+
 pub struct VideoEncoder {
-    camera: Camera,
+    /// Background capture thread — owns the `Camera` and blocks on its `frame()`
+    /// OFF the store thread, publishing the newest decoded RGB frame into
+    /// `latest`. This is the Signal self-view freeze fix: the render/pump loop
+    /// reads `latest` non-blocking and never stalls on the camera.
+    cam_thread: Option<std::thread::JoinHandle<()>>,
+    cam_stop: Arc<AtomicBool>,
+    latest: Arc<Mutex<Option<LatestFrame>>>,
+    /// Sequence of the last frame we encoded — skip re-encoding a stale frame.
+    last_seq: u64,
     scaler: Scaler,
     encoder: ffmpeg::encoder::video::Encoder,
     rgb: FfVideoFrame,
@@ -202,6 +227,12 @@ pub struct VideoEncoder {
 
 impl Drop for VideoEncoder {
     fn drop(&mut self) {
+        // Stop the capture thread and wait for it (it exits within ~1 camera
+        // frame once the flag is set; dropping the Camera closes the stream).
+        self.cam_stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.cam_thread.take() {
+            let _ = h.join();
+        }
         if let Some(id) = self.preview_id {
             surface_remove(id);
         }
@@ -209,8 +240,8 @@ impl Drop for VideoEncoder {
 }
 
 // The store is single-threaded on desktop (winit loop / run-once command); the
-// !Send nokhwa/ffmpeg contexts never cross threads. Mirrors video.rs::android's
-// `unsafe impl Send for VideoEncoder`.
+// !Send ffmpeg contexts never cross threads (the camera lives on its own capture
+// thread). Mirrors video.rs::android's `unsafe impl Send for VideoEncoder`.
 unsafe impl Send for VideoEncoder {}
 
 impl VideoEncoder {
@@ -270,8 +301,41 @@ impl VideoEncoder {
         // Self-view surface: mirrored, upright (rotation 0).
         let preview_id = config.preview.map(|rect| alloc_surface(rect, true, 0));
 
+        // Capture thread: owns the camera, blocks on frame() here (not on the
+        // store thread), and publishes the newest RGB frame into `latest`.
+        let cam_stop = Arc::new(AtomicBool::new(false));
+        let latest: Arc<Mutex<Option<LatestFrame>>> = Arc::new(Mutex::new(None));
+        let (stop_t, latest_t) = (cam_stop.clone(), latest.clone());
+        let send_cam = SendCamera(camera);
+        let cam_thread = std::thread::Builder::new()
+            .name("wandr-cam-capture".into())
+            .spawn(move || {
+                // Capture the whole SendCamera (Send), not just `.0` — Rust-2021
+                // disjoint capture would otherwise grab the !Send Camera field.
+                let send_cam = send_cam;
+                let mut cam = send_cam.0;
+                let mut seq = 0u64;
+                while !stop_t.load(Ordering::Relaxed) {
+                    match cam.frame().and_then(|b| b.decode_image::<RgbFormat>()) {
+                        Ok(img) => {
+                            seq += 1;
+                            let (fw, fh) = (img.width(), img.height());
+                            *latest_t.lock().unwrap() =
+                                Some(LatestFrame { rgb: img.into_raw(), w: fw, h: fh, seq });
+                        }
+                        Err(e) => {
+                            log::debug!("video_desktop: capture: {e:?}");
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                    }
+                }
+                // dropping `cam` here stops + closes the stream
+            })
+            .ok();
+
         Ok(Self {
-            camera, scaler, encoder, rgb, cam_w, cam_h, fps,
+            cam_thread, cam_stop, latest, last_seq: 0,
+            scaler, encoder, rgb, cam_w, cam_h, fps,
             pts: 0, force_keyframe: false, pending: VecDeque::new(), preview_id,
         })
     }
@@ -279,25 +343,29 @@ impl VideoEncoder {
     /// Capture one camera frame, scale RGB→YUV420P, encode; push any produced
     /// packets onto `pending`.
     fn capture_encode(&mut self) {
-        let buf = match self.camera.frame() {
-            Ok(b) => b,
-            Err(e) => { log::debug!("video_desktop: capture: {e:?}"); return; }
+        // Non-blocking: take the freshest frame the capture thread published. No
+        // new frame since we last encoded → return immediately. The render/pump
+        // loop NEVER blocks on the camera here (the self-view freeze fix).
+        let frame = {
+            let mut g = self.latest.lock().unwrap();
+            match g.as_ref() {
+                Some(f) if f.seq != self.last_seq => g.take(),
+                _ => None,
+            }
         };
-        let img = match buf.decode_image::<RgbFormat>() {
-            Ok(im) => im,
-            Err(e) => { log::debug!("video_desktop: decode: {e:?}"); return; }
-        };
-        if img.width() != self.cam_w || img.height() != self.cam_h {
+        let Some(frame) = frame else { return };
+        self.last_seq = frame.seq;
+        if frame.w != self.cam_w || frame.h != self.cam_h {
             log::warn!("video_desktop: frame {}x{} != {}x{}, skipping",
-                img.width(), img.height(), self.cam_w, self.cam_h);
+                frame.w, frame.h, self.cam_w, self.cam_h);
             return;
         }
+        let src: &[u8] = &frame.rgb;
         // Copy tightly-packed RGB into the ffmpeg frame (aligned stride).
         {
             let w3 = self.cam_w as usize * 3;
             let stride = self.rgb.stride(0);
             let data = self.rgb.data_mut(0);
-            let src = img.as_raw();
             for y in 0..self.cam_h as usize {
                 data[y * stride..y * stride + w3].copy_from_slice(&src[y * w3..y * w3 + w3]);
             }
@@ -305,12 +373,11 @@ impl VideoEncoder {
         // PiP self-view: hand the render loop the latest camera frame as RGBA.
         if let Some(id) = self.preview_id {
             let (w, h) = (self.cam_w, self.cam_h);
-            let rgb = img.as_raw();
             let mut rgba = vec![0u8; (w * h * 4) as usize];
             for i in 0..(w * h) as usize {
-                rgba[i * 4] = rgb[i * 3];
-                rgba[i * 4 + 1] = rgb[i * 3 + 1];
-                rgba[i * 4 + 2] = rgb[i * 3 + 2];
+                rgba[i * 4] = src[i * 3];
+                rgba[i * 4 + 1] = src[i * 3 + 1];
+                rgba[i * 4 + 2] = src[i * 3 + 2];
                 rgba[i * 4 + 3] = 255;
             }
             surface_set_frame(id, rgba, w, h);

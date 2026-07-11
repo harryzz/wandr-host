@@ -36,6 +36,16 @@ fn main() {
         println!("camera-shot: wrote {out}");
         return;
     }
+    // Desktop `--video-selfview-test`: reproduce/measure the Signal self-view
+    // freeze — a 60fps render loop pumping the blocking camera encoder.
+    if args.iter().any(|a| a == "--video-selfview-test") {
+        let _ = env_logger::builder().try_init();
+        if let Err(e) = wasm_android_host::video_selfview_test() {
+            eprintln!("wandr-host --video-selfview-test: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Desktop `--run-once <app-id>`: one-shot a wasi:cli/command guest from
     // WANDR_APPS_ROOT (e.g. wandr.video.test), same as the device path. Headless
     // — no winit window. Mirrors the android main's --run-once branch.

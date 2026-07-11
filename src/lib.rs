@@ -1632,6 +1632,62 @@ pub fn camera_preview_shot(outfile: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reproducer for the Signal self-view freeze: a simulated 60 fps UI render loop
+/// that also pumps the camera encoder each frame (as the call engine does).
+/// Measures how long the BLOCKING `next_frame()` (→ `camera.frame()`) stalls the
+/// loop, and the resulting effective frame rate. If the loop is capped far below
+/// 60 fps by the camera, that's the conceptual bug (capture couples the render
+/// thread to camera delivery). `--video-selfview-test`.
+#[cfg(not(target_os = "android"))]
+pub fn video_selfview_test() -> anyhow::Result<()> {
+    use crate::video::{Codec, EncoderConfig, VideoEncoder, VideoRect, ZLayer};
+    use std::time::{Duration, Instant};
+    let (w, h) = (960u32, 720u32);
+    let pip = VideoRect {
+        x: (w * 3 / 5) as i32, y: (h * 3 / 5) as i32,
+        w: (w * 2 / 5) as i32 - 20, h: (h * 2 / 5) as i32 - 20,
+    };
+    log::info!("selfview-test: opening camera encoder …");
+    let t_open = Instant::now();
+    let mut enc = VideoEncoder::open(&EncoderConfig {
+        codec: Codec::Vp8, width: 640, height: 480, bitrate_bps: 1_000_000, framerate: 30,
+        facing_front: true, preview: Some(pip), preview_layer: ZLayer::AboveUi,
+    }).map_err(|e| anyhow::anyhow!("camera encoder open: {e:?} (no camera on this host?)"))?;
+    log::info!("selfview-test: encoder open took {} ms", t_open.elapsed().as_millis());
+
+    let mut r = crate::canvas_impl::SkiaRenderer::new_headless(w, h)?;
+    let target = Duration::from_micros(16_667); // 60 fps
+    let n = 180u32;                             // ~3 s worth
+    let (mut sum_nf, mut max_nf, mut got) = (Duration::ZERO, Duration::ZERO, 0u32);
+    let loop_start = Instant::now();
+    for i in 0..n {
+        let frame_start = Instant::now();
+        r.canvas().clear(skia_safe::Color::from_argb(255, 20, 24, 40)); // "render UI"
+        let t_nf = Instant::now();
+        if enc.next_frame().is_some() { got += 1; }   // BLOCKING camera capture
+        let nf = t_nf.elapsed();
+        sum_nf += nf;
+        if nf > max_nf { max_nf = nf; }
+        if nf.as_millis() > 50 {
+            log::warn!("selfview-test: frame {i}: next_frame BLOCKED {} ms (UI stalls this long)", nf.as_millis());
+        }
+        crate::video_desktop::composite_video_surfaces(r.canvas());
+        if let Some(rem) = target.checked_sub(frame_start.elapsed()) { std::thread::sleep(rem); }
+    }
+    let total = loop_start.elapsed();
+    let eff = n as f64 / total.as_secs_f64();
+    log::warn!(
+        "selfview-test RESULT: {} frames, {} encoded | next_frame avg {} ms / max {} ms | effective {:.1} fps (target 60) — {}",
+        n, got, sum_nf.as_millis() / n as u128, max_nf.as_millis(), eff,
+        if eff < 45.0 { "FREEZE/STALL: render loop is capped by the blocking camera capture" } else { "ok" },
+    );
+    if let Some(png) = r.snapshot_png() {
+        let _ = std::fs::write("/tmp/selfview-test.png", &png);
+        log::info!("selfview-test: wrote /tmp/selfview-test.png (check the PiP filled)");
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "android"))]
 pub fn run() {
     env_logger::init();
