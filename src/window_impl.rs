@@ -26,14 +26,18 @@ fn read_font_scale() -> f32 { 1.0 }
 
 impl Host for crate::HostState {
     fn get_density(&mut self) -> f32 {
-        // Android: real panel density (ro.sf.lcd_density/160). Desktop: the
-        // window's display scale (1.0 on a 1:1 display) instead of the old
-        // hardcoded 2.0 — so a windowed guest scales to the actual window, not a
-        // phone-panel assumption. Guests cap this to their readability ceiling.
+        // Android: real panel density (ro.sf.lcd_density/160).
         #[cfg(target_os = "android")]
         { read_dpi() as f32 / 160.0 }
+        // Desktop: 1.0. The host renders the guest's LOGICAL canvas and handles
+        // the physical/HiDPI upscaling itself (the base_matrix maps logical →
+        // buffer), so the guest works in logical space. Returning the raw window
+        // scale_factor here (e.g. 2.0 on a Retina Mac) made dioxus-canvas guests
+        // set_scale(2.0) and lay their UI out 2× too big for the logical canvas —
+        // the Signal QR/link screen overflowed and clipped regardless of window
+        // size. A 1:1 display already reported 1.0, so this only fixes HiDPI.
         #[cfg(not(target_os = "android"))]
-        { (self.renderer.scale_factor() as f32).max(1.0) }
+        { 1.0 }
     }
     fn get_font_scale(&mut self) -> f32 {
         read_font_scale()
@@ -41,7 +45,8 @@ impl Host for crate::HostState {
     fn get_dpi(&mut self) -> u32 {
         #[cfg(target_os = "android")]
         { read_dpi() }
+        // Desktop: baseline 160 dpi (density 1.0) — see get_density.
         #[cfg(not(target_os = "android"))]
-        { ((self.renderer.scale_factor() as f32).max(1.0) * 160.0) as u32 }
+        { 160 }
     }
 }
