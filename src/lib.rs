@@ -857,6 +857,16 @@ impl ApplicationHandler for App {
                     Err(e) => log::warn!("preopen {} failed: {e:#}", state.display()),
                 }
             }
+            // Task 38 parity — read-only /assets preopen for apps that ship an assets/
+            // dir. Present in run_once/standalone but the desktop --app path had missed
+            // it; restore the universal convention so guests can read files directly,
+            // e.g. /assets/fonts/*.ttf for Image(systemName:) via typeface-from-bytes.
+            if let Some(assets) = loaded.assets_dir() {
+                match wasi_builder.preopened_dir(&assets, "/assets", DirPerms::READ, FilePerms::READ) {
+                    Ok(_)  => log::info!("preopened {} → /assets (read-only)", assets.display()),
+                    Err(e) => log::warn!("preopen {} failed: {e:#}", assets.display()),
+                }
+            }
             // Docker-style per-app host→guest mounts from the manifest
             // `[[mounts]]` — e.g. audio.player declares `~/Music → /music`.
             // Replaces the old hardcoded desktop music preopen; works on every
