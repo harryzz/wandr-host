@@ -46,6 +46,16 @@ fn main() {
         }
         return;
     }
+    // Desktop `--media-test`: exercise camera + audio-out + audio-in (mic level
+    // bar) to isolate per-platform media bugs without a call partner.
+    if args.iter().any(|a| a == "--media-test") {
+        let _ = env_logger::builder().try_init();
+        if let Err(e) = wasm_android_host::media_test() {
+            eprintln!("wandr-host --media-test: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Desktop `--run-once <app-id>`: one-shot a wasi:cli/command guest from
     // WANDR_APPS_ROOT (e.g. wandr.video.test), same as the device path. Headless
     // — no winit window. Mirrors the android main's --run-once branch.

@@ -1688,6 +1688,98 @@ pub fn video_selfview_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Media diagnostic (`--media-test`): exercises the three desktop media backends
+/// in isolation and reports pass/fail per platform — no call partner needed.
+///   [1] CAMERA   — open + count captured frames (self-view path)
+///   [2] AUDIO OUT— play a 440 Hz tone you should HEAR (cpal output)
+///   [3] AUDIO IN — capture the mic for 6s, printing an ASCII level bar (cpal input)
+/// Isolates the per-platform Signal media bugs (macOS camera, Windows mic).
+#[cfg(not(target_os = "android"))]
+pub fn media_test() -> anyhow::Result<()> {
+    use crate::audio_impl::{ChannelLayout, Format, StreamClass, TrackConfig};
+    use crate::video::{Codec, EncoderConfig, VideoEncoder, VideoRect, ZLayer};
+    use std::time::{Duration, Instant};
+
+    // ── [1] Camera (self-view capture) ───────────────────────────────────────
+    log::warn!("media-test: [1/3] CAMERA — opening …");
+    let pip = VideoRect { x: 0, y: 0, w: 320, h: 240 };
+    match VideoEncoder::open(&EncoderConfig {
+        codec: Codec::Vp8, width: 640, height: 480, bitrate_bps: 1_000_000, framerate: 30,
+        facing_front: true, preview: Some(pip), preview_layer: ZLayer::AboveUi,
+    }) {
+        Ok(mut enc) => {
+            let (mut got, start) = (0u32, Instant::now());
+            while start.elapsed() < Duration::from_secs(2) {
+                if enc.next_frame().is_some() { got += 1; }
+                std::thread::sleep(Duration::from_millis(16));
+            }
+            if got > 0 {
+                log::warn!("media-test: [1/3] CAMERA — OK: {got} frames in 2s ✅");
+            } else {
+                log::warn!("media-test: [1/3] CAMERA — opened but 0 frames (camera permission? lid closed?) ❌");
+            }
+        }
+        Err(e) => log::warn!("media-test: [1/3] CAMERA — open FAILED: {e:?} (no camera / permission denied) ❌"),
+    }
+
+    // ── [2] Audio output (a tone you should hear) ────────────────────────────
+    let sr = 48_000u32;
+    log::warn!("media-test: [2/3] AUDIO OUT — 440 Hz tone for 2s (you should HEAR it) …");
+    let out = crate::audio_desktop::create_track(TrackConfig {
+        sample_rate: sr, channel_layout: ChannelLayout::Mono, format: Format::PcmF32, class: StreamClass::Media,
+    });
+    if out != 0 {
+        crate::audio_desktop::start(out);
+        let (mut phase, step) = (0f32, std::f32::consts::TAU * 440.0 / sr as f32);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            let mut buf = vec![0f32; sr as usize / 20]; // 50 ms
+            for s in buf.iter_mut() {
+                *s = phase.sin() * 0.25;
+                phase += step;
+                if phase > std::f32::consts::TAU { phase -= std::f32::consts::TAU; }
+            }
+            crate::audio_desktop::write_pcm_f32(out, &buf);
+            std::thread::sleep(Duration::from_millis(45));
+        }
+        crate::audio_desktop::close(out);
+        log::warn!("media-test: [2/3] AUDIO OUT — done (did you hear the tone?)");
+    } else {
+        log::warn!("media-test: [2/3] AUDIO OUT — create_track FAILED ❌");
+    }
+
+    // ── [3] Audio input (mic level bar) ──────────────────────────────────────
+    log::warn!("media-test: [3/3] AUDIO IN — mic for 6s. SPEAK — the bar should move:");
+    let cap = crate::audio_desktop::open_capture(TrackConfig {
+        sample_rate: sr, channel_layout: ChannelLayout::Mono, format: Format::PcmF32, class: StreamClass::VoiceCall,
+    });
+    if cap != 0 {
+        crate::audio_desktop::start(cap);
+        let (start, mut peak) = (Instant::now(), 0f32);
+        while start.elapsed() < Duration::from_secs(6) {
+            std::thread::sleep(Duration::from_millis(200));
+            let samples = crate::audio_desktop::read_pcm_f32(cap, sr);
+            if samples.is_empty() {
+                log::warn!("mic: [                    ] (no samples)");
+                continue;
+            }
+            let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+            peak = peak.max(rms);
+            let bars = ((rms * 60.0) as usize).min(20);
+            log::warn!("mic: [{}{}] rms={rms:.3}", "#".repeat(bars), "-".repeat(20 - bars));
+        }
+        crate::audio_desktop::close(cap);
+        if peak > 0.005 {
+            log::warn!("media-test: [3/3] AUDIO IN — OK: mic captured (peak rms {peak:.3}) ✅");
+        } else {
+            log::warn!("media-test: [3/3] AUDIO IN — ~0 signal (mic not captured / muted / no permission) ❌");
+        }
+    } else {
+        log::warn!("media-test: [3/3] AUDIO IN — open_capture FAILED ❌");
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "android"))]
 pub fn run() {
     env_logger::init();
