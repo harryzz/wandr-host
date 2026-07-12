@@ -90,6 +90,76 @@ fn stream_config(cfg: &TrackConfig, channels: usize, host_name: &str) -> cpal::S
     }
 }
 
+/// Build an OUTPUT stream at `dev_ch` device channels, up-mixing the ring's
+/// `logical`-channel audio in the callback (mono→stereo duplicates the sample).
+/// The ring always holds `logical`-channel frames — write_pcm_f32 is unchanged.
+fn build_output_adapting(
+    device: &cpal::Device, cfg: &TrackConfig, logical: usize, dev_ch: usize,
+    host_name: &str, ring: &Arc<Mutex<VecDeque<f32>>>, running: &Arc<AtomicBool>,
+) -> Option<cpal::Stream> {
+    let config = stream_config(cfg, dev_ch, host_name);
+    let (cb_ring, cb_running) = (Arc::clone(ring), Arc::clone(running));
+    device.build_output_stream(
+        config,
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            if !cb_running.load(Ordering::Relaxed) {
+                data.iter_mut().for_each(|s| *s = 0.0);
+                return;
+            }
+            let mut r = cb_ring.lock().unwrap_or_else(|e| e.into_inner());
+            for frame in data.chunks_mut(dev_ch.max(1)) {
+                let mut lf = [0f32; 2];
+                for c in 0..logical {
+                    let v = r.pop_front().unwrap_or(0.0);
+                    if c < 2 { lf[c] = v; }
+                }
+                for (c, out) in frame.iter_mut().enumerate() {
+                    *out = if logical <= 1 { lf[0] } else { lf[c % 2] };
+                }
+            }
+        },
+        move |err| log::warn!("audio_desktop: output stream error: {err}"),
+        None,
+    )
+    .map_err(|e| log::warn!("audio_desktop: build_output({dev_ch}ch@{}Hz) err: {e}", cfg.sample_rate))
+    .ok()
+}
+
+/// Build an INPUT stream at `dev_ch` device channels, down-mixing to the ring's
+/// `logical`-channel audio (stereo→mono averages the channels). The ring always
+/// holds `logical`-channel frames — read_pcm_f32 is unchanged.
+fn build_input_adapting(
+    device: &cpal::Device, cfg: &TrackConfig, logical: usize, dev_ch: usize,
+    host_name: &str, ring: &Arc<Mutex<VecDeque<f32>>>, running: &Arc<AtomicBool>, cap: usize,
+) -> Option<cpal::Stream> {
+    let config = stream_config(cfg, dev_ch, host_name);
+    let (cb_ring, cb_running) = (Arc::clone(ring), Arc::clone(running));
+    device.build_input_stream(
+        config,
+        move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            if !cb_running.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut r = cb_ring.lock().unwrap_or_else(|e| e.into_inner());
+            for frame in data.chunks(dev_ch.max(1)) {
+                for c in 0..logical {
+                    let s = if logical <= 1 {
+                        frame.iter().sum::<f32>() / frame.len().max(1) as f32
+                    } else {
+                        frame[c.min(frame.len().saturating_sub(1))]
+                    };
+                    if r.len() >= cap { r.pop_front(); }
+                    r.push_back(s);
+                }
+            }
+        },
+        move |err| log::warn!("audio_desktop: input stream error: {err}"),
+        None,
+    )
+    .map_err(|e| log::warn!("audio_desktop: build_input({dev_ch}ch@{}Hz) err: {e}", cfg.sample_rate))
+    .ok()
+}
+
 /// Open an output track. Returns a handle, or 0 on any failure (surfaced to the
 /// guest as `audio-error::unavailable`).
 pub fn create_track(cfg: TrackConfig) -> u32 {
@@ -106,33 +176,20 @@ pub fn create_track(cfg: TrackConfig) -> u32 {
     let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(cap)));
     let running = Arc::new(AtomicBool::new(false));
 
-    let cb_ring = Arc::clone(&ring);
-    let cb_running = Arc::clone(&running);
-    let config = stream_config(&cfg, channels, host.id().name());
-    let stream = device.build_output_stream(
-        config,
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            if cb_running.load(Ordering::Relaxed) {
-                let mut r = cb_ring.lock().unwrap_or_else(|e| e.into_inner());
-                for s in data.iter_mut() {
-                    *s = r.pop_front().unwrap_or(0.0); // silence on underrun
-                }
-            } else {
-                for s in data.iter_mut() {
-                    *s = 0.0; // paused / not started
-                }
-            }
-        },
-        move |err| log::warn!("audio_desktop: output stream error: {err}"),
-        None,
-    );
-    let stream = match stream {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("audio_desktop: build_output_stream({}ch@{}Hz) failed: {e}",
-                channels, cfg.sample_rate);
-            return 0;
+    // Try the guest's channel layout; WASAPI shared mode rejects a config that
+    // doesn't match the device mix format (mono on a stereo device — the Windows
+    // "peer can't hear me" bug), so fall back to the device's channels + up-mix.
+    let mut res = build_output_adapting(&device, &cfg, channels, channels, host.id().name(), &ring, &running);
+    if res.is_none() {
+        let d = device.default_output_config().map(|c| c.channels() as usize).unwrap_or(2);
+        if d != channels {
+            log::info!("audio_desktop: output {channels}ch rejected — retrying at device {d}ch (up-mix)");
+            res = build_output_adapting(&device, &cfg, channels, d, host.id().name(), &ring, &running);
         }
+    }
+    let Some(stream) = res else {
+        log::warn!("audio_desktop: output track failed ({channels}ch@{}Hz)", cfg.sample_rate);
+        return 0;
     };
     // cpal streams start paused-until-play on some backends; play now, gate
     // audible output via `running` (set by `start`).
@@ -233,33 +290,20 @@ pub fn open_capture(cfg: TrackConfig) -> u32 {
     let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(cap)));
     let running = Arc::new(AtomicBool::new(false));
 
-    let cb_ring = Arc::clone(&ring);
-    let cb_running = Arc::clone(&running);
-    let config = stream_config(&cfg, channels, host.id().name());
-    let stream = device.build_input_stream(
-        config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            if !cb_running.load(Ordering::Relaxed) {
-                return; // not started — drop mic samples
-            }
-            let mut r = cb_ring.lock().unwrap_or_else(|e| e.into_inner());
-            for &s in data {
-                if r.len() >= cap {
-                    r.pop_front(); // overflow — drop oldest (keep the freshest audio)
-                }
-                r.push_back(s);
-            }
-        },
-        move |err| log::warn!("audio_desktop: input stream error: {err}"),
-        None,
-    );
-    let stream = match stream {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("audio_desktop: build_input_stream({}ch@{}Hz) failed: {e}",
-                channels, cfg.sample_rate);
-            return 0;
+    // Same as create_track: WASAPI shared mode rejects mono on a stereo mic
+    // (the Windows "peer can't hear me" bug), so fall back to the device's
+    // channels and down-mix to the guest's logical layout.
+    let mut res = build_input_adapting(&device, &cfg, channels, channels, host.id().name(), &ring, &running, cap);
+    if res.is_none() {
+        let d = device.default_input_config().map(|c| c.channels() as usize).unwrap_or(2);
+        if d != channels {
+            log::info!("audio_desktop: input {channels}ch rejected — retrying at device {d}ch (down-mix)");
+            res = build_input_adapting(&device, &cfg, channels, d, host.id().name(), &ring, &running, cap);
         }
+    }
+    let Some(stream) = res else {
+        log::warn!("audio_desktop: capture failed ({channels}ch@{}Hz)", cfg.sample_rate);
+        return 0;
     };
     if let Err(e) = stream.play() {
         log::warn!("audio_desktop: capture stream.play failed: {e}");
