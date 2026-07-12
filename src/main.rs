@@ -49,7 +49,11 @@ fn main() {
     // Desktop `--media-test`: exercise camera + audio-out + audio-in (mic level
     // bar) to isolate per-platform media bugs without a call partner.
     if args.iter().any(|a| a == "--media-test") {
-        let _ = env_logger::builder().try_init();
+        // Default to `info` so the diagnostic prints without RUST_LOG (its own
+        // lines are at warn, but the backend camera/audio lines are at info).
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("info"),
+        ).try_init();
         if let Err(e) = wasm_android_host::media_test() {
             eprintln!("wandr-host --media-test: {e:#}");
             std::process::exit(1);
