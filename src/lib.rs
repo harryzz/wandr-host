@@ -1701,13 +1701,19 @@ pub fn media_test() -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 
     // ── [1] Camera (self-view capture) ───────────────────────────────────────
-    log::warn!("media-test: [1/3] CAMERA — opening …");
-    let pip = VideoRect { x: 0, y: 0, w: 320, h: 240 };
-    match VideoEncoder::open(&EncoderConfig {
+    // Opened on a worker thread with a timeout: on macOS the camera open BLOCKS
+    // waiting for a TCC permission grant, and a CLI binary can't reliably raise
+    // the prompt — so guard it so the test reports instead of hanging forever.
+    log::warn!("media-test: [1/3] CAMERA — opening (6s timeout) …");
+    let ecfg = EncoderConfig {
         codec: Codec::Vp8, width: 640, height: 480, bitrate_bps: 1_000_000, framerate: 30,
-        facing_front: true, preview: Some(pip), preview_layer: ZLayer::AboveUi,
-    }) {
-        Ok(mut enc) => {
+        facing_front: true, preview: Some(VideoRect { x: 0, y: 0, w: 320, h: 240 }),
+        preview_layer: ZLayer::AboveUi,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(VideoEncoder::open(&ecfg)); });
+    match rx.recv_timeout(Duration::from_secs(6)) {
+        Ok(Ok(mut enc)) => {
             let (mut got, start) = (0u32, Instant::now());
             while start.elapsed() < Duration::from_secs(2) {
                 if enc.next_frame().is_some() { got += 1; }
@@ -1719,7 +1725,8 @@ pub fn media_test() -> anyhow::Result<()> {
                 log::warn!("media-test: [1/3] CAMERA — opened but 0 frames (camera permission? lid closed?) ❌");
             }
         }
-        Err(e) => log::warn!("media-test: [1/3] CAMERA — open FAILED: {e:?} (no camera / permission denied) ❌"),
+        Ok(Err(e)) => log::warn!("media-test: [1/3] CAMERA — open FAILED: {e:?} (no camera / permission denied) ❌"),
+        Err(_) => log::warn!("media-test: [1/3] CAMERA — open TIMED OUT — macOS camera permission not granted (no TCC prompt for a CLI binary; grant your terminal app Camera access) ❌"),
     }
 
     // ── [2] Audio output (a tone you should hear) ────────────────────────────

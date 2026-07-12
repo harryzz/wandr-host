@@ -249,13 +249,23 @@ impl VideoEncoder {
         ff_init();
         let (w, h, fps) = (config.width, config.height, config.framerate.max(1));
 
-        // Camera 0 (facing isn't selectable on most desktop webcams). MJPEG is
-        // the smallest over a virtual/RDP pipe; nokhwa decodes it to RGB.
-        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
-            CameraFormat::new(Resolution::new(w, h), FrameFormat::MJPEG, fps),
-        ));
-        let mut camera = Camera::new(CameraIndex::Index(0), requested).map_err(|e| {
-            log::warn!("video_desktop: Camera::new failed: {e:?}");
+        // Camera 0 (facing isn't selectable on most desktop webcams). Try source
+        // formats in preference order: MJPEG is smallest over a virtual/RDP pipe
+        // (WSLg/Windows), but macOS built-in cameras DON'T offer MJPEG — only YUV
+        // variants — so fall back through NV12/YUYV/RAWRGB until one negotiates.
+        // nokhwa decodes any of these to RGB via RgbFormat.
+        let mut camera = None;
+        for &fmt in &[FrameFormat::MJPEG, FrameFormat::NV12, FrameFormat::YUYV, FrameFormat::RAWRGB] {
+            let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
+                CameraFormat::new(Resolution::new(w, h), fmt, fps),
+            ));
+            match Camera::new(CameraIndex::Index(0), requested) {
+                Ok(c) => { log::info!("video_desktop: camera opened as {fmt:?}"); camera = Some(c); break; }
+                Err(e) => log::debug!("video_desktop: camera format {fmt:?} unavailable: {e:?}"),
+            }
+        }
+        let mut camera = camera.ok_or_else(|| {
+            log::warn!("video_desktop: Camera::new failed for all formats (no camera / permission?)");
             VideoError::CodecInitFailed
         })?;
         let cam = camera.camera_format();
