@@ -846,6 +846,28 @@ impl SkiaRenderer {
         if let Some(tf) = self.typeface_cache.get(&key) {
             return tf.clone();
         }
+        // [desktop] Resolve OS-installed fonts BY NAME via Skia's system FontMgr
+        // (fontconfig / DirectWrite / CoreText). Verified by --font-probe: real metrics
+        // on desktop (the zero-metrics ban in CLAUDE.md is Android-only, where the system
+        // FontMgr is broken). This is what makes "app prerequisite: install font X" work —
+        // the guest asks for a family name and the host resolves the OS-installed font.
+        #[cfg(not(target_os = "android"))]
+        if !family.starts_with('/') {
+            let style = match (bold, italic) {
+                (true,  true ) => skia_safe::FontStyle::bold_italic(),
+                (true,  false) => skia_safe::FontStyle::bold(),
+                (false, true ) => skia_safe::FontStyle::italic(),
+                (false, false) => skia_safe::FontStyle::normal(),
+            };
+            if let Some(tf) = skia_safe::FontMgr::new().match_family_style(family, style) {
+                // Guard against the empty/zero-metrics typeface (defensive; not seen on desktop).
+                if tf.units_per_em().unwrap_or(0) > 0 && tf.count_glyphs() > 0 {
+                    log::info!("get_typeface: system-resolved '{family}' → '{}' (bold={bold} italic={italic})", tf.family_name());
+                    self.typeface_cache.insert(key.clone(), tf.clone());
+                    return tf;
+                }
+            }
+        }
         // If the family is an absolute path, try that first.
         let mut candidates: Vec<String> = Vec::new();
         if family.starts_with('/') {

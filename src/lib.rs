@@ -1635,6 +1635,33 @@ pub fn camera_preview_shot(outfile: &str) -> anyhow::Result<()> {
 /// Reproducer for the Signal self-view freeze: a simulated 60 fps UI render loop
 /// that also pumps the camera encoder each frame (as the call engine does).
 /// Measures how long the BLOCKING `next_frame()` (→ `camera.frame()`) stalls the
+/// `--font-probe`: does the skia-safe (0.93.1) prebuilt's system FontMgr resolve
+/// OS-installed fonts BY NAME with real (non-zero) metrics on this desktop? If yes,
+/// we can add a desktop "resolve-by-name via system FontMgr" path (leveraging the
+/// OS font install) instead of reading TTF files from a hardcoded preopen dir.
+#[cfg(not(target_os = "android"))]
+pub fn font_probe() {
+    use skia_safe::{FontMgr, FontStyle};
+    log::info!("font-probe: skia-safe 0.93.1 — testing system FontMgr resolve-by-name");
+    let mgrs: Vec<(&str, FontMgr)> = vec![
+        ("FontMgr::default()", FontMgr::default()),
+        ("FontMgr::new()", FontMgr::new()),
+    ];
+    for (label, mgr) in &mgrs {
+        let n = mgr.count_families();
+        log::info!("{label}: count_families = {n}");
+        for fam in ["DejaVu Sans", "Noto Sans", "Liberation Sans", "sans-serif", "Arial", "monospace", "Ubuntu"] {
+            match mgr.match_family_style(fam, FontStyle::normal()) {
+                Some(tf) => log::info!(
+                    "  match '{fam}': OK  resolved='{}'  unitsPerEm={:?}  glyphs={}",
+                    tf.family_name(), tf.units_per_em(), tf.count_glyphs()),
+                None => log::info!("  match '{fam}': None"),
+            }
+        }
+    }
+    log::info!("font-probe DONE. Real metrics = count_families>0 AND unitsPerEm>0 AND glyphs>0.");
+}
+
 /// loop, and the resulting effective frame rate. If the loop is capped far below
 /// 60 fps by the camera, that's the conceptual bug (capture couples the render
 /// thread to camera delivery). `--video-selfview-test`.

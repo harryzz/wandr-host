@@ -60,6 +60,16 @@ fn main() {
         }
         return;
     }
+    // `--font-probe`: does Skia's SYSTEM FontMgr resolve OS-installed fonts by NAME
+    // with real (non-zero) metrics on this desktop? (The zero-metrics ban in CLAUDE.md
+    // is Android-specific; verify before adding a desktop resolve-by-name path.)
+    if args.iter().any(|a| a == "--font-probe") {
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("info"),
+        ).try_init();
+        wasm_android_host::font_probe();
+        return;
+    }
     // Desktop `--run-once <app-id>`: one-shot a wasi:cli/command guest from
     // WANDR_APPS_ROOT (e.g. wandr.video.test), same as the device path. Headless
     // — no winit window. Mirrors the android main's --run-once branch.
