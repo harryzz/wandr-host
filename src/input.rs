@@ -149,7 +149,11 @@ pub fn dispatch_pointer_routed(
             buttons: buttons_v5(meta.buttons),
             alt: mods[0], ctrl: mods[1], meta: mods[2], shift: mods[3],
         };
-        crate::guest_call!(ph.wasi_input_handlers_pointer_handler().call_on_pointer(store, ev))?;
+        let r = crate::guest_call!(ph.wasi_input_handlers_pointer_handler().call_on_pointer(store, ev));
+        if let Err(e) = &r {
+            log::error!("on_pointer TRAP (kind={kind} x={x} y={y}): {e:#}");
+        }
+        r?;
         return Ok(());
     }
     Ok(())
