@@ -900,17 +900,15 @@ fn layout_text_style(
     }
     if !s.family.is_empty() {
         ts.set_font_families(&[s.family.as_str()]);
-        if s.family.starts_with('/')
-            || matches!(
-                s.family.as_str(),
-                "Noto Serif" | "NotoSerif" | "DejaVu Serif" | "Times New Roman"
-                    | "Noto Sans Mono" | "NotoSansMono" | "DejaVu Sans Mono"
-                    | "Consolas" | "Roboto Mono" | "RobotoMono"
-            )
-        {
-            let tf = renderer.get_typeface(&s.family, s.weight >= 600, s.italic);
-            ts.set_typeface(Some(tf));
-        }
+        // Resolve the family to a concrete typeface and set it explicitly. The FontCollection alone
+        // does NOT reliably resolve non-system families (an icon font like "tabler-icons", or an
+        // absolute TTF path, or Compose's Noto Serif/Mono) for shaping — so the run would fall back
+        // to a default font that lacks the requested glyph (e.g. Image(systemName:) icon codepoints
+        // → blank). get_typeface handles both absolute paths and by-name (Skia match_family_style).
+        let tf = renderer.get_typeface(&s.family, s.weight >= 600, s.italic);
+        log::debug!("layout_text_style: family='{}' → typeface '{}' (glyphs={})",
+                    s.family, tf.family_name(), tf.count_glyphs());
+        ts.set_typeface(Some(tf));
     }
     ts
 }

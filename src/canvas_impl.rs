@@ -846,12 +846,14 @@ impl SkiaRenderer {
         if let Some(tf) = self.typeface_cache.get(&key) {
             return tf.clone();
         }
-        // [desktop] Resolve OS-installed fonts BY NAME via Skia's system FontMgr
-        // (fontconfig / DirectWrite / CoreText). Verified by --font-probe: real metrics
-        // on desktop (the zero-metrics ban in CLAUDE.md is Android-only, where the system
-        // FontMgr is broken). This is what makes "app prerequisite: install font X" work —
-        // the guest asks for a family name and the host resolves the OS-installed font.
-        #[cfg(not(target_os = "android"))]
+        // Resolve OS/system-installed fonts BY NAME via Skia's system FontMgr (fontconfig /
+        // DirectWrite / CoreText / Android). Verified by --font-probe with REAL metrics on BOTH
+        // desktop AND device: the old Android zero-metrics bug (which forced the TTF-path
+        // fallback below) is fixed as of skia-safe 0.99 / Skia m150 (SkFontMgr_New_Android with an
+        // explicit FreeType scanner) — on device `match 'sans-serif'` → unitsPerEm=2048, glyphs=3362.
+        // The units_per_em/count_glyphs guard falls through to the TTF-path candidates if a manager
+        // ever returns an empty/zero-metrics typeface (defensive) or for families the system config
+        // doesn't expose by name (e.g. Compose's "Noto Serif"). Unified — no per-platform cfg gate.
         if !family.starts_with('/') {
             let style = match (bold, italic) {
                 (true,  true ) => skia_safe::FontStyle::bold_italic(),

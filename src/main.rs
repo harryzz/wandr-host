@@ -128,6 +128,16 @@ fn main() {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // [spike] `--font-probe` on device: does skia-safe 0.99 (Skia m150) resolve system fonts by
+    // name with real metrics? Logs go to logcat via android_logger (the working Android path).
+    if args.iter().any(|a| a == "--font-probe") {
+        android_logger::init_once(
+            android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+        );
+        wasm_android_host::font_probe();
+        return;
+    }
+
     if args.iter().any(|a| a == "--probe-ime") {
         android_logger::init_once(
             android_logger::Config::default().with_max_level(log::LevelFilter::Debug),

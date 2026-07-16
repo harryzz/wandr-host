@@ -1649,18 +1649,26 @@ pub fn camera_preview_shot(outfile: &str) -> anyhow::Result<()> {
 /// OS-installed fonts BY NAME with real (non-zero) metrics on this desktop? If yes,
 /// we can add a desktop "resolve-by-name via system FontMgr" path (leveraging the
 /// OS font install) instead of reading TTF files from a hardcoded preopen dir.
-#[cfg(not(target_os = "android"))]
 pub fn font_probe() {
     use skia_safe::{FontMgr, FontStyle};
-    log::info!("font-probe: skia-safe 0.93.1 — testing system FontMgr resolve-by-name");
+    log::info!("font-probe: skia-safe 0.99.0 (Skia m150) — testing system FontMgr resolve-by-name + metrics");
     let mgrs: Vec<(&str, FontMgr)> = vec![
         ("FontMgr::default()", FontMgr::default()),
         ("FontMgr::new()", FontMgr::new()),
     ];
+    // Extra families to probe from argv (anything after `--font-probe` that isn't a flag), so we
+    // can test custom families (e.g. lato/rubik from /product/etc/fonts_customization.xml, or a
+    // dropped-in tabler-icons) WITHOUT rebuilding.
+    let extra: Vec<String> = std::env::args()
+        .filter(|a| a != "--font-probe" && !a.starts_with('-'))
+        .skip(1)
+        .collect();
     for (label, mgr) in &mgrs {
         let n = mgr.count_families();
         log::info!("{label}: count_families = {n}");
-        for fam in ["DejaVu Sans", "Noto Sans", "Liberation Sans", "sans-serif", "Arial", "monospace", "Ubuntu"] {
+        let mut fams: Vec<&str> = vec!["sans-serif", "Roboto", "Noto Sans", "serif", "monospace", "Arial"];
+        fams.extend(extra.iter().map(|s| s.as_str()));
+        for fam in fams {
             match mgr.match_family_style(fam, FontStyle::normal()) {
                 Some(tf) => log::info!(
                     "  match '{fam}': OK  resolved='{}'  unitsPerEm={:?}  glyphs={}",

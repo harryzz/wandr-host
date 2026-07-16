@@ -79,8 +79,10 @@ cpufeatures        = "0.2"
 toml               = { version = "0.8", default-features = false, features = ["parse", "display"] }
 
 # skia-safe: GL backend only (no Vulkan needed — EGL gives us GLES)
+# [spike] bumped 0.93.1 -> 0.99.0 (Skia m144 -> m150) to test whether the newer Android
+# system font manager (explicit FreeType scanner) fixes match_family_style zero-metrics on device.
 [dependencies.skia-safe]
-version  = "0.93.1"
+version  = "0.99.0"
 features = ["gl", "textlayout", "embed-icudtl"]
 
 # winit for window + event loop — android-native-activity on Android
