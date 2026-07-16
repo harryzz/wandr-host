@@ -112,9 +112,14 @@ pub fn taskbar_height_px() -> u32 {
 /// logged warning if the shim doesn't export `sf_create_overlay_surface`
 /// (e.g. an older `libsf_surface.so` predating step 3c).
 pub fn run_with_engine(engine: &Engine, app_id: Option<&str>, mode: OverlayMode) -> Result<()> {
-    android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Debug),
-    );
+    // Debug by default (dev convenience — see everything without extra setup). Verbose per-frame
+    // debug!() calls (e.g. layout_text_style, once per text-shape) measurably cost frame time when
+    // profiling — set WANDR_LOG_LEVEL=info (or warn/error) to drop them without editing code.
+    let level = std::env::var("WANDR_LOG_LEVEL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(log::LevelFilter::Debug);
+    android_logger::init_once(android_logger::Config::default().with_max_level(level));
     // Surface guest WASI stderr + host panics to logcat (same as android_main).
     crate::wasi_stderr::redirect_stderr_to_logcat();
     log::info!("standalone: starting — no NativeActivity");

@@ -235,10 +235,20 @@ static PRELOADED_ENGINE: OnceLock<Engine> = OnceLock::new();
 /// The arg is accepted now so the CLI shape ages well.
 pub fn serve(preload_app_id: Option<&str>) -> Result<()> {
     // Logging up first — the zygote parent runs unattended; logcat is the
-    // only easy observation channel.
-    android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Debug),
-    );
+    // only easy observation channel. `init_once` is process-wide and fork()
+    // COW-inherits it into every forked child — this is the call site that
+    // actually governs log verbosity for every zygote-forked app (GUI/overlay/
+    // headless), NOT each child's own `--standalone`/etc. init (those run
+    // after fork, so their own `init_once` is a no-op against the already-
+    // initialized logger). Debug by default (dev convenience); set
+    // WANDR_LOG_LEVEL=info (or warn/error) before starting the zygote to drop
+    // verbose per-frame debug!() calls (e.g. layout_text_style, once per text
+    // shape) without editing code — they measurably cost frame time.
+    let level = std::env::var("WANDR_LOG_LEVEL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(log::LevelFilter::Debug);
+    android_logger::init_once(android_logger::Config::default().with_max_level(level));
     log::info!(
         "wandr-zygote: starting — sock={} preload_hint={:?}",
         ZYGOTE_SOCK_PATH,
