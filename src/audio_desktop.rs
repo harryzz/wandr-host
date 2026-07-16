@@ -90,15 +90,22 @@ fn stream_config(cfg: &TrackConfig, channels: usize, host_name: &str) -> cpal::S
     }
 }
 
-/// Build an OUTPUT stream at `dev_ch` device channels, up-mixing the ring's
-/// `logical`-channel audio in the callback (mono→stereo duplicates the sample).
-/// The ring always holds `logical`-channel frames — write_pcm_f32 is unchanged.
+/// Build an OUTPUT stream at `dev_ch` device channels and `stream_rate` device sample rate,
+/// up-mixing the ring's `logical`-channel audio in the callback (mono→stereo duplicates the
+/// sample) and linearly resampling if `stream_rate` differs from the ring's own `cfg.sample_rate`
+/// (a device that rejects the guest's rate outright — WASAPI shared mode requires an exact match
+/// to the current mix format, e.g. it demanded 48kHz and refused 44.1kHz). The ring always holds
+/// `logical`-channel frames at `cfg.sample_rate` — write_pcm_f32 is unchanged either way.
 fn build_output_adapting(
-    device: &cpal::Device, cfg: &TrackConfig, logical: usize, dev_ch: usize,
+    device: &cpal::Device, cfg: &TrackConfig, logical: usize, dev_ch: usize, stream_rate: u32,
     host_name: &str, ring: &Arc<Mutex<VecDeque<f32>>>, running: &Arc<AtomicBool>,
 ) -> Option<cpal::Stream> {
-    let config = stream_config(cfg, dev_ch, host_name);
+    let mut config = stream_config(cfg, dev_ch, host_name);
+    config.sample_rate = stream_rate;
+    // Logical (ring) frames consumed per device frame. 1.0 when rates match — no interpolation.
+    let ratio = cfg.sample_rate as f64 / stream_rate as f64;
     let (cb_ring, cb_running) = (Arc::clone(ring), Arc::clone(running));
+    let mut cursor: f64 = 0.0; // fractional read position, in logical frames, carried across calls
     device.build_output_stream(
         config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -107,33 +114,57 @@ fn build_output_adapting(
                 return;
             }
             let mut r = cb_ring.lock().unwrap_or_else(|e| e.into_inner());
+            let avail_frames = r.len() / logical.max(1);
             for frame in data.chunks_mut(dev_ch.max(1)) {
+                let idx = cursor as usize;
                 let mut lf = [0f32; 2];
                 for c in 0..logical {
-                    let v = r.pop_front().unwrap_or(0.0);
+                    let a = if idx < avail_frames { r[idx * logical + c] } else { 0.0 };
+                    let v = if ratio == 1.0 || idx + 1 >= avail_frames {
+                        a
+                    } else {
+                        let b = r[(idx + 1) * logical + c];
+                        let frac = cursor.fract() as f32;
+                        a + (b - a) * frac
+                    };
                     if c < 2 { lf[c] = v; }
                 }
                 for (c, out) in frame.iter_mut().enumerate() {
                     *out = if logical <= 1 { lf[0] } else { lf[c % 2] };
                 }
+                cursor += ratio;
+            }
+            // Drop whole logical frames the cursor has fully passed, so the ring doesn't grow
+            // unbounded and write_pcm_f32's backpressure cap stays meaningful.
+            let consumed = (cursor as usize).min(avail_frames);
+            if consumed > 0 {
+                r.drain(..consumed * logical);
+                cursor -= consumed as f64;
             }
         },
         move |err| log::warn!("audio_desktop: output stream error: {err}"),
         None,
     )
-    .map_err(|e| log::warn!("audio_desktop: build_output({dev_ch}ch@{}Hz) err: {e}", cfg.sample_rate))
+    .map_err(|e| log::warn!("audio_desktop: build_output({dev_ch}ch@{stream_rate}Hz, ring@{}Hz) err: {e}", cfg.sample_rate))
     .ok()
 }
 
-/// Build an INPUT stream at `dev_ch` device channels, down-mixing to the ring's
-/// `logical`-channel audio (stereo→mono averages the channels). The ring always
-/// holds `logical`-channel frames — read_pcm_f32 is unchanged.
+/// Build an INPUT stream at `dev_ch` device channels and `stream_rate` device sample rate,
+/// down-mixing to the ring's `logical`-channel audio (stereo→mono averages the channels) and
+/// linearly resampling if `stream_rate` differs from `cfg.sample_rate` (mirrors the output path's
+/// WASAPI-exact-rate constraint for capture devices). The ring always holds `logical`-channel
+/// frames at `cfg.sample_rate` — read_pcm_f32 is unchanged either way.
 fn build_input_adapting(
-    device: &cpal::Device, cfg: &TrackConfig, logical: usize, dev_ch: usize,
+    device: &cpal::Device, cfg: &TrackConfig, logical: usize, dev_ch: usize, stream_rate: u32,
     host_name: &str, ring: &Arc<Mutex<VecDeque<f32>>>, running: &Arc<AtomicBool>, cap: usize,
 ) -> Option<cpal::Stream> {
-    let config = stream_config(cfg, dev_ch, host_name);
+    let mut config = stream_config(cfg, dev_ch, host_name);
+    config.sample_rate = stream_rate;
+    // Logical (ring) frames produced per device frame. 1.0 when rates match — no interpolation.
+    let ratio = cfg.sample_rate as f64 / stream_rate as f64;
     let (cb_ring, cb_running) = (Arc::clone(ring), Arc::clone(running));
+    let mut carry: Option<Vec<f32>> = None; // previous device frame (down-mixed), for interpolation
+    let mut cursor: f64 = 0.0; // fractional write position, in logical frames
     device.build_input_stream(
         config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -142,21 +173,42 @@ fn build_input_adapting(
             }
             let mut r = cb_ring.lock().unwrap_or_else(|e| e.into_inner());
             for frame in data.chunks(dev_ch.max(1)) {
+                let mut logical_frame = vec![0f32; logical];
                 for c in 0..logical {
-                    let s = if logical <= 1 {
+                    logical_frame[c] = if logical <= 1 {
                         frame.iter().sum::<f32>() / frame.len().max(1) as f32
                     } else {
                         frame[c.min(frame.len().saturating_sub(1))]
                     };
-                    if r.len() >= cap { r.pop_front(); }
-                    r.push_back(s);
+                }
+                if ratio == 1.0 {
+                    for s in &logical_frame {
+                        if r.len() >= cap { r.pop_front(); }
+                        r.push_back(*s);
+                    }
+                } else {
+                    // Emit logical frames at the ring's rate by interpolating between the
+                    // previous and current device frame, advancing by `ratio` each output frame.
+                    if let Some(prev) = &carry {
+                        while cursor < 1.0 {
+                            let frac = cursor as f32;
+                            for c in 0..logical {
+                                let v = prev[c] + (logical_frame[c] - prev[c]) * frac;
+                                if r.len() >= cap { r.pop_front(); }
+                                r.push_back(v);
+                            }
+                            cursor += ratio;
+                        }
+                    }
+                    cursor -= 1.0;
+                    carry = Some(logical_frame);
                 }
             }
         },
         move |err| log::warn!("audio_desktop: input stream error: {err}"),
         None,
     )
-    .map_err(|e| log::warn!("audio_desktop: build_input({dev_ch}ch@{}Hz) err: {e}", cfg.sample_rate))
+    .map_err(|e| log::warn!("audio_desktop: build_input({dev_ch}ch@{stream_rate}Hz, ring@{}Hz) err: {e}", cfg.sample_rate))
     .ok()
 }
 
@@ -176,16 +228,30 @@ pub fn create_track(cfg: TrackConfig) -> u32 {
     let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(cap)));
     let running = Arc::new(AtomicBool::new(false));
 
-    // Try the guest's channel layout; WASAPI shared mode rejects a config that
-    // doesn't match the device mix format (mono on a stereo device — the Windows
-    // "peer can't hear me" bug), so fall back to the device's channels + up-mix.
-    let mut res = build_output_adapting(&device, &cfg, channels, channels, host.id().name(), &ring, &running);
-    if res.is_none() {
-        let d = device.default_output_config().map(|c| c.channels() as usize).unwrap_or(2);
-        if d != channels {
-            log::info!("audio_desktop: output {channels}ch rejected — retrying at device {d}ch (up-mix)");
-            res = build_output_adapting(&device, &cfg, channels, d, host.id().name(), &ring, &running);
-        }
+    // Try the guest's exact config first; WASAPI shared mode (and some ALSA/CoreAudio configs)
+    // reject anything that doesn't match the device's current mix format — mono on a stereo
+    // device (the Windows "peer can't hear me" bug), or a sample rate the device isn't currently
+    // running at (confirmed: a device defaulting to 48kHz flatly refused a 44.1kHz request).
+    // Fall back progressively to the device's own channels/rate, auto up-mixing/resampling in the
+    // stream callback so the guest never has to know or care — but WARN loudly each time, since a
+    // silent substitution here previously cost real debugging time diagnosing "why is there no
+    // sound" as if it were a guest-side bug.
+    let default_cfg = device.default_output_config().ok();
+    let dev_ch = default_cfg.as_ref().map(|c| c.channels() as usize).unwrap_or(channels);
+    let dev_rate = default_cfg.as_ref().map(|c| c.sample_rate()).unwrap_or(cfg.sample_rate);
+
+    let mut res = build_output_adapting(&device, &cfg, channels, channels, cfg.sample_rate, host.id().name(), &ring, &running);
+    if res.is_none() && dev_ch != channels {
+        log::warn!("audio_desktop: output {channels}ch@{}Hz rejected — retrying at device {dev_ch}ch (auto up/down-mix)", cfg.sample_rate);
+        res = build_output_adapting(&device, &cfg, channels, dev_ch, cfg.sample_rate, host.id().name(), &ring, &running);
+    }
+    if res.is_none() && dev_rate != cfg.sample_rate {
+        log::warn!("audio_desktop: output {channels}ch@{}Hz rejected — retrying at device rate {dev_rate}Hz (auto resample)", cfg.sample_rate);
+        res = build_output_adapting(&device, &cfg, channels, channels, dev_rate, host.id().name(), &ring, &running);
+    }
+    if res.is_none() && dev_ch != channels && dev_rate != cfg.sample_rate {
+        log::warn!("audio_desktop: output {channels}ch@{}Hz rejected — retrying at device {dev_ch}ch@{dev_rate}Hz (auto mix+resample)", cfg.sample_rate);
+        res = build_output_adapting(&device, &cfg, channels, dev_ch, dev_rate, host.id().name(), &ring, &running);
     }
     let Some(stream) = res else {
         log::warn!("audio_desktop: output track failed ({channels}ch@{}Hz)", cfg.sample_rate);
@@ -290,16 +356,27 @@ pub fn open_capture(cfg: TrackConfig) -> u32 {
     let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(cap)));
     let running = Arc::new(AtomicBool::new(false));
 
-    // Same as create_track: WASAPI shared mode rejects mono on a stereo mic
-    // (the Windows "peer can't hear me" bug), so fall back to the device's
-    // channels and down-mix to the guest's logical layout.
-    let mut res = build_input_adapting(&device, &cfg, channels, channels, host.id().name(), &ring, &running, cap);
-    if res.is_none() {
-        let d = device.default_input_config().map(|c| c.channels() as usize).unwrap_or(2);
-        if d != channels {
-            log::info!("audio_desktop: input {channels}ch rejected — retrying at device {d}ch (down-mix)");
-            res = build_input_adapting(&device, &cfg, channels, d, host.id().name(), &ring, &running, cap);
-        }
+    // Same class of issue as create_track: WASAPI shared mode (and some ALSA/CoreAudio configs)
+    // reject a mono request on a stereo mic, or a sample rate the device isn't currently running
+    // at. Fall back progressively to the device's own channels/rate, auto down-mixing/resampling
+    // in the capture callback — WARNing loudly each time so a silent substitution never looks like
+    // a guest-side bug.
+    let default_cfg = device.default_input_config().ok();
+    let dev_ch = default_cfg.as_ref().map(|c| c.channels() as usize).unwrap_or(channels);
+    let dev_rate = default_cfg.as_ref().map(|c| c.sample_rate()).unwrap_or(cfg.sample_rate);
+
+    let mut res = build_input_adapting(&device, &cfg, channels, channels, cfg.sample_rate, host.id().name(), &ring, &running, cap);
+    if res.is_none() && dev_ch != channels {
+        log::warn!("audio_desktop: input {channels}ch@{}Hz rejected — retrying at device {dev_ch}ch (auto down-mix)", cfg.sample_rate);
+        res = build_input_adapting(&device, &cfg, channels, dev_ch, cfg.sample_rate, host.id().name(), &ring, &running, cap);
+    }
+    if res.is_none() && dev_rate != cfg.sample_rate {
+        log::warn!("audio_desktop: input {channels}ch@{}Hz rejected — retrying at device rate {dev_rate}Hz (auto resample)", cfg.sample_rate);
+        res = build_input_adapting(&device, &cfg, channels, channels, dev_rate, host.id().name(), &ring, &running, cap);
+    }
+    if res.is_none() && dev_ch != channels && dev_rate != cfg.sample_rate {
+        log::warn!("audio_desktop: input {channels}ch@{}Hz rejected — retrying at device {dev_ch}ch@{dev_rate}Hz (auto mix+resample)", cfg.sample_rate);
+        res = build_input_adapting(&device, &cfg, channels, dev_ch, dev_rate, host.id().name(), &ring, &running, cap);
     }
     let Some(stream) = res else {
         log::warn!("audio_desktop: capture failed ({channels}ch@{}Hz)", cfg.sample_rate);
