@@ -808,7 +808,7 @@ impl ApplicationHandler for App {
                 .expect("window creation failed"),
         );
 
-        let renderer = canvas_impl::SkiaRenderer::new(window.clone())
+        let mut renderer = canvas_impl::SkiaRenderer::new(window.clone())
             .expect("renderer init failed");
 
         // Warm resume: a store + bindings are already alive from a previous
@@ -866,6 +866,7 @@ impl ApplicationHandler for App {
                     Ok(_)  => log::info!("preopened {} → /assets (read-only)", assets.display()),
                     Err(e) => log::warn!("preopen {} failed: {e:#}", assets.display()),
                 }
+                renderer.load_asset_fonts(&assets);
             }
             // Docker-style per-app host→guest mounts from the manifest
             // `[[mounts]]` — e.g. audio.player declares `~/Music → /music`.

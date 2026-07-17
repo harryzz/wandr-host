@@ -536,6 +536,7 @@ fn run_cwasm_loop(
             Ok(_)  => log::info!("standalone: preopened {} → /assets (read-only)", assets.display()),
             Err(e) => log::warn!("standalone: preopen {} failed: {e:#}", assets.display()),
         }
+        renderer.load_asset_fonts(&assets);
     }
     // Task 41 — /system/fonts/ preopen for the system-fonts dep.
     // Always-on, read-only. Guests that don't need fonts pay nothing

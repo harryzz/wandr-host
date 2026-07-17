@@ -174,6 +174,16 @@ pub struct SkiaRenderer {
 
     typeface_cache:   HashMap<(String, bool, bool), Typeface>,
     pub font_collection: skia_safe::textlayout::FontCollection,
+    /// Fonts the CURRENT APP bundles itself (scanned from its own `assets/fonts/` dir via
+    /// `load_asset_fonts`, called once real `assets_dir` is known — not available at
+    /// construction time for every SkiaRenderer variant, e.g. headless/test paths never load
+    /// this). Consulted by `get_typeface` ahead of system fonts (an app that ships its own font
+    /// wants THAT one used, not a same-named system font) and registered as the FontCollection's
+    /// asset font manager so regular text-layout fallback benefits too — mirrors how Flutter uses
+    /// `TypefaceFontProvider` for the exact same "app-bundled custom fonts" case. No per-app
+    /// hardcoding: any app can drop a .ttf/.otf in its own `assets/fonts/`, the host just scans
+    /// whatever's there, keyed by each file's own embedded family name (no manifest needed).
+    asset_font_mgr: Option<skia_safe::FontMgr>,
 }
 
 // Skia's RCHandle uses non-atomic refcounts so its types aren't auto-Send.
@@ -289,6 +299,7 @@ impl SkiaRenderer {
                 base_matrix: skia_safe::Matrix::new_identity(),
                 current_orient: 0,
                 typeface_cache:   HashMap::new(),
+                asset_font_mgr:   None,
                 font_collection:  Self::make_font_collection(),
             });
         }
@@ -312,6 +323,7 @@ impl SkiaRenderer {
                         base_matrix: skia_safe::Matrix::new_identity(),
                         current_orient: 0,
                         typeface_cache:   HashMap::new(),
+                        asset_font_mgr:   None,
                         font_collection:  Self::make_font_collection(),
                     });
                 }
@@ -337,6 +349,7 @@ impl SkiaRenderer {
                 base_matrix: skia_safe::Matrix::new_identity(),
                 current_orient: 0,
                 typeface_cache:   HashMap::new(),
+                asset_font_mgr:   None,
                 font_collection:  Self::make_font_collection(),
             })
         }
@@ -361,6 +374,7 @@ impl SkiaRenderer {
             base_matrix: skia_safe::Matrix::new_identity(),
             current_orient: 0,
             typeface_cache:   HashMap::new(),
+            asset_font_mgr:   None,
             font_collection:  Self::make_font_collection(),
         })
     }
@@ -460,6 +474,7 @@ impl SkiaRenderer {
             inset_top: 0, inset_bottom: 0, keyboard_base_px: 0,
             current_orient: orient,
             typeface_cache:   HashMap::new(),
+            asset_font_mgr:   None,
             font_collection:  Self::make_font_collection(),
         })
     }
@@ -590,6 +605,7 @@ impl SkiaRenderer {
     /// inherited because their textures live in the dying gr_context.
     pub fn inherit_caches_from(&mut self, old: &mut Self) {
         self.typeface_cache   = std::mem::take(&mut old.typeface_cache);
+        self.asset_font_mgr   = old.asset_font_mgr.take();
         // bitmap_canvases hold a raster Surface (CPU-only), safe to inherit.
         // font_collection holds a default-FontMgr; keep the freshly built
         // one to be safe (cheap to recreate).
@@ -693,6 +709,51 @@ impl SkiaRenderer {
         let mgr = skia_safe::FontMgr::new();
         fc.set_default_font_manager(mgr, None);
         fc
+    }
+
+    /// Scan `assets_dir/fonts/*.{ttf,otf}` and register them as this app's own font manager —
+    /// consulted by `get_typeface` ahead of system fonts, and wired into `font_collection` via
+    /// `set_asset_font_manager` so regular text-layout fallback benefits too (mirrors Flutter's
+    /// own `TypefaceFontProvider` use for app-bundled fonts). No manifest, no system-level
+    /// install on any platform: each font's OWN embedded family name is what gets matched
+    /// (`register_typeface(tf, None)` — `None` alias means "use the file's own name-table family"),
+    /// so this sidesteps entirely the system-font-install dance (Android /system/fonts +
+    /// /product/etc/fonts_customization.xml, Windows registry, Linux fontconfig) a bundled icon
+    /// font previously needed per platform. A no-op if the app has no `assets/fonts/` dir.
+    pub fn load_asset_fonts(&mut self, assets_dir: &std::path::Path) {
+        let fonts_dir = assets_dir.join("fonts");
+        let Ok(entries) = std::fs::read_dir(&fonts_dir) else {
+            return;
+        };
+        let mut provider = skia_safe::textlayout::TypefaceFontProvider::new();
+        let sys_mgr = skia_safe::FontMgr::new();
+        let mut loaded = 0u32;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            if ext != "ttf" && ext != "otf" {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                log::warn!("load_asset_fonts: couldn't read {}", path.display());
+                continue;
+            };
+            let Some(tf) = sys_mgr.new_from_data(&bytes, None) else {
+                log::warn!("load_asset_fonts: {} didn't parse as a font", path.display());
+                continue;
+            };
+            log::info!("load_asset_fonts: {} → family '{}' (glyphs={})",
+                       path.display(), tf.family_name(), tf.count_glyphs());
+            provider.register_typeface(tf, None);
+            loaded += 1;
+        }
+        if loaded == 0 {
+            return;
+        }
+        let mgr: skia_safe::FontMgr = provider.into();
+        self.font_collection.set_asset_font_manager(Some(mgr.clone()));
+        self.asset_font_mgr = Some(mgr);
+        log::info!("load_asset_fonts: {loaded} app-bundled font(s) registered from {}", fonts_dir.display());
     }
 
     pub fn canvas(&mut self) -> &Canvas {
@@ -845,6 +906,24 @@ impl SkiaRenderer {
         let key = (family.to_string(), bold, italic);
         if let Some(tf) = self.typeface_cache.get(&key) {
             return tf.clone();
+        }
+        // App-bundled fonts (assets/fonts/, loaded once via load_asset_fonts) take priority over
+        // system fonts — an app that ships its own font wants THAT one used, not a same-named
+        // system font. No per-platform install needed for these at all.
+        if !family.starts_with('/') {
+            if let Some(asset_mgr) = &self.asset_font_mgr {
+                let style = match (bold, italic) {
+                    (true,  true ) => skia_safe::FontStyle::bold_italic(),
+                    (true,  false) => skia_safe::FontStyle::bold(),
+                    (false, true ) => skia_safe::FontStyle::italic(),
+                    (false, false) => skia_safe::FontStyle::normal(),
+                };
+                if let Some(tf) = asset_mgr.match_family_style(family, style) {
+                    log::info!("get_typeface: app-asset-resolved '{family}' → '{}' (bold={bold} italic={italic})", tf.family_name());
+                    self.typeface_cache.insert(key.clone(), tf.clone());
+                    return tf;
+                }
+            }
         }
         // Resolve OS/system-installed fonts BY NAME via Skia's system FontMgr (fontconfig /
         // DirectWrite / CoreText / Android). Verified by --font-probe with REAL metrics on BOTH
