@@ -189,6 +189,21 @@ pub mod ui_shell_export_bindings {
             exports: { default: async },
         });
     }
+    /// Guaranteed-once "app entry point" probe (see ui-shell.wit's `startup`
+    /// interface doc comment for why this is a separate world from `events`).
+    pub mod startup {
+        #[cfg(not(feature = "p3-async"))]
+        wasmtime::component::bindgen!({
+            path: "../../wit/ui-shell.wit",
+            world: "startup-world",
+        });
+        #[cfg(feature = "p3-async")]
+        wasmtime::component::bindgen!({
+            path: "../../wit/ui-shell.wit",
+            world: "startup-world",
+            exports: { default: async },
+        });
+    }
 }
 mod logging_bindings {
     wasmtime::component::bindgen!({

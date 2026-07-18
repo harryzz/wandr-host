@@ -518,6 +518,16 @@ impl LoadedApp {
             crate::ui_shell_export_bindings::events::ShellEventsWorld::new(&mut *store, &instance).ok();
         let shell_pacing =
             crate::ui_shell_export_bindings::pacing::FramePacingWorld::new(&mut *store, &instance).ok();
+        // Guaranteed-once "app entry point" — probe AND call inline, right here before the
+        // first wasi:input-handlers call reaches the guest (same "call it once at instantiate
+        // time" shape as the CM-async engine-start spawn point below). Not retained afterward —
+        // it's called exactly once and never needed again, unlike shell_events/shell_pacing.
+        if let Some(su) =
+            crate::ui_shell_export_bindings::startup::StartupWorld::new(&mut *store, &instance).ok()
+        {
+            crate::guest_call!(su.wandr_ui_shell_startup().call_on_init(&mut *store))?;
+            log::info!("loader: app exports wandr:ui-shell/startup — called on-init once");
+        }
 
         // Arbiter Inc. 3c — optional alarm handler (same .ok() probe).
         let alarm_events =
