@@ -490,7 +490,8 @@ fn overlay_rect(mode: OverlayMode, orient: u32, pw: i32, ph: i32, t: i32, sb: i3
 fn run_cwasm_loop(
     engine: &wasmtime::Engine,
     loaded: LoadedApp,
-    renderer: crate::canvas_impl::SkiaRenderer,
+    // `mut` because load_asset_fonts (below) now takes &mut self (app-bundled font registration).
+    mut renderer: crate::canvas_impl::SkiaRenderer,
     sf: crate::sf_surface::SfSurface,
     // Task 62 — the surface's anchor (fullscreen vs which overlay edge).
     // Drives the rotated-rect geometry flip for overlays.
