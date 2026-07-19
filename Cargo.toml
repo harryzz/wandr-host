@@ -36,7 +36,7 @@ anyhow             = "1"
 log                = "0.4"
 # Shared sensor HAL (task 77) — the ISensorManager path, also used by the
 # arbiter's sensor driver. Cross-platform (off-android = no-op stubs).
-wandr-sensors-client  = { path = "../wandr-sensors-client" }
+wandr-sensors-client  = { path = "crates/wandr-sensors-client" }
 android_logger     = { version = "0.14", optional = true }
 env_logger         = { version = "0.11", optional = true }
 raw-window-handle  = "0.6"
@@ -109,7 +109,7 @@ tokio            = { version = "1", features = ["rt"] }
 # no AAudioService, no JVM). Decoupled, reusable crate; same rsbinder rev so
 # both share one ProcessState. Path dep during integration; switch to the
 # codeberg git dep once verified audible on-device.
-audioclient      = { package = "audioclient-rs", path = "../../external/audioclient-rs" }
+audioclient      = { package = "audioclient-rs", path = "crates/audioclient-rs" }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 env_logger = "0.11"
@@ -173,8 +173,8 @@ rsbinder-aidl = { git = "https://github.com/hiking90/rsbinder", rev = "5e999e04a
 # whose attributionSource.packageName is empty. (Not needed for createTrack itself;
 # that was the sessionId bug.) Applies to the whole graph incl. the audioclient crate.
 [patch."https://github.com/hiking90/rsbinder"]
-rsbinder      = { path = "../../external/rsbinder/rsbinder" }
-rsbinder-aidl = { path = "../../external/rsbinder/rsbinder-aidl" }
+rsbinder      = { path = "crates/rsbinder/rsbinder" }
+rsbinder-aidl = { path = "crates/rsbinder/rsbinder-aidl" }
 
 [features]
 # wasi-canvas default-on since the dioxus-canvas migration (stage 1):

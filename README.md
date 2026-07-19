@@ -1,122 +1,98 @@
 # wandr-host
 
-The Rust + wasmtime + skia-safe host that **replaces Android's ART runtime**
-with a WebAssembly Component runtime. It loads a Kotlin/Compose application
-compiled to WASM (the `.cwasm` file produced by [wandr-app](../wandr-app/))
-and renders it on real GPU hardware via Skia + EGL.
+The **portable WASM UI runtime host** for [wandr](https://codeberg.org/harryzz/wandr) —
+Rust + wasmtime (component model) + a skia-safe rendering core. It implements the
+[`wandr-wit`](https://github.com/harryzz/wandr-wit) contracts and delegates only the
+OS-specific bits to a per-platform backend.
 
-## What this app is for
+A guest app — *any* language, *any* UI framework — is compiled once to a WASM component
+against those contracts, and the same `.wasm` runs anywhere `wandr-host` has a backend.
+Shipped guest frameworks: Compose Multiplatform, Slint, dioxus, Avalonia,
+Swift/OpenSwiftUI.
 
-The full design goal of the `wandr` project is:
+| Platform | Status |
+|---|---|
+| **Android** (aarch64) | production backend — replaces ART end-to-end, real GPU via EGL + Skia, full `--no-art` native-service stack |
+| **Linux** (x86_64) | desktop/dev backend — winit + glutin, JIT |
+| **macOS** | desktop/dev backend |
+| **Windows** | desktop/dev backend (MSVC) |
 
-> *Run Kotlin/Compose apps on Android **without ART** — compile them to WASM
-> components and execute them under wasmtime, rendering with native Skia.*
+## Build
 
-`wandr-host` is the part that runs **on** the Android device:
-
-- A `cdylib` (`libwasm_android_host.so`) packaged into an APK with a
-  `NativeActivity` entry point — no Java / no ART for app logic.
-- Boots wasmtime, loads the precompiled `.cwasm` from app-private storage,
-  instantiates the WASM component, and dispatches WIT-imported calls to
-  native implementations.
-- Owns the EGL context, the Skia `Surface`, the winit event loop, and all
-  Android-side state. The WASM guest only talks to the host via WIT
-  interfaces.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Android device (Pixel 2 XL, Android 15 / API 35)           │
-│                                                             │
-│  ┌──────────────── wandr-host APK ───────────────────────┐   │
-│  │  NativeActivity → android_main (wandr-host cdylib)    │   │
-│  │     │                                                │   │
-│  │     ├─ winit event loop  (window, input, lifecycle)  │   │
-│  │     ├─ EGL context       (egl.rs)                    │   │
-│  │     ├─ skia-safe GPU canvas                          │   │
-│  │     │                                                │   │
-│  │     └─ wasmtime runtime                              │   │
-│  │           │                                          │   │
-│  │           ├─ loads skiko-component.cwasm             │   │
-│  │           │     (AOT-compiled for aarch64-android)   │   │
-│  │           │                                          │   │
-│  │           └─ implements WIT imports:                 │   │
-│  │                canvas_impl.rs                        │   │
-│  │                paragraph_impl.rs                     │   │
-│  │                window_impl.rs                        │   │
-│  │                scheduler_impl.rs                     │   │
-│  │                input.rs                              │   │
-│  │                lifecycle_impl.rs                     │   │
-│  │                clipboard_impl.rs                     │   │
-│  │                haptics_impl.rs                       │   │
-│  │                pointer_icon_impl.rs                  │   │
-│  │                text_segmentation_impl.rs             │   │
-│  │                locale_impl.rs                        │   │
-│  │                                                      │   │
-│  └──────────────────────────────────────────────────────┘   │
-│           │                              │                  │
-│           ▼ EGL/GL                       ▼ Bionic libc      │
-│       GPU surface                    Android NDK            │
-└─────────────────────────────────────────────────────────────┘
+```bash
+git clone --recurse-submodules https://github.com/harryzz/wandr-host
+cd wandr-host
+cargo build --release
 ```
 
-## Source layout
+`cargo build` targets the **host** platform — there is deliberately no default target in
+`.cargo/config.toml`, so a fresh clone just works. If you cloned without submodules, a
+desktop build needs only three:
 
-| File | Role |
-|------|------|
-| `src/lib.rs` | Entry point — registers `android_main`, owns winit `App`, sets up wasmtime `Engine` + `Store` + `Linker` |
-| `src/main.rs` | Desktop binary stub (Android uses `android_main` in the cdylib) |
-| `src/egl.rs` | EGL context creation from the `ANativeWindow`, skia-safe `Surface` setup |
-| `src/canvas_impl.rs` | Skia drawing primitives — `draw_rect`, `draw_path`, `make_paint`, text blob registry, host-side `WasiDrawable` (the C++ shim in `cpp/wasi_drawable.cpp`) |
-| `src/paragraph_impl.rs` | Skia paragraph layout — `getRectsForRange` / `getGlyphPositionAtCoordinate` / `getWordBoundary` |
-| `src/window_impl.rs` | Window metrics (size, scale, insets) exposed via WIT |
-| `src/scheduler_impl.rs` | Host-side frame scheduling, `withFrameNanos` driver, delay() |
-| `src/input.rs` | winit `WindowEvent` → WIT exports (`on-pointer-event`, `on-key-event-v2`) |
-| `src/lifecycle_impl.rs` | Activity lifecycle proxy events (focused/unfocused → Started/Stopped) |
-| `src/clipboard_impl.rs` | Cut/copy/paste plumbing |
-| `src/haptics_impl.rs` | Haptic feedback stubs |
-| `src/pointer_icon_impl.rs` | Cursor icon changes |
-| `src/text_segmentation_impl.rs` | ICU grapheme/word/line break for cursor stepping |
-| `src/locale_impl.rs` | Locale provider |
-| `src/bionic_compat.rs` | NDK linker shims — symbol redirects for older libc functions Skia/wasmtime expect |
-| `cpp/wasi_drawable.cpp` | `SkDrawable` subclass with a *mutable* `sk_sp<SkPicture>` so child layers swap pictures without invalidating parent recordings |
-| `cpp/wasi_drawable.h` | C ABI for the C++ shim |
-| `build.rs` | Builds `wasi_drawable.cpp` against vendored Skia headers, links against skia-bindings' static lib |
-| `assets/skiko-component.cwasm` | The AOT-compiled WASM component (built from [wandr-app](../wandr-app/)). Embedded into the APK; also overridable from app-private external storage |
-| `vendor/skia-src/` | Vendored Skia headers (at the skia-bindings 0.93.1 commit) for the C++ shim's `#include`s |
-| `.cargo/config.toml` | Cross-compile config — sets aarch64-linux-android target, NDK linker, sysroot |
+```bash
+git submodule update --init --depth 1 contracts crates/wandr-sensors-client vendor/skia-src
+```
+
+### Linux system packages
+
+```bash
+sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+  libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev \
+  libasound2-dev libpulse-dev libfontconfig1-dev clang ninja-build
+```
+
+### Android (cross build)
+
+Android additionally needs the NDK and the AOSP submodules, which `build.rs` reads to
+generate AIDL bindings:
+
+```bash
+git submodule update --init --recursive        # ~2.3 GB (AOSP trees, shallow)
+export ANDROID_NDK_HOME=/path/to/android-ndk
+cargo install cargo-ndk
+cargo ndk -t arm64-v8a -p 30 build --release
+```
+
+Convenience wrappers live in `scripts/` (`build-host-linux.sh`, `-macos.sh`,
+`-android.sh`, `build-host-windows.bat`). CI builds all four targets — see
+`.github/workflows/build.yml`.
+
+For the deeper Android toolchain notes (API levels, `cargo apk`, device install), see
+[BUILD.md](BUILD.md).
+
+## Layout
+
+| Path | Role |
+|---|---|
+| `src/lib.rs` | wasmtime `Engine`/`Store`/`Linker` setup, the WIT host implementations, winit `App` |
+| `src/canvas_impl.rs`, `src/wasi_canvas_002_impl.rs` | Skia drawing — rects/paths/paragraphs/images, `wasi:canvas` host side |
+| `src/egl.rs` | EGL context from the `ANativeWindow`, skia-safe `Surface` |
+| `src/app_loader.rs` | installs/loads app packages, AOT `.cwasm` cache + cache-key validation |
+| `src/input.rs`, `src/ime_impl.rs` | pointer/key events, IME |
+| `src/sensors_impl.rs` | `wandr:device/sensors` — a thin adapter over `crates/wandr-sensors-client` |
+| `src/standalone.rs`, `src/zygote.rs` | the `--no-art` / zygote-fork runtime paths |
+| `src/bionic_compat.rs` | NDK linker shims for libc symbols Skia/wasmtime expect |
+| `cpp/` | the C++ shims built by `build.rs` (`SkDrawable` with a swappable `SkPicture`, libgui/SurfaceFlinger) |
+| `contracts/` | submodule → [wandr-wit](https://github.com/harryzz/wandr-wit) — the WIT contracts this host implements |
+| `crates/wandr-sensors-client/` | submodule → [sensorservice client](https://github.com/harryzz/wandr-sensors-client) |
+| `crates/rsbinder`, `crates/audioclient-rs` | submodules — Android binder / audio (Android-only) |
+| `vendor/` | AOSP trees for AIDL codegen, plus `skia-src` headers for the C++ shims |
+| `.cargo/config.toml` | ARMv8 crypto `--cfg` flags for the Android target. **No** forced target and **no** absolute NDK paths |
 
 ## How a frame happens
 
-1. winit delivers `WindowEvent::RedrawRequested` to `App::window_event`.
-2. `App` calls the WIT export `render-frame(width, height, scale)` on the guest.
-3. Guest's Compose runtime traverses its layer tree, building up `WasiDrawable`
-   pictures.
-4. For each draw call (rect/path/text/image/...), the guest invokes a WIT
-   import like `canvas.draw-rect(x, y, w, h, paint-attrs)`.
-5. The host implementation in `canvas_impl.rs` translates `paint-attrs` to a
-   `skia_safe::Paint`, calls `canvas.draw_rect(rect, &paint)`, and the GPU does
-   the actual rasterization.
-6. Frame ends, EGL swaps buffers.
+1. The backend delivers a redraw (winit `RedrawRequested`, or the standalone render loop).
+2. The host calls the guest's `render-frame` WIT export.
+3. The guest's UI framework traverses its layer tree and issues draw calls.
+4. Each draw call arrives as a WIT import — e.g. `canvas.draw-rect(...)`.
+5. The host translates it to `skia_safe` and the GPU rasterizes.
+6. EGL/GL swaps buffers.
 
-## Where the `.cwasm` comes from
+Rendering is on-demand: guests that export frame-pacing only redraw when dirty.
 
-`assets/skiko-component.cwasm` is the **default** component embedded at APK
-build time. To override on a running device (no APK rebuild):
+## Relationship to the wandr repo
 
-```bash
-adb push /tmp/wandr-aot/skiko-component.cwasm \
-    /sdcard/Android/data/com.example.wasmruntime/files/skiko-component.cwasm
-```
-
-The host checks app-private external storage first; if a `.cwasm` is there it
-wins over the embedded asset. Hot-reload cycle is ~5 seconds.
-
-See `wandr-app/BUILD.md` for how to produce `skiko-component.cwasm` from the
-Kotlin/Compose source.
-
-## Build & install
-
-See [BUILD.md](BUILD.md) for the full toolchain setup, NDK env vars, target API
-levels, and the `cargo apk build` + `adb install` cycle.
+[`wandr`](https://codeberg.org/harryzz/wandr) is the umbrella project — apps, guest
+crates, the arbiter (window server / system coordinator), docs — and carries this repo as
+a submodule at `runtime/wandr-host`. This repo is split out so the host can be cloned and
+built on its own, per platform, without the monorepo.

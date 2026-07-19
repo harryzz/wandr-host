@@ -104,7 +104,7 @@ pub mod run_once;
 mod ime_bindings {
     #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
-        path: "../../wit/ime.wit",
+        path: "contracts/wit/ime.wit",
         world: "ime-events",
     });
     // Task 115 — async twin: export call methods become `async fn` (call_async
@@ -112,7 +112,7 @@ mod ime_bindings {
     // `guest_call!`. Same pattern on every export-probe world below.
     #[cfg(feature = "p3-async")]
     wasmtime::component::bindgen!({
-        path: "../../wit/ime.wit",
+        path: "contracts/wit/ime.wit",
         world: "ime-events",
         exports: { default: async },
     });
@@ -129,7 +129,7 @@ mod wasi_canvas_impl;
 #[cfg(feature = "wasi-canvas")]
 mod wasi_canvas_002_bindings {
     wasmtime::component::bindgen!({
-        path: "../../proposals/wasi-canvas/wit",
+        path: "contracts/proposals/wasi-canvas/wit",
         world: "canvas-host",
         imports: { default: trappable },
         with: {
@@ -157,7 +157,7 @@ mod wasi_canvas_002_impl;
 /// keeps serving until Phase C.
 mod ui_shell_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/ui-shell.wit",
+        path: "contracts/wit/ui-shell.wit",
         world: "ui-shell-imports",
     });
 }
@@ -166,12 +166,12 @@ pub mod ui_shell_export_bindings {
     pub mod events {
         #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
-            path: "../../wit/ui-shell.wit",
+            path: "contracts/wit/ui-shell.wit",
             world: "shell-events-world",
         });
         #[cfg(feature = "p3-async")]
         wasmtime::component::bindgen!({
-            path: "../../wit/ui-shell.wit",
+            path: "contracts/wit/ui-shell.wit",
             world: "shell-events-world",
             exports: { default: async },
         });
@@ -179,12 +179,12 @@ pub mod ui_shell_export_bindings {
     pub mod pacing {
         #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
-            path: "../../wit/ui-shell.wit",
+            path: "contracts/wit/ui-shell.wit",
             world: "frame-pacing-world",
         });
         #[cfg(feature = "p3-async")]
         wasmtime::component::bindgen!({
-            path: "../../wit/ui-shell.wit",
+            path: "contracts/wit/ui-shell.wit",
             world: "frame-pacing-world",
             exports: { default: async },
         });
@@ -194,12 +194,12 @@ pub mod ui_shell_export_bindings {
     pub mod startup {
         #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
-            path: "../../wit/ui-shell.wit",
+            path: "contracts/wit/ui-shell.wit",
             world: "startup-world",
         });
         #[cfg(feature = "p3-async")]
         wasmtime::component::bindgen!({
-            path: "../../wit/ui-shell.wit",
+            path: "contracts/wit/ui-shell.wit",
             world: "startup-world",
             exports: { default: async },
         });
@@ -207,31 +207,31 @@ pub mod ui_shell_export_bindings {
 }
 mod logging_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/deps-upstream/logging",
+        path: "contracts/wit/deps-upstream/logging",
         world: "imports",
     });
 }
 mod device_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/device.wit",
+        path: "contracts/wit/device.wit",
         world: "device-imports",
     });
 }
 mod chrome_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/chrome.wit",
+        path: "contracts/wit/chrome.wit",
         world: "chrome-imports",
     });
 }
 mod assets_pkg_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/assets.wit",
+        path: "contracts/wit/assets.wit",
         world: "assets-imports",
     });
 }
 mod keyboard_send_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/ime.wit",
+        path: "contracts/wit/ime.wit",
         world: "keyboard-send-imports",
     });
 }
@@ -243,7 +243,7 @@ mod consolidated_impl;
 /// directly instead of migrating twice).
 mod wasi_audio_bindings {
     wasmtime::component::bindgen!({
-        path: "../../proposals/wasi-audio/wit",
+        path: "contracts/proposals/wasi-audio/wit",
         world: "audio-guest",
         with: {
             "wasi:audio/pcm.playback": crate::wasi_audio_impl::PlaybackRes,
@@ -261,12 +261,12 @@ pub mod input_handlers_002_bindings {
     pub mod pointer {
         #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit",
+            path: "contracts/proposals/wasi-input-handlers/wit",
             world: "pointer-handler-world",
         });
         #[cfg(feature = "p3-async")]
         wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit",
+            path: "contracts/proposals/wasi-input-handlers/wit",
             world: "pointer-handler-world",
             exports: { default: async },
         });
@@ -274,12 +274,12 @@ pub mod input_handlers_002_bindings {
     pub mod key {
         #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit",
+            path: "contracts/proposals/wasi-input-handlers/wit",
             world: "key-handler-world",
         });
         #[cfg(feature = "p3-async")]
         wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit",
+            path: "contracts/proposals/wasi-input-handlers/wit",
             world: "key-handler-world",
             exports: { default: async },
         });
@@ -287,12 +287,12 @@ pub mod input_handlers_002_bindings {
     pub mod frame {
         #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit",
+            path: "contracts/proposals/wasi-input-handlers/wit",
             world: "frame-handler-world",
         });
         #[cfg(feature = "p3-async")]
         wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit",
+            path: "contracts/proposals/wasi-input-handlers/wit",
             world: "frame-handler-world",
             exports: { default: async },
         });
@@ -300,12 +300,12 @@ pub mod input_handlers_002_bindings {
     pub mod gesture {
         #[cfg(not(feature = "p3-async"))]
         wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit",
+            path: "contracts/proposals/wasi-input-handlers/wit",
             world: "gesture-handler-world",
         });
         #[cfg(feature = "p3-async")]
         wasmtime::component::bindgen!({
-            path: "../../proposals/wasi-input-handlers/wit",
+            path: "contracts/proposals/wasi-input-handlers/wit",
             world: "gesture-handler-world",
             exports: { default: async },
         });
@@ -317,7 +317,7 @@ pub mod input_handlers_002_bindings {
 /// `alarm_host_impl.rs`) and `add_to_linker`s it onto every guest's linker.
 mod alarm_host_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/alarm.wit",
+        path: "contracts/wit/alarm.wit",
         world: "alarm-host",
     });
 }
@@ -328,7 +328,7 @@ mod alarm_host_bindings {
 /// onto every guest's linker.
 mod task_manager_host_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/task-manager.wit",
+        path: "contracts/wit/task-manager.wit",
         world: "task-manager-host",
     });
 }
@@ -342,7 +342,7 @@ mod task_manager_host_bindings {
 /// the missing import) — that *is* the gate.
 mod wifi_host_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/connectivity.wit",
+        path: "contracts/wit/connectivity.wit",
         world: "wifi-host",
     });
 }
@@ -356,7 +356,7 @@ mod wifi_host_bindings {
 /// own keys). See `crypto_host_impl.rs`.
 mod crypto_host_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/crypto.wit",
+        path: "contracts/wit/crypto.wit",
         world: "crypto-host",
         with: {
             "wandr:crypto/hash.hasher": crate::crypto_host_impl::HasherState,
@@ -376,7 +376,7 @@ mod crypto_host_bindings {
 /// (NDK camera2/mediandk, promoted from the `--probe-video` spike).
 mod video_host_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/video.wit",
+        path: "contracts/wit/video.wit",
         world: "video-host",
         with: {
             "wandr:video/encoder.video-encoder": crate::video_host_impl::EncoderState,
@@ -392,7 +392,7 @@ mod video_host_bindings {
 /// `package.toml [events] subscribe`.
 mod events_host_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/events.wit",
+        path: "contracts/wit/events.wit",
         world: "events-host",
     });
 }
@@ -404,12 +404,12 @@ mod events_host_bindings {
 mod events_incoming_bindings {
     #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
-        path: "../../wit/events.wit",
+        path: "contracts/wit/events.wit",
         world: "events-incoming",
     });
     #[cfg(feature = "p3-async")]
     wasmtime::component::bindgen!({
-        path: "../../wit/events.wit",
+        path: "contracts/wit/events.wit",
         world: "events-incoming",
         exports: { default: async },
     });
@@ -421,12 +421,12 @@ mod events_incoming_bindings {
 mod alarm_events_bindings {
     #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
-        path: "../../wit/alarm.wit",
+        path: "contracts/wit/alarm.wit",
         world: "alarm-events",
     });
     #[cfg(feature = "p3-async")]
     wasmtime::component::bindgen!({
-        path: "../../wit/alarm.wit",
+        path: "contracts/wit/alarm.wit",
         world: "alarm-events",
         exports: { default: async },
     });
@@ -440,12 +440,12 @@ mod alarm_events_bindings {
 mod background_events_bindings {
     #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
-        path: "../../wit/background.wit",
+        path: "contracts/wit/background.wit",
         world: "background-events",
     });
     #[cfg(feature = "p3-async")]
     wasmtime::component::bindgen!({
-        path: "../../wit/background.wit",
+        path: "contracts/wit/background.wit",
         world: "background-events",
         exports: { default: async },
     });
@@ -456,7 +456,7 @@ mod background_events_bindings {
 /// and `add_to_linker`s it onto every guest's linker.
 mod notify_host_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/notify.wit",
+        path: "contracts/wit/notify.wit",
         world: "notify-host",
     });
 }
@@ -466,7 +466,7 @@ mod notify_host_bindings {
 /// `add_to_linker`s it onto guests (the keyguard guest imports it).
 mod keyguard_host_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/keyguard.wit",
+        path: "contracts/wit/keyguard.wit",
         world: "keyguard-host",
     });
 }
@@ -477,12 +477,12 @@ mod keyguard_host_bindings {
 mod notify_events_bindings {
     #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
-        path: "../../wit/notify.wit",
+        path: "contracts/wit/notify.wit",
         world: "notify-events",
     });
     #[cfg(feature = "p3-async")]
     wasmtime::component::bindgen!({
-        path: "../../wit/notify.wit",
+        path: "contracts/wit/notify.wit",
         world: "notify-events",
         exports: { default: async },
     });
@@ -493,7 +493,7 @@ mod notify_events_bindings {
 /// `audio_focus_host_impl.rs`) and `add_to_linker`s it onto every guest.
 mod audio_focus_host_bindings {
     wasmtime::component::bindgen!({
-        path: "../../wit/audio-focus.wit",
+        path: "contracts/wit/audio-focus.wit",
         world: "audio-focus-host",
     });
 }
@@ -504,12 +504,12 @@ mod audio_focus_host_bindings {
 mod audio_focus_events_bindings {
     #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
-        path: "../../wit/audio-focus.wit",
+        path: "contracts/wit/audio-focus.wit",
         world: "audio-focus-events",
     });
     #[cfg(feature = "p3-async")]
     wasmtime::component::bindgen!({
-        path: "../../wit/audio-focus.wit",
+        path: "contracts/wit/audio-focus.wit",
         world: "audio-focus-events",
         exports: { default: async },
     });
@@ -522,7 +522,7 @@ mod audio_focus_events_bindings {
 /// (`wandr:chrome/now-playing`) is implemented in the same module.
 mod media_session_host_bindings {
     wasmtime::component::bindgen!({
-        path: "../../proposals/wasi-media-session/wit",
+        path: "contracts/proposals/wasi-media-session/wit",
         world: "media-session-host",
     });
 }
@@ -533,12 +533,12 @@ mod media_session_host_bindings {
 mod media_session_events_bindings {
     #[cfg(not(feature = "p3-async"))]
     wasmtime::component::bindgen!({
-        path: "../../proposals/wasi-media-session/wit",
+        path: "contracts/proposals/wasi-media-session/wit",
         world: "media-session-events",
     });
     #[cfg(feature = "p3-async")]
     wasmtime::component::bindgen!({
-        path: "../../proposals/wasi-media-session/wit",
+        path: "contracts/proposals/wasi-media-session/wit",
         world: "media-session-events",
         exports: { default: async },
     });

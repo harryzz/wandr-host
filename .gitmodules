@@ -1,0 +1,48 @@
+[submodule "vendor/skia-src"]
+	path = vendor/skia-src
+	url = https://github.com/rust-skia/skia.git
+	shallow = true
+[submodule "vendor/aosp-hardware-interfaces"]
+	path = vendor/aosp-hardware-interfaces
+	url = https://android.googlesource.com/platform/hardware/interfaces
+	shallow = true
+[submodule "vendor/aosp-frameworks-hardware-interfaces"]
+	path = vendor/aosp-frameworks-hardware-interfaces
+	url = https://android.googlesource.com/platform/frameworks/hardware/interfaces
+	shallow = true
+[submodule "vendor/aosp-frameworks-av"]
+	path = vendor/aosp-frameworks-av
+	url = https://android.googlesource.com/platform/frameworks/av
+[submodule "vendor/aosp-system-hardware-interfaces"]
+	path = vendor/aosp-system-hardware-interfaces
+	url = https://android.googlesource.com/platform/system/hardware/interfaces
+[submodule "vendor/aosp-frameworks-native"]
+	path = vendor/aosp-frameworks-native
+	url = https://android.googlesource.com/platform/frameworks/native
+[submodule "vendor/aosp-frameworks-base"]
+	path = vendor/aosp-frameworks-base
+	url = https://android.googlesource.com/platform/frameworks/base
+	shallow = true
+[submodule "vendor/aosp-packages-modules-dnsresolver"]
+	path = vendor/aosp-packages-modules-dnsresolver
+	url = https://android.googlesource.com/platform/packages/modules/DnsResolver
+	branch = android15-qpr1-release
+[submodule "vendor/aosp-packages-modules-connectivity"]
+	path = vendor/aosp-packages-modules-connectivity
+	url = https://android.googlesource.com/platform/packages/modules/Connectivity
+	branch = android15-qpr1-release
+[submodule "contracts"]
+	path = contracts
+	url = https://github.com/harryzz/wandr-wit.git
+[submodule "crates/wandr-sensors-client"]
+	path = crates/wandr-sensors-client
+	url = https://github.com/harryzz/wandr-sensors-client.git
+[submodule "crates/audioclient-rs"]
+	path = crates/audioclient-rs
+	url = https://codeberg.org/harryzz/audioclient-rs.git
+	shallow = true
+[submodule "crates/rsbinder"]
+	path = crates/rsbinder
+	url = https://codeberg.org/harryzz/rsbinder.git
+	branch = wandr-recursive
+	shallow = true

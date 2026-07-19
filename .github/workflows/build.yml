@@ -1,0 +1,115 @@
+name: build
+
+# wandr-host builds for the HOST platform by default (no forced target in
+# .cargo/config.toml), so Linux/macOS/Windows are plain `cargo build`. Android is a
+# cross build via cargo-ndk and additionally needs the AOSP submodules, which build.rs
+# reads to generate AIDL bindings — hence its own job with submodule caching.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-latest }
+          - { name: macos-aarch64,  os: macos-latest }
+          - { name: windows-x86_64, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Contracts (wandr-wit) + wandr-hal-sensors are required to compile; the AOSP
+          # vendor submodules are Android-only. Fetch just what the desktop build needs.
+          submodules: false
+
+      - name: Fetch required submodules (contracts, hal-sensors, skia headers)
+        shell: bash
+        run: |
+          git submodule update --init --depth 1 contracts crates/wandr-sensors-client vendor/skia-src
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      # skia-safe + the winit/EGL desktop backend need X11/Wayland/GL dev headers.
+      - name: Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev \
+            libasound2-dev libpulse-dev libfontconfig1-dev clang ninja-build
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked --no-run
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wandr-host-${{ matrix.name }}
+          path: |
+            target/release/wasm-android-host
+            target/release/wasm-android-host.exe
+          if-no-files-found: warn
+
+  android:
+    name: android-aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      # The AOSP trees are large even shallow; cache them so only the first run pays.
+      - name: Cache AOSP vendor submodules
+        uses: actions/cache@v4
+        with:
+          path: |
+            .git/modules/vendor
+            vendor
+          key: aosp-vendor-${{ hashFiles('.gitmodules') }}
+
+      - name: Fetch submodules (contracts, hal-sensors, skia, AOSP)
+        run: git submodule update --init --depth 1 --recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-aarch64
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build (aarch64-linux-android)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo ndk -t arm64-v8a -p 30 build --release --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wandr-host-android-aarch64
+          path: target/aarch64-linux-android/release/wasm-android-host
+          if-no-files-found: warn

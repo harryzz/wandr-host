@@ -1,19 +1,15 @@
-[build]
-target = "aarch64-linux-android"
+# wandr-host cargo config.
+#
+# NOTE: deliberately NO `[build] target` — the host builds for the HOST platform by
+# default (Linux / macOS / Windows), so a fresh clone just works with `cargo build`.
+# Android is a CROSS build, driven by scripts/build-host-android.sh, which uses
+# cargo-ndk to supply the linker/ar/sysroot from $ANDROID_NDK_HOME. Pinning one
+# machine's absolute NDK path here is what made this crate un-clonable before the split.
 
 [target.aarch64-linux-android]
-ar = "/home/harry/android-ndk-r27d/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-linker = "/home/harry/android-ndk-r27d/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
-rustflags = [
-    "-C", "link-arg=--sysroot=/home/harry/android-ndk-r27d/toolchains/llvm/prebuilt/linux-x86_64/sysroot",
-    "-C", "link-arg=-fuse-ld=lld",
-    # Task 93 Phase A — opt RustCrypto into its aarch64 HW backends. These crates
-    # gate the ARMv8 AES + PMULL(GHASH) intrinsics behind `--cfg` flags (not the
-    # target feature), then auto-detect at runtime on Linux/Android. Without them AES
-    # falls back to constant-time SOFTWARE (probe: AES-256-GCM 39 MB/s, slower than
-    # ChaCha). `aes_armv8` → AES (CTR/CBC/CMAC/GCM block); `polyval_armv8` → GHASH (the
-    # other half of AES-GCM). (SHA-2 HW would need the sha2 `asm` feature — deferred;
-    # Signal SRTP is GCM, not HMAC-SHA.)
-    "--cfg", "aes_armv8",
-    "--cfg", "polyval_armv8",
-]
+# Opt RustCrypto into its aarch64 HW backends. These crates gate the ARMv8 AES +
+# PMULL(GHASH) intrinsics behind `--cfg` flags (not target features), then auto-detect
+# at runtime. Without them AES falls back to constant-time SOFTWARE (measured:
+# AES-256-GCM 39 MB/s — slower than ChaCha). `aes_armv8` → AES (CTR/CBC/CMAC/GCM
+# block); `polyval_armv8` → GHASH (the other half of AES-GCM).
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
