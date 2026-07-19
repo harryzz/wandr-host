@@ -24,6 +24,7 @@ jobs:
         include:
           - { name: linux-x86_64,   os: ubuntu-latest }
           - { name: macos-aarch64,  os: macos-latest }
+          - { name: macos-x86_64,   os: macos-13 }
           - { name: windows-x86_64, os: windows-latest }
     steps:
       - uses: actions/checkout@v4
@@ -75,11 +76,15 @@ jobs:
           echo "FFMPEG_DIR=$dir" >> $env:GITHUB_ENV
           echo "$dir\bin" >> $env:GITHUB_PATH
 
+      # Match scripts/build-host-*.{sh,bat}: they all default to P3=1 (--features
+      # p3-async). It is NOT in `default`, so a plain `cargo build` yields a host with no
+      # WASI 0.3 surface — guests importing wasi:sockets@0.3.0 then fail to instantiate
+      # with "resource implementation is missing".
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --features p3-async
 
       - name: Test
-        run: cargo test --release --locked --no-run
+        run: cargo test --release --locked --features p3-async --no-run
 
       - uses: actions/upload-artifact@v4
         with:
@@ -129,7 +134,7 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
-        run: cargo ndk -t arm64-v8a --platform 30 build --release --locked
+        run: cargo ndk -t arm64-v8a --platform 30 build --release --locked --features p3-async
 
       - uses: actions/upload-artifact@v4
         with:
