@@ -51,7 +51,26 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev \
-            libasound2-dev libpulse-dev libfontconfig1-dev clang ninja-build
+            libasound2-dev libpulse-dev libfontconfig1-dev clang ninja-build \
+            pkg-config libavcodec-dev libavformat-dev libavutil-dev \
+            libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev
+
+      # ffmpeg-next 8.1 is a hard (non-optional) dependency of the desktop video
+      # backend, so every desktop target needs ffmpeg dev libraries present.
+      - name: macOS system deps
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg pkg-config
+
+      - name: Windows ffmpeg (prebuilt shared libs + FFMPEG_DIR)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip'
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath $env:RUNNER_TEMP\ffmpeg
+          $dir = (Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory | Select-Object -First 1).FullName
+          echo "FFMPEG_DIR=$dir" >> $env:GITHUB_ENV
+          echo "$dir\bin" >> $env:GITHUB_PATH
 
       - name: Build
         run: cargo build --release --locked
