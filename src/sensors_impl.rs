@@ -1,14 +1,14 @@
 use crate::device_bindings::wandr::device::sensors::{Host, Kind, SensorInfo, SensorSample};
-use wandr_hal_sensors::{HalSample, HalSensor};
+use wandr_sensors_client::{SensorEvent, SensorDesc};
 
 // ── Sensor WIT impl ──────────────────────────────────────────────────────────
 //
 // The binder mechanism (ISensorManager event-queue path) was extracted into the
-// shared `wandr-hal-sensors` crate (task 77) so the arbiter's sensor-driver
+// shared `wandr-sensors-client` crate (task 77) so the arbiter's sensor-driver
 // thread and this guest-facing WIT impl share one HAL owner. This file is now a
-// thin adapter: it maps the crate's neutral `HalSensor`/`HalSample` structs to
+// thin adapter: it maps the crate's neutral `SensorDesc`/`SensorEvent` structs to
 // the `skiko-gfx` `sensors` WIT types and keeps the task-43 device-orientation
-// helpers. All cross-platform gating lives in `wandr-hal-sensors` (off-android the
+// helpers. All cross-platform gating lives in `wandr-sensors-client` (off-android the
 // API is no-op stubs), so this file needs no `cfg` of its own.
 
 /// Map AIDL `SensorType` i32 → our WIT `Kind`. `Unknown` covers anything we
@@ -31,7 +31,7 @@ fn aidl_type_to_wit(t: i32) -> Kind {
     }
 }
 
-fn hal_to_wit_info(s: HalSensor) -> SensorInfo {
+fn to_wit_info(s: SensorDesc) -> SensorInfo {
     SensorInfo {
         handle: s.handle,
         kind: aidl_type_to_wit(s.aidl_type),
@@ -44,7 +44,7 @@ fn hal_to_wit_info(s: HalSensor) -> SensorInfo {
     }
 }
 
-fn hal_to_wit_sample(s: HalSample) -> SensorSample {
+fn to_wit_sample(s: SensorEvent) -> SensorSample {
     SensorSample { timestamp_ns: s.ts_ns, x: s.x, y: s.y, z: s.z }
 }
 
@@ -57,20 +57,20 @@ fn hal_to_wit_sample(s: HalSample) -> SensorSample {
 
 impl Host for crate::HostState {
     fn list_sensors(&mut self) -> Vec<SensorInfo> {
-        wandr_hal_sensors::enumerate().into_iter().map(hal_to_wit_info).collect()
+        wandr_sensors_client::enumerate().into_iter().map(to_wit_info).collect()
     }
 
     fn enable(&mut self, handle: u32, rate_hz: u32) -> bool {
-        wandr_hal_sensors::enable(handle, rate_hz)
+        wandr_sensors_client::enable(handle, rate_hz)
     }
 
     fn disable(&mut self, handle: u32) {
-        wandr_hal_sensors::disable(handle);
+        wandr_sensors_client::disable(handle);
     }
 
     fn poll_latest(&mut self, handle: u32) -> SensorSample {
-        wandr_hal_sensors::poll_latest(handle)
-            .map(hal_to_wit_sample)
+        wandr_sensors_client::poll_latest(handle)
+            .map(to_wit_sample)
             .unwrap_or(SensorSample { timestamp_ns: 0, x: 0.0, y: 0.0, z: 0.0 })
     }
 }

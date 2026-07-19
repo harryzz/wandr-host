@@ -119,7 +119,7 @@ mod session3 {
 
     /// Tokio current-thread runtime as the `BinderAsyncRuntime` —
     /// required by `BnInputMethodClient::new_async_binder`. Same shape
-    /// as `wandr_hal_sensors`' internal `TokioRuntime`.
+    /// as `wandr_sensors_client`' internal `TokioRuntime`.
     struct TokioRuntime;
     impl rsbinder::BinderAsyncRuntime for TokioRuntime {
         fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {

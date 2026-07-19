@@ -680,7 +680,7 @@ interface ISurfaceComposer {
             .source(light_aidl.join("android/hardware/light/ILights.aidl"))
             .source(power_aidl.join("android/hardware/power/IPower.aidl"))
             .source(thermal_aidl.join("android/hardware/thermal/IThermal.aidl"))
-            // Sensors (ISensorManager closure) moved to the shared `wandr-hal-sensors`
+            // Sensors (ISensorManager closure) moved to the shared `wandr-sensors-client`
             // crate (task 77) — codegen'd there now, consumed by both host + arbiter.
             .source(aaudio_aidl.join("aaudio/IAAudioService.aidl"))
             .source(aaudio_aidl.join("aaudio/IAAudioClient.aidl"))

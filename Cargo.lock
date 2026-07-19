@@ -4907,7 +4907,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wandr-hal-sensors"
+name = "wandr-sensors-client"
 version = "0.0.1"
 dependencies = [
  "async-trait",
@@ -4989,7 +4989,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml 0.8.23",
- "wandr-hal-sensors",
+ "wandr-sensors-client",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-tls",

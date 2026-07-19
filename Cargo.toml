@@ -36,7 +36,7 @@ anyhow             = "1"
 log                = "0.4"
 # Shared sensor HAL (task 77) — the ISensorManager path, also used by the
 # arbiter's sensor driver. Cross-platform (off-android = no-op stubs).
-wandr-hal-sensors  = { path = "../wandr-hal-sensors" }
+wandr-sensors-client  = { path = "../wandr-sensors-client" }
 android_logger     = { version = "0.14", optional = true }
 env_logger         = { version = "0.11", optional = true }
 raw-window-handle  = "0.6"
