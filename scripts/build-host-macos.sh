@@ -23,8 +23,8 @@
 #   P3=0 build-host-macos.sh            # p2-only flavor (default is p3-async ON)
 #
 # Outputs:
-#   runtime/wandr-host/target/<arch>-apple-darwin/release/wasm-android-host
-#   runtime/wandr-host/target/wasm-android-host-universal   (when both built)
+#   target/<arch>-apple-darwin/release/wasm-android-host
+#   target/wasm-android-host-universal   (when both built)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -71,7 +71,7 @@ if [[ "${UNIVERSAL:-1}" == "1" && ${#BUILT[@]} -eq 2 ]]; then
 fi
 
 for b in "${BUILT[@]}"; do
-  echo "Built: $(du -sh "$b" | cut -f1)  $REPO_ROOT/runtime/wandr-host/$b"
+  echo "Built: $(du -sh "$b" | cut -f1)  $REPO_ROOT/$b"
 done
 
 echo

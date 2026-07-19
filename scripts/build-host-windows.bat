@@ -10,7 +10,7 @@ REM   VCVARS        vcvarsall.bat for the MSVC x64 toolchain
 REM   FFMPEG_DIR    BtbN ffmpeg *-shared prebuilt (bin -> PATH; lib/include for ffmpeg-sys-next)
 REM   LIBCLANG_PATH VS "C++ Clang tools" bin (ffmpeg-sys-next bindgen needs libclang)
 REM
-REM Output: runtime\wandr-host\target\release\wasm-android-host.exe
+REM Output: target\release\wasm-android-host.exe
 REM Run the exe with FFMPEG_DIR\bin on PATH (the avcodec-*.dll are load-time deps).
 setlocal
 if "%VCVARS%"==""        set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
@@ -19,7 +19,7 @@ if "%LIBCLANG_PATH%"=="" set "LIBCLANG_PATH=C:\Program Files\Microsoft Visual St
 
 call "%VCVARS%" x64 >nul
 set "PATH=%FFMPEG_DIR%\bin;%PATH%"
-cd /d "%~dp0..\..\runtime\wandr-host"
+cd /d "%~dp0.."
 
 echo === cargo build --release --features p3-async (windows) ===
 cargo build --release --features p3-async
