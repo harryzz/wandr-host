@@ -1,0 +1,44 @@
+wandr-host — the portable WASM UI runtime host
+Copyright 2025-2026 Zahari Zahariev
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+--------------------------------------------------------------------------------
+
+This product includes software developed by
+The Android Open Source Project (https://source.android.com/),
+licensed under the Apache License, Version 2.0.
+
+Specifically:
+  - cpp/sf_surface.{cpp,h} and cpp/sf_probe.cpp are written against, and partly
+    derived from, AOSP's libgui/SurfaceFlinger headers.
+  - The binder/AIDL bindings generated at build time come from the `.aidl`
+    interface definitions in the AOSP submodules under vendor/.
+  - vendor/ contains AOSP source trees as submodules; they retain their own
+    copyright headers and licenses.
+
+--------------------------------------------------------------------------------
+
+Third-party components keep their own licenses, including:
+
+  wasmtime            Apache-2.0 WITH LLVM-exception
+  skia / skia-safe    BSD-3-Clause / MIT
+  winit, cpal, nokhwa Apache-2.0
+  image               MIT OR Apache-2.0
+  rsbinder            Apache-2.0
+  libvpx              BSD-3-Clause
+
+FFMPEG NOTE: the desktop build links FFmpeg, which is LGPL-2.1-or-later. Most Linux
+distributions ship FFmpeg built with `--enable-gpl`, which makes that build GPL.
+Anyone redistributing binaries of this host should link an LGPL-configured FFmpeg
+(`--disable-gpl --disable-nonfree`) and satisfy the LGPL (notice, source
+availability, and the ability to relink), or build without the video backend.
