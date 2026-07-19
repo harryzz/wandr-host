@@ -54,8 +54,28 @@ cargo ndk -t arm64-v8a -p 30 build --release
 ```
 
 Convenience wrappers live in `scripts/` (`build-host-linux.sh`, `-macos.sh`,
-`-android.sh`, `build-host-windows.bat`). CI builds all four targets — see
+`-android.sh`, `build-host-windows.bat`). CI builds every target — see
 `.github/workflows/build.yml`.
+
+### CI artifacts are a build check, not portable binaries
+
+The desktop host links **system ffmpeg**, so a binary is tied to the ffmpeg the build
+machine had:
+
+- **Linux** — the artifact wants the runner's soname (e.g. `libavutil.so.58`) and fails
+  with `error while loading shared libraries` on a machine with a different ffmpeg.
+- **macOS** — Homebrew ships per-OS bottles, so an artifact built on the `macos-13`
+  runner carries `minos 13.0` and will not load on macOS 12. (GitHub retired the
+  `macos-12` runners, so this cannot be matched in CI.) `MACOSX_DEPLOYMENT_TARGET`
+  defaults to 12.0 for *our* code, but it cannot lower ffmpeg's floor.
+
+**To run it, build it on the machine you want to run it on** — brew/apt then install a
+matching ffmpeg. For an older macOS:
+
+```bash
+brew install ffmpeg pkg-config
+ARCHS=x86_64 ./scripts/build-host-macos.sh      # MACOS_MIN=12.0 by default
+```
 
 For the deeper Android toolchain notes (API levels, `cargo apk`, device install), see
 [BUILD.md](BUILD.md).

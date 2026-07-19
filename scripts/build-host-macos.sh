@@ -52,6 +52,15 @@ fi
 FEATURES=()
 [[ "${P3:-1}" == "1" ]] && FEATURES=(--features p3-async)
 
+# Minimum macOS this binary claims to support. Applies to OUR code (rustc + the cc-rs C++
+# shims); it does NOT change what the dependencies were built against. In particular a
+# Homebrew ffmpeg is a per-OS bottle: one installed on macOS 13 carries `minos 13.0`, so a
+# binary linked against it will not load on macOS 12 however this is set. That is why the
+# CI artifacts are a BUILD CHECK — to RUN on an older macOS, build ON that macOS, where
+# brew installs a matching bottle.
+export MACOSX_DEPLOYMENT_TARGET="${MACOS_MIN:-12.0}"
+echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET (override with MACOS_MIN=…)"
+
 ARCHS="${ARCHS:-x86_64 aarch64}"
 BUILT=()
 for arch in $ARCHS; do
