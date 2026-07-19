@@ -65,7 +65,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip'
+          # Must be a RELEASE build: ffmpeg-next 8.1 binds ffmpeg 7.x/8.0 APIs, while
+          # BtbN's master-latest is post-8.0 master (AVCodec::pix_fmts/sample_fmts removed,
+          # new IAMF/HDR side-data variants) and fails to compile.
+          $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip'
           Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath $env:RUNNER_TEMP\ffmpeg
           $dir = (Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory | Select-Object -First 1).FullName
