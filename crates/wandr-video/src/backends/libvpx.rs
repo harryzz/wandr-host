@@ -27,16 +27,22 @@ use crate::{
     Codec, Decoder, DecoderParams, Packet, Encoder, EncoderParams, I420Ref, CodecError,
 };
 
-/// libvpx's realtime deadline (`VPX_DL_REALTIME`) — the replacement for ffmpeg's
-/// `deadline=realtime` private option.
-const DL_REALTIME: std::os::raw::c_ulong = 1;
-/// `VPX_EFLAG_FORCE_KF` — per-call and non-sticky, like ffmpeg's `pict_type = I`.
-const EFLAG_FORCE_KF: i64 = 1;
-/// `VPX_FRAME_IS_KEY`.
-const FRAME_IS_KEY: u32 = 0x1;
-
 /// Speed/quality knob. 8 is the WebRTC realtime range for both VP8 and VP9.
 const CPU_USED: i32 = 8;
+
+// ‼️ Do NOT hand-write widths for libvpx's flag/deadline scalars. `vpx_enc_frame_flags_t`
+// and `vpx_codec_flags_t` are C `long`, which is 64-bit on LP64 (Linux/macOS) but
+// 32-bit on LLP64 (Windows/MSVC) — an `i64` constant compiles on Linux and fails on
+// Windows with E0308. Always spell them via the generated typedef, and take the
+// values from the generated constants rather than repeating the magic numbers.
+/// libvpx's realtime deadline — the replacement for ffmpeg's `deadline=realtime`.
+const fn dl_realtime() -> vpx::vpx_enc_deadline_t {
+    vpx::VPX_DL_REALTIME as vpx::vpx_enc_deadline_t
+}
+/// Per-call and non-sticky, like ffmpeg's `pict_type = I`.
+const fn eflag_force_kf() -> vpx::vpx_enc_frame_flags_t {
+    vpx::VPX_EFLAG_FORCE_KF as vpx::vpx_enc_frame_flags_t
+}
 
 fn enc_iface(codec: Codec) -> *const vpx::vpx_codec_iface_t {
     unsafe {
@@ -195,7 +201,7 @@ impl LibvpxEncoder {
             self.pending.push_back(Packet {
                 data,
                 timestamp: crate::rtp_ts(f.pts, self.fps),
-                keyframe: (f.flags & FRAME_IS_KEY) != 0,
+                keyframe: (f.flags & vpx::VPX_FRAME_IS_KEY) != 0,
             });
         }
     }
@@ -229,8 +235,8 @@ impl Encoder for LibvpxEncoder {
                 &mut self.resizer,
             )?;
 
-            let flags: i64 = if force_keyframe { EFLAG_FORCE_KF } else { 0 };
-            let r = vpx::vpx_codec_encode(&mut self.ctx, self.img, self.pts, 1, flags, DL_REALTIME);
+            let flags = if force_keyframe { eflag_force_kf() } else { 0 };
+            let r = vpx::vpx_codec_encode(&mut self.ctx, self.img, self.pts, 1, flags, dl_realtime());
             if r != vpx::vpx_codec_err_t::VPX_CODEC_OK {
                 log::warn!("wandr-video: vpx_codec_encode -> {r:?}");
                 return Err(CodecError::BadFrame);
