@@ -29,3 +29,7 @@ log = "0.4"
 [[test]]
 name = "roundtrip"
 required-features = ["libvpx"]
+
+[[test]]
+name = "playback"
+required-features = ["libvpx"]

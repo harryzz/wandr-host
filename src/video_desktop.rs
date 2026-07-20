@@ -425,8 +425,14 @@ impl VideoDecoder {
         Ok(Self { dec, decoded: 0, surface_id, rgba: Vec::new() })
     }
 
-    pub fn submit(&mut self, data: &[u8], _timestamp: u32) -> Result<(), VideoError> {
-        self.dec.decode(data).map_err(map_err)?;
+    pub fn submit(&mut self, data: &[u8], timestamp: u32) -> Result<(), VideoError> {
+        // The call path speaks a 90 kHz RTP clock; the codec speaks microseconds
+        // (task 117 M2). Convert at the boundary rather than widening the codec
+        // back to a transport timestamp. Playback callers pass real µs directly.
+        let timestamp_us = (timestamp as i64) * 1_000_000 / 90_000;
+        self.dec
+            .decode(wandr_video::Chunk::new(data, timestamp_us))
+            .map_err(map_err)?;
         // VP8/VP9 keyframes carry their own dimensions, and the codec reports them
         // per frame — which is why the old lazy scaler-rebuild machinery is gone.
         while let Some(frame) = self.dec.next_frame() {

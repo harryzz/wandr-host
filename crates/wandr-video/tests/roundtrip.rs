@@ -5,7 +5,9 @@
 //! instead of kilobits, a BT.601/BT.709 mixup, a limited/full range mixup) all
 //! produce perfectly well-formed packets. Only comparing pixels catches them.
 
-use wandr_video::{open_decoder, open_encoder, Codec, DecoderParams, EncoderParams, Rgb24Frame};
+use wandr_video::{
+    open_decoder, open_encoder, Chunk, Codec, DecoderParams, EncoderParams, Rgb24Frame,
+};
 
 const W: u32 = 320;
 const H: u32 = 240;
@@ -65,7 +67,7 @@ fn vp8_roundtrip_preserves_the_image() {
                 assert!(pkt.keyframe, "first frame must be a keyframe");
             }
             assert!(!pkt.data.is_empty(), "empty packet");
-            dec.decode(&pkt.data).expect("decode");
+            dec.decode(Chunk::new(&pkt.data, 0)).expect("decode");
             while let Some(frame) = dec.next_frame() {
                 assert_eq!((frame.width, frame.height), (W, H));
                 let mut rgba = Vec::new();
@@ -103,7 +105,7 @@ fn vp9_roundtrip_works() {
         let src = test_frame(W, H, t);
         enc.encode(Rgb24Frame::new(&src, W, H), t == 0).expect("encode");
         while let Some(pkt) = enc.next_packet() {
-            dec.decode(&pkt.data).expect("decode");
+            dec.decode(Chunk::new(&pkt.data, 0)).expect("decode");
             while dec.next_frame().is_some() {
                 decoded += 1;
             }
@@ -125,7 +127,7 @@ fn encodes_when_source_resolution_differs() {
         let src = test_frame(sw, sh, t);
         enc.encode(Rgb24Frame::new(&src, sw, sh), t == 0).expect("encode");
         while let Some(pkt) = enc.next_packet() {
-            dec.decode(&pkt.data).expect("decode");
+            dec.decode(Chunk::new(&pkt.data, 0)).expect("decode");
             while let Some(f) = dec.next_frame() {
                 assert_eq!((f.width, f.height), (W, H), "decoded at the ENCODE size");
                 decoded += 1;
@@ -151,5 +153,5 @@ fn set_bitrate_is_accepted_mid_stream() {
 #[test]
 fn rejects_garbage_payload() {
     let mut dec = open_decoder(&dec_cfg(Codec::Vp8)).expect("open decoder");
-    assert!(dec.decode(&[0xde, 0xad, 0xbe, 0xef]).is_err(), "garbage should error");
+    assert!(dec.decode(Chunk::new(&[0xde, 0xad, 0xbe, 0xef], 0)).is_err(), "garbage should error");
 }

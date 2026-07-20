@@ -24,7 +24,7 @@ use wandr_vpx_sys as vpx;
 
 use crate::convert::{chroma_dims, rgb24_into_i420, Rgb24Frame};
 use crate::{
-    Codec, Decoder, DecoderParams, Packet, Encoder, EncoderParams, I420Ref, CodecError,
+    Chunk, Codec, CodecError, Decoder, DecoderParams, Encoder, EncoderParams, I420Ref, Packet,
 };
 
 /// Speed/quality knob. 8 is the WebRTC realtime range for both VP8 and VP9.
@@ -280,10 +280,25 @@ impl Drop for LibvpxEncoder {
 
 // ── decoder ──────────────────────────────────────────────────────────────────
 
+// PTS travels through libvpx in `user_priv`: whatever pointer-sized value is
+// handed to vpx_codec_decode comes back on the decoded vpx_image_t. libvpx
+// guarantees "frames produced will always be in PTS order", and a packet may
+// produce zero frames (VP9 superframes / hidden altrefs), so pairing by an
+// external FIFO would silently desync — this is the exact mechanism.
+// We only ever store and read the value back; it is never dereferenced.
+const _: () = assert!(
+    std::mem::size_of::<usize>() >= std::mem::size_of::<i64>(),
+    "PTS is smuggled through libvpx's pointer-sized user_priv; a 32-bit target \
+     would truncate it. Use a side FIFO keyed on decode order if wandr ever \
+     targets 32-bit."
+);
+
 pub struct LibvpxDecoder {
     ctx: vpx::vpx_codec_ctx_t,
     /// Iterator state for `vpx_codec_get_frame`; reset on every `decode`.
     iter: vpx::vpx_codec_iter_t,
+    /// Kept so `reset()` (seek) can rebuild the context.
+    codec: Codec,
 }
 
 unsafe impl Send for LibvpxDecoder {}
@@ -311,27 +326,66 @@ impl LibvpxDecoder {
                 log::warn!("wandr-video: dec_init_ver -> {r:?}");
                 return Err(CodecError::InitFailed);
             }
-            Ok(Self { ctx: ctx.assume_init(), iter: ptr::null() })
+            Ok(Self { ctx: ctx.assume_init(), iter: ptr::null(), codec: params.codec })
         }
+    }
+
+    /// Feed one buffer, carrying `timestamp_us` through libvpx's `user_priv`.
+    /// `data = None` signals end-of-stream (what `flush` sends).
+    unsafe fn feed(&mut self, data: Option<&[u8]>, timestamp_us: i64) -> Result<(), CodecError> {
+        let (ptr_, len) = match data {
+            Some(d) => (d.as_ptr(), d.len() as u32),
+            None => (ptr::null(), 0),
+        };
+        let r = vpx::vpx_codec_decode(
+            &mut self.ctx,
+            ptr_,
+            len,
+            timestamp_us as usize as *mut std::os::raw::c_void,
+            0,
+        );
+        if r != vpx::vpx_codec_err_t::VPX_CODEC_OK {
+            log::warn!("wandr-video: vpx_codec_decode -> {r:?}");
+            return Err(CodecError::BadFrame);
+        }
+        self.iter = ptr::null();
+        Ok(())
     }
 }
 
 impl Decoder for LibvpxDecoder {
-    fn decode(&mut self, data: &[u8]) -> Result<(), CodecError> {
+    fn decode(&mut self, chunk: Chunk<'_>) -> Result<(), CodecError> {
+        unsafe { self.feed(Some(chunk.data), chunk.timestamp_us) }
+    }
+
+    fn flush(&mut self) -> Result<(), CodecError> {
+        // libvpx drains on a NULL buffer; `next_frame` then yields what was held.
+        unsafe { self.feed(None, 0) }
+    }
+
+    fn reset(&mut self) -> Result<(), CodecError> {
+        // libvpx exposes no decoder reset, so a seek rebuilds the context. That
+        // is the only way to be sure no reference frame from before the seek
+        // survives; it costs a codec init (sub-ms), which is nothing against the
+        // I/O a seek already implies. The caller must feed a keyframe next.
         unsafe {
-            let r = vpx::vpx_codec_decode(
-                &mut self.ctx,
-                data.as_ptr(),
-                data.len() as u32,
-                ptr::null_mut(),
+            vpx::vpx_codec_destroy(&mut self.ctx);
+            let mut ctx = MaybeUninit::<vpx::vpx_codec_ctx_t>::uninit();
+            let dcfg = vpx::vpx_codec_dec_cfg_t { threads: 2, w: 0, h: 0 };
+            let r = vpx::vpx_codec_dec_init_ver(
+                ctx.as_mut_ptr(),
+                dec_iface(self.codec),
+                &dcfg,
                 0,
+                vpx::VPX_DECODER_ABI_VERSION as i32,
             );
             if r != vpx::vpx_codec_err_t::VPX_CODEC_OK {
-                log::warn!("wandr-video: vpx_codec_decode -> {r:?}");
-                return Err(CodecError::BadFrame);
+                log::warn!("wandr-video: reset dec_init_ver -> {r:?}");
+                return Err(CodecError::InitFailed);
             }
+            self.ctx = ctx.assume_init();
+            self.iter = ptr::null();
         }
-        self.iter = ptr::null();
         Ok(())
     }
 
@@ -361,6 +415,8 @@ impl Decoder for LibvpxDecoder {
                 v_stride: vs,
                 width: w,
                 height: h,
+                // The PTS handed to vpx_codec_decode, back out unchanged.
+                timestamp_us: img.user_priv as usize as i64,
             })
         }
     }

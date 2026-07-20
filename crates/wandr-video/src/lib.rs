@@ -102,9 +102,42 @@ pub trait Encoder: Send {
     fn set_bitrate(&mut self, bps: u32) -> Result<(), CodecError>;
 }
 
+/// One compressed frame going IN to the decoder.
+///
+/// `timestamp_us` is a PRESENTATION timestamp in microseconds — the WebCodecs
+/// unit, matching `wasi:audio-codec`'s `encoded-chunk`. Deliberately NOT the
+/// 90 kHz `u32` RTP clock the call path uses: that is a transport timestamp and
+/// it wraps every ~13.25 h, which is fine for a call and useless for a file.
+pub struct Chunk<'a> {
+    pub data: &'a [u8],
+    pub timestamp_us: i64,
+}
+
+impl<'a> Chunk<'a> {
+    pub fn new(data: &'a [u8], timestamp_us: i64) -> Self {
+        Self { data, timestamp_us }
+    }
+}
+
 /// A video decoder: compressed packets in, borrowed I420 frames out.
+///
+/// PLAYBACK SHAPE (task 117 M2). The decoder carries presentation timestamps and
+/// supports the two stream discontinuities a player needs — end-of-stream
+/// (`flush`) and seek (`reset`). It does NOT schedule presentation: the caller
+/// decides when a frame is shown, because sync policy differs per player (live
+/// vs VOD, frame-drop vs audio-stretch). On Android the WIT-level
+/// `present(at-ns)` maps to `AMediaCodec_releaseOutputBufferAtTime`; on desktop
+/// the host adapter times it. Neither belongs in the codec.
 pub trait Decoder: Send {
-    fn decode(&mut self, data: &[u8]) -> Result<(), CodecError>;
+    fn decode(&mut self, chunk: Chunk<'_>) -> Result<(), CodecError>;
+
+    /// End of stream: decode anything still queued so `next_frame` can drain it.
+    /// (= WebCodecs `flush()`.)
+    fn flush(&mut self) -> Result<(), CodecError>;
+
+    /// Seek: discard queued work and reset reference frames. The caller MUST
+    /// feed a keyframe next. (= WebCodecs `reset()`.)
+    fn reset(&mut self) -> Result<(), CodecError>;
 
     /// Next decoded frame from the last `decode`, as a borrowed I420 view.
     ///
@@ -125,6 +158,9 @@ pub struct I420Ref<'a> {
     pub v_stride: u32,
     pub width: u32,
     pub height: u32,
+    /// The presentation timestamp of the `Chunk` this frame came from, carried
+    /// through the codec unchanged. This is what a player schedules against.
+    pub timestamp_us: i64,
 }
 
 // ── factories ────────────────────────────────────────────────────────────────
