@@ -5,8 +5,10 @@
 //! teardown — the cameraserver-wedge guarantee.
 //!
 //! Phase 1 scope: encoder (camera self-view → pulled VP8) + decoder
-//! decode-to-buffer. `set-rect` is recorded but not yet composited — the
-//! decode-to-surface arbiter `Role::Video` path is Phase 4.
+//! decode-to-buffer. Phase 4 shipped decode-to-surface as CHILD surfaces of the
+//! app's own surface (the SurfaceView model) — NOT the arbiter `Role::Video`
+//! this comment used to promise, which was decided against; see the design
+//! decision on `world video-client` in contracts/wit/video.wit.
 
 use wasmtime::component::Resource;
 
