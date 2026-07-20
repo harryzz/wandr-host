@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::mem::MaybeUninit;
 use std::ptr;
 
-use vpx_sys as vpx;
+use wandr_vpx_sys as vpx;
 
 use crate::convert::{chroma_dims, rgb24_into_i420, Rgb24Frame};
 use crate::{

@@ -16,7 +16,7 @@ REM                 The triplet matters: -static-md = static lib + DYNAMIC CRT
 REM                 (/MD), matching rustc's x86_64-pc-windows-msvc. Plain -static
 REM                 (/MT) gives LNK4098; plain x64-windows gives a vpx.dll and
 REM                 reintroduces the runtime-DLL problem this task removed.
-REM   LIBCLANG_PATH VS "C++ Clang tools" bin (env-libvpx-sys bindgen needs libclang)
+REM   LIBCLANG_PATH VS "C++ Clang tools" bin (wandr-vpx-sys bindgen needs libclang)
 REM
 REM Output: target\release\wasm-android-host.exe
 setlocal
@@ -24,20 +24,16 @@ if "%VCVARS%"==""        set "VCVARS=C:\Program Files\Microsoft Visual Studio\20
 if "%VCPKG_ROOT%"==""    set "VCPKG_ROOT=C:\vcpkg"
 if "%LIBCLANG_PATH%"=="" set "LIBCLANG_PATH=C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\Llvm\x64\bin"
 
+REM On Linux/macOS wandr-vpx-sys compiles vendor/libvpx itself. Windows can't run
+REM libvpx's POSIX configure, so point it at vcpkg's prebuilt static lib instead.
 set "VPX_ROOT=%VCPKG_ROOT%\installed\x64-windows-static-md"
 if not exist "%VPX_ROOT%\lib\vpx.lib" (
   echo ERROR: libvpx not found at %VPX_ROOT%\lib\vpx.lib
   echo Run: vcpkg install libvpx[core,realtime]:x64-windows-static-md
   exit /b 1
 )
-REM env-libvpx-sys hardcodes `static=libvpx` on Windows (looks for libvpx.lib) but
-REM vcpkg installs vpx.lib — alias it rather than depending on pkg-config, which
-REM Windows boxes often lack.
-if not exist "%VPX_ROOT%\lib\libvpx.lib" copy /y "%VPX_ROOT%\lib\vpx.lib" "%VPX_ROOT%\lib\libvpx.lib" >nul
 set "VPX_LIB_DIR=%VPX_ROOT%\lib"
 set "VPX_INCLUDE_DIR=%VPX_ROOT%\include"
-set "VPX_VERSION=1.16.0"
-set "VPX_STATIC=1"
 
 call "%VCVARS%" x64 >nul
 cd /d "%~dp0.."

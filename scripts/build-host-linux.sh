@@ -17,9 +17,9 @@ FEATURES=()
 
 cd "$REPO_ROOT"
 
-# Task 117: static libvpx (BSD-3) replaced ffmpeg — builds it on first run.
-. "$REPO_ROOT/scripts/libvpx-env.sh"
-
+# Task 117: video is static libvpx (BSD-3), not ffmpeg. crates/wandr-vpx-sys's
+# build script compiles vendor/libvpx on the first build, so there is nothing to
+# set up here — just `nasm` on PATH for its x86 SIMD.
 echo "Building wandr-host for $TARGET (release${P3:+, p3-async=$P3}) …"
 cargo build --release --target "$TARGET" "${FEATURES[@]}"
 

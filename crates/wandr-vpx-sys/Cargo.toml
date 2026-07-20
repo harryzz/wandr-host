@@ -1,0 +1,12 @@
+[package]
+name = "wandr-vpx-sys"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Raw FFI bindings to libvpx, built from the vendored source and linked statically."
+# Tells cargo this crate owns the native `vpx` library, so two crates can't both
+# try to link it.
+links = "vpx"
+
+[build-dependencies]
+bindgen = "0.72"

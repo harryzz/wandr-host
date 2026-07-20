@@ -35,10 +35,10 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-# Task 117: ffmpeg is gone. libvpx (BSD-3) is built from vendor/libvpx and linked
-# statically — no Homebrew ffmpeg, no GPL exposure, no runtime .dylib. The x86_64
+# Task 117: ffmpeg is gone. libvpx (BSD-3) is compiled from vendor/libvpx by
+# crates/wandr-vpx-sys's build script and linked statically — no Homebrew ffmpeg,
+# no GPL exposure, no runtime .dylib, and nothing to configure here. The x86_64
 # slice needs `brew install nasm` for libvpx's SIMD (arm64/NEON does not).
-. "$(dirname "$0")/libvpx-env.sh"
 
 FEATURES=()
 [[ "${P3:-1}" == "1" ]] && FEATURES=(--features p3-async)
