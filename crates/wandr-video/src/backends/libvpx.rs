@@ -44,11 +44,17 @@ const fn eflag_force_kf() -> vpx::vpx_enc_frame_flags_t {
     vpx::VPX_EFLAG_FORCE_KF as vpx::vpx_enc_frame_flags_t
 }
 
+/// libvpx handles exactly these; anything else is another backend's job.
+fn is_vpx(codec: Codec) -> bool {
+    matches!(codec, Codec::Vp8 | Codec::Vp9)
+}
+
 fn enc_iface(codec: Codec) -> *const vpx::vpx_codec_iface_t {
     unsafe {
         match codec {
             Codec::Vp8 => vpx::vpx_codec_vp8_cx(),
             Codec::Vp9 => vpx::vpx_codec_vp9_cx(),
+            _ => std::ptr::null(),
         }
     }
 }
@@ -58,7 +64,38 @@ fn dec_iface(codec: Codec) -> *const vpx::vpx_codec_iface_t {
         match codec {
             Codec::Vp8 => vpx::vpx_codec_vp8_dx(),
             Codec::Vp9 => vpx::vpx_codec_vp9_dx(),
+            _ => std::ptr::null(),
         }
+    }
+}
+
+// ── backend descriptor ───────────────────────────────────────────────────────
+
+/// Software VP8/VP9 via statically-linked libvpx. Always available (no runtime
+/// load), so it is the reliable software floor at priority 100.
+pub struct LibvpxBackend;
+
+impl crate::CodecBackend for LibvpxBackend {
+    fn name(&self) -> &'static str {
+        "libvpx"
+    }
+    fn kind(&self) -> crate::BackendKind {
+        crate::BackendKind::Software
+    }
+    fn priority(&self) -> u32 {
+        100
+    }
+    fn supports_decode(&self, codec: Codec) -> bool {
+        is_vpx(codec)
+    }
+    fn supports_encode(&self, codec: Codec) -> bool {
+        is_vpx(codec)
+    }
+    fn open_decoder(&self, p: &DecoderParams) -> Result<Box<dyn Decoder>, CodecError> {
+        Ok(Box::new(LibvpxDecoder::open(p)?))
+    }
+    fn open_encoder(&self, p: &EncoderParams) -> Result<Box<dyn Encoder>, CodecError> {
+        Ok(Box::new(LibvpxEncoder::open(p)?))
     }
 }
 

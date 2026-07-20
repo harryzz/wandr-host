@@ -51,6 +51,8 @@ pub enum CodecError {
 pub enum Codec {
     Vp8,
     Vp9,
+    H264,
+    H265,
 }
 
 /// Everything a codec needs to start encoding — and nothing else. Notably absent:
@@ -163,39 +165,166 @@ pub struct I420Ref<'a> {
     pub timestamp_us: i64,
 }
 
-// ── factories ────────────────────────────────────────────────────────────────
-// `Box<dyn>` (rather than a concrete type behind a cfg) because the point of the
-// crate is runtime "try HW for this codec, fall back to software". One vtable
-// call per encoded frame is unmeasurable against a VP8 encode.
-//
-// With no backend feature enabled the crate is types-only (what Android wants —
-// it encodes from a Surface via MediaCodec), and these report `NoHwCodec` rather
-// than failing to compile, so callers need no cfg of their own.
+// ── backend registry ─────────────────────────────────────────────────────────
+// Runtime codec selection, modelled on oxideav's design (which we spiked — see
+// repros/oxideav-spike): every backend declares which codecs it handles, whether
+// it is HW or SW, and a priority; `open_*` walks the candidates for the requested
+// codec in priority order and returns the first that opens. Adding a backend
+// (a HW lane, or oxideav once its silent-fallback bug is fixed) is one new file
+// implementing `CodecBackend` plus one line in `default_registry()` — no call
+// site changes. That is the decoupling seam.
 
-pub fn open_encoder(params: &EncoderParams) -> Result<Box<dyn Encoder>, CodecError> {
-    #[cfg(feature = "libvpx")]
-    {
-        return Ok(Box::new(backends::libvpx::LibvpxEncoder::open(params)?));
+/// Whether a backend talks to a hardware codec block or decodes in software.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Hardware,
+    Software,
+}
+
+/// A pluggable codec backend. One instance describes a whole implementation
+/// (e.g. "libvpx", "openh264", a future "vaapi"); it is a *factory*, so it is
+/// cheap, `Sync`, and constructed once into the registry.
+///
+/// ‼️ THE FALLBACK CONTRACT (learned from the oxideav spike, where a HW H.264
+/// decoder returned success while producing ZERO frames and the registry never
+/// fell back): a backend's `open_*` MUST return `Err` if the implementation is
+/// not actually going to work — a HW backend that cannot reach its device, or
+/// whose probe decode yields nothing, must fail at `open`, NOT succeed and then
+/// silently decode nothing. The registry can only fall back on an `Err`.
+pub trait CodecBackend: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn kind(&self) -> BackendKind;
+    /// Lower wins. HW backends sit ~10, software ~100, so HW is tried first and
+    /// software is the fallback.
+    fn priority(&self) -> u32;
+    fn supports_decode(&self, codec: Codec) -> bool;
+    fn supports_encode(&self, codec: Codec) -> bool;
+    fn open_decoder(&self, params: &DecoderParams) -> Result<Box<dyn Decoder>, CodecError>;
+    fn open_encoder(&self, params: &EncoderParams) -> Result<Box<dyn Encoder>, CodecError>;
+}
+
+/// Caller policy over backend selection (mirrors oxideav's `CodecPreferences`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Preferences {
+    /// Skip hardware backends entirely — byte-deterministic output, or bisecting
+    /// a HW regression against the software path.
+    pub no_hardware: bool,
+    /// Refuse to fall back to software — surface the HW error instead of silently
+    /// degrading. The opt-out for a caller that genuinely needs HW.
+    pub require_hardware: bool,
+}
+
+/// The set of compiled-in backends, sorted by priority.
+pub struct Registry {
+    backends: Vec<Box<dyn CodecBackend>>,
+}
+
+impl Registry {
+    pub fn new() -> Self {
+        Registry { backends: Vec::new() }
     }
-    #[cfg(not(feature = "libvpx"))]
-    {
-        let _ = params;
-        log::warn!("wandr-video: no codec backend compiled in (enable the `libvpx` feature)");
-        Err(CodecError::Unsupported)
+
+    /// Add a backend; keeps the list sorted by ascending priority.
+    pub fn register(&mut self, backend: Box<dyn CodecBackend>) {
+        log::debug!(
+            "wandr-video: register backend {} ({:?}, priority {})",
+            backend.name(),
+            backend.kind(),
+            backend.priority()
+        );
+        self.backends.push(backend);
+        self.backends.sort_by_key(|b| b.priority());
+    }
+
+    fn candidates(&self, prefs: Preferences) -> impl Iterator<Item = &dyn CodecBackend> {
+        // Two independent exclusions — kept as two clauses on purpose; clippy's
+        // De-Morgan merge into one `!(… || …)` reads worse than the intent.
+        #[allow(clippy::nonminimal_bool)]
+        self.backends.iter().map(|b| b.as_ref()).filter(move |b| {
+            !(prefs.no_hardware && b.kind() == BackendKind::Hardware)
+                && !(prefs.require_hardware && b.kind() == BackendKind::Software)
+        })
+    }
+
+    pub fn open_decoder(
+        &self,
+        params: &DecoderParams,
+        prefs: Preferences,
+    ) -> Result<Box<dyn Decoder>, CodecError> {
+        let mut last = CodecError::Unsupported;
+        for b in self.candidates(prefs).filter(|b| b.supports_decode(params.codec)) {
+            match b.open_decoder(params) {
+                Ok(d) => {
+                    log::info!("wandr-video: {:?} decode via {}", params.codec, b.name());
+                    return Ok(d);
+                }
+                Err(e) => {
+                    log::warn!("wandr-video: {} declined {:?} decode: {e:?}", b.name(), params.codec);
+                    last = e;
+                }
+            }
+        }
+        Err(last)
+    }
+
+    pub fn open_encoder(
+        &self,
+        params: &EncoderParams,
+        prefs: Preferences,
+    ) -> Result<Box<dyn Encoder>, CodecError> {
+        let mut last = CodecError::Unsupported;
+        for b in self.candidates(prefs).filter(|b| b.supports_encode(params.codec)) {
+            match b.open_encoder(params) {
+                Ok(e) => {
+                    log::info!("wandr-video: {:?} encode via {}", params.codec, b.name());
+                    return Ok(e);
+                }
+                Err(e) => {
+                    log::warn!("wandr-video: {} declined {:?} encode: {e:?}", b.name(), params.codec);
+                    last = e;
+                }
+            }
+        }
+        Err(last)
     }
 }
 
-pub fn open_decoder(params: &DecoderParams) -> Result<Box<dyn Decoder>, CodecError> {
+impl Default for Registry {
+    fn default() -> Self {
+        default_registry()
+    }
+}
+
+/// Build the registry from every backend compiled into this build. A backend
+/// whose feature is off simply isn't added; a HW backend whose native library is
+/// absent declines at construction (returns `None` from its own `try_new`), so
+/// it never enters the registry — the "load failure" fallback path.
+pub fn default_registry() -> Registry {
+    let mut r = Registry::new();
     #[cfg(feature = "libvpx")]
-    {
-        return Ok(Box::new(backends::libvpx::LibvpxDecoder::open(params)?));
-    }
-    #[cfg(not(feature = "libvpx"))]
-    {
-        let _ = params;
-        log::warn!("wandr-video: no codec backend compiled in (enable the `libvpx` feature)");
-        Err(CodecError::Unsupported)
-    }
+    r.register(Box::new(backends::libvpx::LibvpxBackend));
+    #[cfg(feature = "openh264")]
+    r.register(Box::new(backends::openh264::OpenH264Backend));
+    // Future: HW backends register here at priority < 100, and oxideav slots in
+    // as just another software (or HW-bridge) backend once it is ready.
+    r
+}
+
+fn global_registry() -> &'static Registry {
+    use std::sync::OnceLock;
+    static REG: OnceLock<Registry> = OnceLock::new();
+    REG.get_or_init(default_registry)
+}
+
+/// Open a decoder for `params.codec` using the process default registry and
+/// default preferences (HW first, software fallback).
+pub fn open_decoder(params: &DecoderParams) -> Result<Box<dyn Decoder>, CodecError> {
+    global_registry().open_decoder(params, Preferences::default())
+}
+
+/// Open an encoder for `params.codec` using the process default registry.
+pub fn open_encoder(params: &EncoderParams) -> Result<Box<dyn Encoder>, CodecError> {
+    global_registry().open_encoder(params, Preferences::default())
 }
 
 /// 90 kHz RTP timestamp from a frame index at `fps` (wraps like RTP).

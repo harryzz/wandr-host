@@ -10,6 +10,11 @@ description = "Portable video codec backends for wandr:video — VP8/VP9 via lib
 # uses MediaCodec) needs no media library at all. The desktop host turns it on.
 default = []
 libvpx = ["dep:wandr-vpx-sys"]
+# Software H.264 (Cisco OpenH264, BSD-2) — the DESKTOP software fallback for
+# H.264 decode/encode. Built from source by openh264-sys2 (cc), so no system
+# library. Android decodes H.264 in hardware via MediaCodec and never enables
+# this, which is why it is a separate opt-in feature like `libvpx`.
+openh264 = ["dep:openh264"]
 
 [dependencies]
 # libvpx (BSD-3), built from vendor/libvpx and linked statically by wandr-vpx-sys.
@@ -17,6 +22,7 @@ libvpx = ["dep:wandr-vpx-sys"]
 # libvpx — it could only consume a prebuilt one), so a plain `cargo build` now
 # needs no system media library and no pre-build step.
 wandr-vpx-sys = { path = "../wandr-vpx-sys", optional = true }
+openh264 = { version = "0.9", optional = true }
 # Pure-Rust SIMD colorspace + resize — the libswscale replacement. These are pure
 # Rust (no system library, cross-compiles anywhere), so they are NOT gated: the
 # shared types and conversion helpers stay available on every target.
@@ -33,3 +39,7 @@ required-features = ["libvpx"]
 [[test]]
 name = "playback"
 required-features = ["libvpx"]
+
+[[test]]
+name = "h264"
+required-features = ["libvpx", "openh264"]

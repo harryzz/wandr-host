@@ -7,3 +7,6 @@
 
 #[cfg(feature = "libvpx")]
 pub mod libvpx;
+
+#[cfg(feature = "openh264")]
+pub mod openh264;
