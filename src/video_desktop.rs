@@ -19,7 +19,7 @@
 //! (device/native) handle 720p+.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -395,6 +395,14 @@ impl VideoEncoder {
 
 // ── decoder (decode-to-surface, or decode-to-buffer when rect is empty) ───────
 
+/// A decoded frame waiting for its presentation time (playback mode only).
+struct PendingFrame {
+    pts_us: i64,
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
 pub struct VideoDecoder {
     dec: Box<dyn wandr_video::Decoder>,
     decoded: u64,
@@ -404,6 +412,16 @@ pub struct VideoDecoder {
     surface_id: Option<u32>,
     /// Reused RGBA staging, so steady-state decode-to-surface doesn't allocate.
     rgba: Vec<u8>,
+    /// PLAYBACK mode (task 117 M2): frames decoded ahead, each held until the
+    /// caller's media clock reaches its PTS. Empty on the call path, which
+    /// presents immediately because the network is the pacer.
+    ///
+    /// On Android this queue does not exist — `AMediaCodec_releaseOutputBufferAtTime`
+    /// hands the PTS to the HW compositor and the frame never reaches the CPU.
+    /// This is the desktop stand-in for that, which is why it holds RGBA.
+    pending: VecDeque<PendingFrame>,
+    /// Frames dropped because a newer one was already due (playback only).
+    dropped: u64,
 }
 
 impl VideoDecoder {
@@ -422,7 +440,8 @@ impl VideoDecoder {
                 rect.w, rect.h, rect.x, rect.y, config.rotation);
             alloc_surface(rect, false, config.rotation)
         });
-        Ok(Self { dec, decoded: 0, surface_id, rgba: Vec::new() })
+        Ok(Self { dec, decoded: 0, surface_id, rgba: Vec::new(),
+                  pending: VecDeque::new(), dropped: 0 })
     }
 
     pub fn submit(&mut self, data: &[u8], timestamp: u32) -> Result<(), VideoError> {
@@ -450,6 +469,79 @@ impl VideoDecoder {
 
     pub fn decoded_frames(&self) -> u64 {
         self.decoded
+    }
+
+    // ── playback mode (task 117 M2) ──────────────────────────────────────────
+    // The call path presents immediately: the network is the pacer, and a late
+    // frame is worthless. A player is the opposite — frames are decoded AHEAD and
+    // each is held until the media clock reaches its PTS. These three methods are
+    // that difference, and nothing else on this type changes.
+
+    /// Decode a chunk carrying a real presentation timestamp, queueing the frames
+    /// it produces rather than presenting them.
+    pub fn submit_for_playback(&mut self, data: &[u8], pts_us: i64) -> Result<(), VideoError> {
+        self.dec
+            .decode(wandr_video::Chunk::new(data, pts_us))
+            .map_err(map_err)?;
+        self.queue_decoded();
+        Ok(())
+    }
+
+    /// End of stream — drain whatever the codec held back.
+    pub fn finish_playback(&mut self) -> Result<(), VideoError> {
+        self.dec.flush().map_err(map_err)?;
+        self.queue_decoded();
+        Ok(())
+    }
+
+    /// Seek — discard queued work; the caller must feed a keyframe next.
+    pub fn seek_reset(&mut self) -> Result<(), VideoError> {
+        self.dec.reset().map_err(map_err)?;
+        self.pending.clear();
+        Ok(())
+    }
+
+    fn queue_decoded(&mut self) {
+        while let Some(f) = self.dec.next_frame() {
+            self.decoded += 1;
+            let (w, h) = (f.width, f.height);
+            let pts_us = f.timestamp_us;
+            let mut rgba = Vec::new();
+            if wandr_video::i420_to_rgba(&f, &mut rgba).is_ok() {
+                self.pending.push_back(PendingFrame { pts_us, rgba, w, h });
+            }
+        }
+    }
+
+    /// Present whatever is due at `clock_us` and return its PTS.
+    ///
+    /// Frame-drop policy: if several frames are already due, only the NEWEST is
+    /// shown and the older ones are counted as dropped — showing them would be
+    /// showing the past. That is a player POLICY choice, which is exactly why it
+    /// lives here on the host adapter and not inside the codec.
+    pub fn present_due(&mut self, clock_us: i64) -> Option<i64> {
+        let mut chosen: Option<PendingFrame> = None;
+        while self.pending.front().is_some_and(|f| f.pts_us <= clock_us) {
+            if chosen.is_some() {
+                self.dropped += 1;
+            }
+            chosen = self.pending.pop_front();
+        }
+        let f = chosen?;
+        if let Some(id) = self.surface_id {
+            surface_set_frame(id, f.rgba, f.w, f.h);
+        }
+        Some(f.pts_us)
+    }
+
+    /// Frames decoded but not yet due — the player's cushion against a decode
+    /// stall. A real player refills toward a target depth.
+    pub fn queued_frames(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped
     }
 
     pub fn set_rect(&mut self, rect: VideoRect) {

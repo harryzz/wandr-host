@@ -1701,6 +1701,149 @@ pub fn font_probe() {
 /// 60 fps by the camera, that's the conceptual bug (capture couples the render
 /// thread to camera delivery). `--video-selfview-test`.
 #[cfg(not(target_os = "android"))]
+/// `--video-playback-test` — task 117 M2 step 1b. Drives the PLAYBACK path
+/// end-to-end on the desktop backend and reports measured A/V drift.
+///
+/// Deliberately synthetic and self-contained: it encodes its own clip, so there
+/// is no file, no demuxer, no network and no camera in the loop. The only thing
+/// under test is whether decoded frames can be presented at their PTS against an
+/// independent clock — which is what the call-shaped decoder could not express.
+///
+/// The clock here stands in for `wasi:audio playback.position()`. A real player
+/// slaves to that; using wall time keeps this runnable with no audio device, and
+/// drift against a monotonic clock is the same measurement either way.
+#[cfg(not(target_os = "android"))]
+pub fn video_playback_test() -> anyhow::Result<()> {
+    use crate::video::{Codec, DecoderConfig, VideoRect, ZLayer};
+    use std::time::Instant;
+
+    let (sw, sh) = (960u32, 720u32);
+    let (vw, vh) = (640u32, 480u32);
+    const FPS: i64 = 30;
+    const N: i64 = 150; // 5 s at 30 fps
+    let pts_us = |i: i64| (i * 1_000_000) / FPS;
+
+    // ── 1. produce a clip (encode synthetic motion) ──────────────────────────
+    log::info!("playback-test: encoding a {N}-frame {vw}x{vh} VP9 clip …");
+    let mut enc = wandr_video::open_encoder(&wandr_video::EncoderParams {
+        codec: wandr_video::Codec::Vp9,
+        width: vw,
+        height: vh,
+        bitrate_bps: 2_000_000,
+        framerate: FPS as u32,
+    })
+    .map_err(|e| anyhow::anyhow!("encoder open: {e:?}"))?;
+
+    let mut clip: Vec<(Vec<u8>, i64)> = Vec::new();
+    let mut rgb = vec![0u8; (vw * vh * 3) as usize];
+    for i in 0..N {
+        // A bar sweeping left→right, so a stutter or a wrong-order present is
+        // visible in the snapshot as well as in the numbers.
+        let bar = (i as u32 * vw / N as u32).min(vw - 1);
+        for y in 0..vh {
+            for x in 0..vw {
+                let o = ((y * vw + x) * 3) as usize;
+                let on_bar = x.abs_diff(bar) < 12;
+                rgb[o] = if on_bar { 250 } else { (x * 255 / vw) as u8 };
+                rgb[o + 1] = if on_bar { 40 } else { (y * 255 / vh) as u8 };
+                rgb[o + 2] = if on_bar { 40 } else { 90 };
+            }
+        }
+        enc.encode(wandr_video::Rgb24Frame::new(&rgb, vw, vh), i % 30 == 0)
+            .map_err(|e| anyhow::anyhow!("encode: {e:?}"))?;
+        while let Some(pkt) = enc.next_packet() {
+            clip.push((pkt.data, pts_us(i)));
+        }
+    }
+    log::info!("playback-test: {} packets encoded", clip.len());
+
+    // ── 2. play it, pacing against a clock ───────────────────────────────────
+    let mut dec = crate::video_desktop::VideoDecoder::open(&DecoderConfig {
+        codec: Codec::Vp9,
+        width: vw,
+        height: vh,
+        rect: Some(VideoRect { x: 40, y: 60, w: (sw - 80) as i32, h: (sh - 200) as i32 }),
+        rotation: 0,
+        layer: ZLayer::AboveUi,
+    })
+    .map_err(|e| anyhow::anyhow!("decoder open: {e:?}"))?;
+
+    let mut r = crate::canvas_impl::SkiaRenderer::new_headless(sw, sh)?;
+    // Decode-ahead cushion, in frames. Real players use time; frames is enough here.
+    const CUSHION: usize = 4;
+    let mut feed = 0usize;
+    let (mut presented, mut sum_drift, mut max_drift) = (0u64, 0i64, 0i64);
+    let mut last_pts = -1i64;
+    let mut ordered = true;
+
+    let start = Instant::now();
+    loop {
+        // Refill the cushion — a player's decode thread, inlined.
+        while dec.queued_frames() < CUSHION && feed < clip.len() {
+            let (data, pts) = &clip[feed];
+            dec.submit_for_playback(data, *pts)
+                .map_err(|e| anyhow::anyhow!("submit: {e:?}"))?;
+            feed += 1;
+        }
+        if feed >= clip.len() {
+            dec.finish_playback().map_err(|e| anyhow::anyhow!("flush: {e:?}"))?;
+        }
+
+        let clock_us = start.elapsed().as_micros() as i64;
+        if let Some(pts) = dec.present_due(clock_us) {
+            let drift = clock_us - pts; // how late we were
+            sum_drift += drift;
+            max_drift = max_drift.max(drift);
+            presented += 1;
+            if pts <= last_pts {
+                ordered = false;
+            }
+            last_pts = pts;
+
+            r.canvas().clear(skia_safe::Color::from_argb(255, 20, 24, 40));
+            crate::video_desktop::composite_video_surfaces(r.canvas());
+        }
+
+        if dec.queued_frames() == 0 && feed >= clip.len() {
+            break;
+        }
+        if start.elapsed().as_secs() > 30 {
+            anyhow::bail!("playback-test: timed out — pacing loop never drained");
+        }
+        std::thread::sleep(std::time::Duration::from_micros(2_000));
+    }
+
+    let wall = start.elapsed();
+    let expect_s = N as f64 / FPS as f64;
+    let avg_drift = if presented > 0 { sum_drift / presented as i64 } else { 0 };
+    // One frame interval of lateness is the honest bar: the loop can only present
+    // on a tick, so being up to one frame late is scheduling, not drift.
+    let bar_us = 1_000_000 / FPS;
+    let ok = ordered && max_drift <= bar_us * 2 && (wall.as_secs_f64() - expect_s).abs() < 0.5;
+
+    log::warn!(
+        "playback-test RESULT: {presented}/{} presented, {} dropped, {} decoded | \
+         drift avg {avg_drift} us / max {max_drift} us (bar {} us) | \
+         wall {:.2}s vs media {:.2}s | order {} — {}",
+        clip.len(),
+        dec.dropped_frames(),
+        dec.decoded_frames(),
+        bar_us * 2,
+        wall.as_secs_f64(),
+        expect_s,
+        if ordered { "OK" } else { "BROKEN" },
+        if ok { "ok" } else { "FAIL" },
+    );
+    if let Some(png) = r.snapshot_png() {
+        let _ = std::fs::write("/tmp/playback-test.png", &png);
+        log::info!("playback-test: wrote /tmp/playback-test.png (bar should be at the right edge)");
+    }
+    if !ok {
+        anyhow::bail!("playback-test: pacing did not hold (see RESULT above)");
+    }
+    Ok(())
+}
+
 pub fn video_selfview_test() -> anyhow::Result<()> {
     use crate::video::{Codec, EncoderConfig, VideoEncoder, VideoRect, ZLayer};
     use std::time::{Duration, Instant};

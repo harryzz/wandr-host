@@ -38,6 +38,21 @@ fn main() {
     }
     // Desktop `--video-selfview-test`: reproduce/measure the Signal self-view
     // freeze — a 60fps render loop pumping the blocking camera encoder.
+    // Desktop `--video-playback-test`: task 117 M2 step 1b — decode a synthetic
+    // VP9 clip and present each frame at its PTS against an independent clock,
+    // reporting measured drift. No camera, no file, no network.
+    #[cfg(not(target_os = "android"))]
+    if args.iter().any(|a| a == "--video-playback-test") {
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("info"),
+        )
+        .try_init();
+        if let Err(e) = wasm_android_host::video_playback_test() {
+            eprintln!("wandr-host --video-playback-test: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--video-selfview-test") {
         let _ = env_logger::builder().try_init();
         if let Err(e) = wasm_android_host::video_selfview_test() {
