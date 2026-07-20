@@ -1697,10 +1697,6 @@ pub fn font_probe() {
     log::info!("font-probe DONE. Real metrics = count_families>0 AND unitsPerEm>0 AND glyphs>0.");
 }
 
-/// loop, and the resulting effective frame rate. If the loop is capped far below
-/// 60 fps by the camera, that's the conceptual bug (capture couples the render
-/// thread to camera delivery). `--video-selfview-test`.
-#[cfg(not(target_os = "android"))]
 /// `--video-playback-test` — task 117 M2 step 1b. Drives the PLAYBACK path
 /// end-to-end on the desktop backend and reports measured A/V drift.
 ///
@@ -1844,6 +1840,11 @@ pub fn video_playback_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Measures the Signal self-view stall: how long `next_frame` blocks the render
+/// loop, and the resulting effective frame rate. If the loop is capped far below
+/// 60 fps by the camera, that's the conceptual bug (capture couples the render
+/// thread to camera delivery). `--video-selfview-test`.
+#[cfg(not(target_os = "android"))]
 pub fn video_selfview_test() -> anyhow::Result<()> {
     use crate::video::{Codec, EncoderConfig, VideoEncoder, VideoRect, ZLayer};
     use std::time::{Duration, Instant};
