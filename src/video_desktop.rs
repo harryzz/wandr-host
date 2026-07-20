@@ -1,36 +1,54 @@
-//! Desktop (non-Android) `wandr:video` backend — nokhwa camera capture + ffmpeg
-//! software VP8/VP9 (libvpx) encode/decode. The cross-platform peer of the
-//! Android NDK-camera + AMediaCodec backend in `video.rs::android` (Linux v4l2 /
-//! Windows MediaFoundation / macOS AVFoundation via nokhwa; libvpx via ffmpeg).
+//! Desktop (non-Android) `wandr:video` backend — nokhwa camera capture + software
+//! VP8/VP9 via `wandr-video` (statically-linked libvpx). The cross-platform peer
+//! of the Android NDK-camera + AMediaCodec backend in `video.rs::android` (Linux
+//! v4l2 / Windows MediaFoundation / macOS AVFoundation via nokhwa).
 //!
-//! Scope: the OUTGOING encoder (camera → VP8) and decode-to-BUFFER (frame
-//! counting) — enough for `wandr.video.test` Part 1/2 to pass. On-screen
-//! compositing (PiP preview + decode-to-surface) is a follow-up; the Android
-//! SurfaceView child-surface model has no desktop analog yet, so `set_preview_*`
-//! / `set_rect` / `set_visible` are recorded no-ops. Proven end-to-end in
-//! `repros/nokhwa-camera-probe` (camera → VP8 → decode).
+//! This file owns everything that is NOT a codec — camera capture, the PiP
+//! self-view, and the Skia compositing registry — and delegates encode/decode to
+//! `wandr_video`. That split is why the codec crate can be unit-tested with a
+//! synthetic gradient and no hardware.
+//!
+//! Task 117 replaced ffmpeg here. Two behavior changes fell out of it:
+//!   * `set_bitrate` is REAL now (libvpx retunes rate control mid-stream), so the
+//!     desktop encoder finally honors the guest's REMB/TWCC congestion control.
+//!   * A camera frame whose size differs from the encode size is now RESIZED
+//!     rather than dropped — the old code hard-skipped those frames.
 //!
 //! WSLg note: the RDP-forwarded virtual camera truncates large buffers, so
 //! >640x480 tears; the call path uses 640x480, which is intact. Real cameras
 //! (device/native) handle 720p+.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ffmpeg_next as ffmpeg;
-use ffmpeg::format::Pixel;
-use ffmpeg::software::scaling::{context::Context as Scaler, flag::Flags};
-use ffmpeg::util::frame::video::Video as FfVideoFrame;
-use ffmpeg::util::picture;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{
     CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
 };
 use nokhwa::Camera;
 
+use wandr_video::{CodecError, DecoderParams, EncoderParams, Rgb24Frame};
+
 use crate::video::{Codec, DecoderConfig, EncodedFrame, EncoderConfig, VideoError, VideoRect};
+
+/// The codec crate's errors are narrower than the WIT surface (a codec cannot
+/// fail with `surface-unavailable`), so widen at the boundary.
+fn map_err(e: CodecError) -> VideoError {
+    match e {
+        CodecError::Unsupported => VideoError::NoHwCodec,
+        CodecError::InitFailed => VideoError::CodecInitFailed,
+        CodecError::BadFrame => VideoError::BadFrame,
+    }
+}
+
+fn codec_of(c: Codec) -> wandr_video::Codec {
+    match c {
+        Codec::Vp8 => wandr_video::Codec::Vp8,
+        Codec::Vp9 => wandr_video::Codec::Vp9,
+    }
+}
 
 // ── PiP self-view registry ───────────────────────────────────────────────────
 // The encoder captures the LOCAL camera; the host composites that frame at the
@@ -148,39 +166,9 @@ fn surface_remove(id: u32) {
 }
 
 /// No binder off-Android (the Android path spins up an rsbinder threadpool for
-/// the camera/codec HAL; desktop nokhwa/ffmpeg need none).
+/// the camera/codec HAL; desktop nokhwa/libvpx need none).
 pub fn ensure_binder_threadpool() -> bool {
     false
-}
-
-fn ff_init() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let _ = ffmpeg::init();
-    });
-}
-
-/// libvpx encoder name for the codec (VP8/VP9; H264/H265 are rejected upstream).
-fn enc_name(codec: Codec) -> &'static str {
-    match codec {
-        Codec::Vp8 => "libvpx",
-        Codec::Vp9 => "libvpx-vp9",
-    }
-}
-
-fn dec_id(codec: Codec) -> ffmpeg::codec::Id {
-    match codec {
-        Codec::Vp8 => ffmpeg::codec::Id::VP8,
-        Codec::Vp9 => ffmpeg::codec::Id::VP9,
-    }
-}
-
-/// 90 kHz RTP timestamp from a frame index at `fps` (matches the Android encoder's
-/// µs-PTS → 90 kHz conversion; wraps like RTP).
-fn rtp_ts(idx: i64, fps: u32) -> u32 {
-    let fps = fps.max(1) as i64;
-    ((idx * 90_000) / fps) as u32
 }
 
 // ── encoder ──────────────────────────────────────────────────────────────────
@@ -210,19 +198,12 @@ pub struct VideoEncoder {
     latest: Arc<Mutex<Option<LatestFrame>>>,
     /// Sequence of the last frame we encoded — skip re-encoding a stale frame.
     last_seq: u64,
-    scaler: Scaler,
-    encoder: ffmpeg::encoder::video::Encoder,
-    rgb: FfVideoFrame,
-    /// Camera's actual decoded resolution (scaler input); may differ from the
-    /// encoder's target (config w×h), so the scaler also resizes.
-    cam_w: u32,
-    cam_h: u32,
-    fps: u32,
-    pts: i64,
+    enc: Box<dyn wandr_video::Encoder>,
     force_keyframe: bool,
-    pending: VecDeque<EncodedFrame>,
     /// PiP self-view surface (Some iff opened with a preview rect).
     preview_id: Option<u32>,
+    /// Reused RGB→RGBA staging for the self-view, so steady state doesn't allocate.
+    pip: Vec<u8>,
 }
 
 impl Drop for VideoEncoder {
@@ -239,14 +220,12 @@ impl Drop for VideoEncoder {
     }
 }
 
-// The store is single-threaded on desktop (winit loop / run-once command); the
-// !Send ffmpeg contexts never cross threads (the camera lives on its own capture
-// thread). Mirrors video.rs::android's `unsafe impl Send for VideoEncoder`.
-unsafe impl Send for VideoEncoder {}
+// NOTE: no `unsafe impl Send` here any more. The old one existed only because
+// ffmpeg's Context is !Send; `Box<dyn wandr_video::Encoder>` is Send because the
+// trait requires it, and the codec backend justifies that itself.
 
 impl VideoEncoder {
     pub fn open(config: &EncoderConfig) -> Result<Self, VideoError> {
-        ff_init();
         let (w, h, fps) = (config.width, config.height, config.framerate.max(1));
 
         // Camera 0 (facing isn't selectable on most desktop webcams). Try source
@@ -279,33 +258,16 @@ impl VideoEncoder {
             cam.frame_rate(), cam.format(), config.codec
         );
 
-        // libvpx encoder.
-        let enc_codec = ffmpeg::encoder::find_by_name(enc_name(config.codec)).ok_or_else(|| {
-            log::warn!("video_desktop: no {} encoder", enc_name(config.codec));
-            VideoError::NoHwCodec
-        })?;
-        let mut enc_ctx = ffmpeg::codec::context::Context::new_with_codec(enc_codec)
-            .encoder()
-            .video()
-            .map_err(|_| VideoError::CodecInitFailed)?;
-        enc_ctx.set_width(w);
-        enc_ctx.set_height(h);
-        enc_ctx.set_format(Pixel::YUV420P);
-        enc_ctx.set_time_base((1, fps as i32));
-        enc_ctx.set_bit_rate(config.bitrate_bps.max(100_000) as usize);
-        // Recover-friendly keyframe cadence; on-demand keyframes via set_kind(I).
-        enc_ctx.set_gop(fps * 4);
-        let mut opts = ffmpeg::Dictionary::new();
-        opts.set("deadline", "realtime"); // low-latency VP8 (a call, not a file)
-        opts.set("lag-in-frames", "0");
-        let encoder = enc_ctx.open_with(opts).map_err(|e| {
-            log::warn!("video_desktop: encoder open failed: {e:?}");
-            VideoError::CodecInitFailed
-        })?;
-
-        let scaler = Scaler::get(Pixel::RGB24, cam_w, cam_h, Pixel::YUV420P, w, h, Flags::BILINEAR)
-            .map_err(|_| VideoError::CodecInitFailed)?;
-        let rgb = FfVideoFrame::new(Pixel::RGB24, cam_w, cam_h);
+        // Software VP8/VP9. Resize (camera size → encode size) and RGB→I420 both
+        // happen inside the codec crate, straight into libvpx's own planes.
+        let enc = wandr_video::open_encoder(&EncoderParams {
+            codec: codec_of(config.codec),
+            width: w,
+            height: h,
+            bitrate_bps: config.bitrate_bps,
+            framerate: fps,
+        })
+        .map_err(map_err)?;
 
         // PiP self-view: register a slot the render loop composites (above-ui).
         // Self-view surface: mirrored, upright (rotation 0).
@@ -345,13 +307,11 @@ impl VideoEncoder {
 
         Ok(Self {
             cam_thread, cam_stop, latest, last_seq: 0,
-            scaler, encoder, rgb, cam_w, cam_h, fps,
-            pts: 0, force_keyframe: false, pending: VecDeque::new(), preview_id,
+            enc, force_keyframe: false, preview_id, pip: Vec::new(),
         })
     }
 
-    /// Capture one camera frame, scale RGB→YUV420P, encode; push any produced
-    /// packets onto `pending`.
+    /// Capture one camera frame, hand it to the encoder, and update the self-view.
     fn capture_encode(&mut self) {
         // Non-blocking: take the freshest frame the capture thread published. No
         // new frame since we last encoded → return immediately. The render/pump
@@ -365,76 +325,55 @@ impl VideoEncoder {
         };
         let Some(frame) = frame else { return };
         self.last_seq = frame.seq;
-        if frame.w != self.cam_w || frame.h != self.cam_h {
-            log::warn!("video_desktop: frame {}x{} != {}x{}, skipping",
-                frame.w, frame.h, self.cam_w, self.cam_h);
-            return;
-        }
-        let src: &[u8] = &frame.rgb;
-        // Copy tightly-packed RGB into the ffmpeg frame (aligned stride).
-        {
-            let w3 = self.cam_w as usize * 3;
-            let stride = self.rgb.stride(0);
-            let data = self.rgb.data_mut(0);
-            for y in 0..self.cam_h as usize {
-                data[y * stride..y * stride + w3].copy_from_slice(&src[y * w3..y * w3 + w3]);
-            }
-        }
+
         // PiP self-view: hand the render loop the latest camera frame as RGBA.
         if let Some(id) = self.preview_id {
-            let (w, h) = (self.cam_w, self.cam_h);
-            let mut rgba = vec![0u8; (w * h * 4) as usize];
-            for i in 0..(w * h) as usize {
-                rgba[i * 4] = src[i * 3];
-                rgba[i * 4 + 1] = src[i * 3 + 1];
-                rgba[i * 4 + 2] = src[i * 3 + 2];
-                rgba[i * 4 + 3] = 255;
+            let (w, h) = (frame.w, frame.h);
+            let px = (w * h) as usize;
+            self.pip.resize(px * 4, 0);
+            for i in 0..px {
+                self.pip[i * 4] = frame.rgb[i * 3];
+                self.pip[i * 4 + 1] = frame.rgb[i * 3 + 1];
+                self.pip[i * 4 + 2] = frame.rgb[i * 3 + 2];
+                self.pip[i * 4 + 3] = 255;
             }
-            surface_set_frame(id, rgba, w, h);
+            surface_set_frame(id, self.pip.clone(), w, h);
         }
-        let mut yuv = FfVideoFrame::empty();
-        if self.scaler.run(&self.rgb, &mut yuv).is_err() {
-            return;
-        }
-        yuv.set_pts(Some(self.pts));
-        if self.force_keyframe {
-            yuv.set_kind(picture::Type::I);
-            self.force_keyframe = false;
-        }
-        if self.encoder.send_frame(&yuv).is_err() {
-            return;
-        }
-        self.drain_packets();
-        self.pts += 1;
-    }
 
-    fn drain_packets(&mut self) {
-        let mut pkt = ffmpeg::Packet::empty();
-        while self.encoder.receive_packet(&mut pkt).is_ok() {
-            if let Some(data) = pkt.data() {
-                self.pending.push_back(EncodedFrame {
-                    data: data.to_vec(),
-                    timestamp: rtp_ts(pkt.pts().unwrap_or(self.pts), self.fps),
-                    keyframe: pkt.is_key(),
-                });
-            }
+        // Frames whose size differs from the encode size are resized by the codec
+        // crate — the old ffmpeg path hard-skipped them instead.
+        let force = std::mem::take(&mut self.force_keyframe);
+        if let Err(e) = self
+            .enc
+            .encode(Rgb24Frame::new(&frame.rgb, frame.w, frame.h), force)
+        {
+            log::warn!("video_desktop: encode failed: {e:?}");
+            // Don't silently swallow the keyframe request — retry it next frame.
+            self.force_keyframe |= force;
         }
     }
 
     pub fn next_frame(&mut self) -> Option<EncodedFrame> {
-        if self.pending.is_empty() {
-            self.capture_encode();
+        if let Some(p) = self.enc.next_packet() {
+            return Some(EncodedFrame { data: p.data, timestamp: p.timestamp, keyframe: p.keyframe });
         }
-        self.pending.pop_front()
+        self.capture_encode();
+        self.enc
+            .next_packet()
+            .map(|p| EncodedFrame { data: p.data, timestamp: p.timestamp, keyframe: p.keyframe })
     }
 
     pub fn request_keyframe(&mut self) {
         self.force_keyframe = true;
     }
 
-    pub fn set_bitrate(&mut self, _bps: u32) {
-        // libvpx rate control can't be retuned post-open via ffmpeg without a
-        // reconfigure; the desktop path is best-effort (the device honors REMB).
+    pub fn set_bitrate(&mut self, bps: u32) {
+        // Was a no-op on the ffmpeg path (libvpx rate control couldn't be retuned
+        // post-open through ffmpeg-next without a full reconfigure). libvpx does
+        // it directly and cheaply, so desktop now adapts to congestion for real.
+        if let Err(e) = self.enc.set_bitrate(bps) {
+            log::warn!("video_desktop: set_bitrate({bps}) failed: {e:?}");
+        }
     }
 
     pub fn set_preview_rect(&mut self, rect: VideoRect) {
@@ -457,31 +396,25 @@ impl VideoEncoder {
 // ── decoder (decode-to-surface, or decode-to-buffer when rect is empty) ───────
 
 pub struct VideoDecoder {
-    decoder: ffmpeg::decoder::Video,
+    dec: Box<dyn wandr_video::Decoder>,
     decoded: u64,
     /// Compositing surface (Some iff opened with a real rect = decode-to-surface).
     /// None = decode-to-buffer: frames are counted + dropped (the Phase-1 loopback
     /// diagnostic; `wandr.video.test` Part 1).
     surface_id: Option<u32>,
-    /// YUV→RGBA scaler, (re)built lazily to match the decoded frame's size (VP8
-    /// keyframes carry their own dimensions, which can change mid-stream).
-    scaler: Option<Scaler>,
-    scaler_dims: (u32, u32),
+    /// Reused RGBA staging, so steady-state decode-to-surface doesn't allocate.
+    rgba: Vec<u8>,
 }
-
-unsafe impl Send for VideoDecoder {}
 
 impl VideoDecoder {
     pub fn open(config: &DecoderConfig) -> Result<Self, VideoError> {
-        ff_init();
-        let dec_codec = ffmpeg::decoder::find(dec_id(config.codec)).ok_or(VideoError::NoHwCodec)?;
-        let decoder = ffmpeg::codec::context::Context::new_with_codec(dec_codec)
-            .decoder()
-            .video()
-            .map_err(|e| {
-                log::warn!("video_desktop: decoder open failed: {e:?}");
-                VideoError::CodecInitFailed
-            })?;
+        let dec = wandr_video::open_decoder(&DecoderParams {
+            codec: codec_of(config.codec),
+            width: config.width,
+            height: config.height,
+        })
+        .map_err(map_err)?;
+
         // A real rect = decode-to-SURFACE (composite on screen, upright per the
         // peer's CVO rotation); empty/None = decode-to-buffer (count only).
         let surface_id = config.rect.filter(|r| r.w > 0 && r.h > 0).map(|rect| {
@@ -489,44 +422,22 @@ impl VideoDecoder {
                 rect.w, rect.h, rect.x, rect.y, config.rotation);
             alloc_surface(rect, false, config.rotation)
         });
-        Ok(Self { decoder, decoded: 0, surface_id, scaler: None, scaler_dims: (0, 0) })
-    }
-
-    /// Convert one decoded YUV frame to RGBA and hand it to the compositor.
-    fn composite_frame(&mut self, frame: &FfVideoFrame) {
-        let Some(id) = self.surface_id else { return };
-        let (w, h) = (frame.width(), frame.height());
-        if w == 0 || h == 0 {
-            return;
-        }
-        if self.scaler.is_none() || self.scaler_dims != (w, h) {
-            match Scaler::get(frame.format(), w, h, Pixel::RGBA, w, h, Flags::BILINEAR) {
-                Ok(s) => { self.scaler = Some(s); self.scaler_dims = (w, h); }
-                Err(e) => { log::warn!("video_desktop: decode scaler: {e:?}"); return; }
-            }
-        }
-        let mut rgba_frame = FfVideoFrame::empty();
-        if self.scaler.as_mut().unwrap().run(frame, &mut rgba_frame).is_err() {
-            return;
-        }
-        // Tightly pack RGBA (drop the aligned row stride) for skia raster upload.
-        let stride = rgba_frame.stride(0);
-        let src = rgba_frame.data(0);
-        let w4 = w as usize * 4;
-        let mut rgba = vec![0u8; w4 * h as usize];
-        for y in 0..h as usize {
-            rgba[y * w4..y * w4 + w4].copy_from_slice(&src[y * stride..y * stride + w4]);
-        }
-        surface_set_frame(id, rgba, w, h);
+        Ok(Self { dec, decoded: 0, surface_id, rgba: Vec::new() })
     }
 
     pub fn submit(&mut self, data: &[u8], _timestamp: u32) -> Result<(), VideoError> {
-        let pkt = ffmpeg::Packet::copy(data);
-        self.decoder.send_packet(&pkt).map_err(|_| VideoError::BadFrame)?;
-        let mut frame = FfVideoFrame::empty();
-        while self.decoder.receive_frame(&mut frame).is_ok() {
+        self.dec.decode(data).map_err(map_err)?;
+        // VP8/VP9 keyframes carry their own dimensions, and the codec reports them
+        // per frame — which is why the old lazy scaler-rebuild machinery is gone.
+        while let Some(frame) = self.dec.next_frame() {
             self.decoded += 1;
-            self.composite_frame(&frame);
+            let Some(id) = self.surface_id else { continue };
+            let (w, h) = (frame.width, frame.height);
+            // Only convert in decode-to-surface mode — decode-to-buffer must not
+            // pay for a colorspace conversion it throws away.
+            if wandr_video::i420_to_rgba(&frame, &mut self.rgba).is_ok() {
+                surface_set_frame(id, self.rgba.clone(), w, h);
+            }
         }
         Ok(())
     }

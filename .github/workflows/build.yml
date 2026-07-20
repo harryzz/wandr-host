@@ -35,7 +35,7 @@ jobs:
       - name: Fetch required submodules (contracts, hal-sensors, skia headers)
         shell: bash
         run: |
-          git submodule update --init --depth 1 contracts crates/wandr-sensors-client crates/rsbinder crates/audioclient-rs vendor/skia-src
+          git submodule update --init --depth 1 contracts crates/wandr-sensors-client crates/rsbinder crates/audioclient-rs vendor/skia-src vendor/libvpx
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -52,37 +52,62 @@ jobs:
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev \
             libasound2-dev libpulse-dev libfontconfig1-dev clang ninja-build \
-            pkg-config libavcodec-dev libavformat-dev libavutil-dev \
-            libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev
+            pkg-config nasm
 
-      # ffmpeg-next 8.1 is a hard (non-optional) dependency of the desktop video
-      # backend, so every desktop target needs ffmpeg dev libraries present.
+      # nasm assembles libvpx's x86 SIMD. Without it libvpx silently falls back to
+      # a pure-C build with badly degraded realtime encode performance, so
+      # scripts/build-libvpx.sh hard-fails instead. (arm64 needs no external
+      # assembler — NEON goes through the C compiler.)
       - name: macOS system deps
         if: runner.os == 'macOS'
-        run: brew install ffmpeg pkg-config
+        run: brew install nasm pkg-config
 
-      # Claim macOS 12 as the floor for OUR code. NOTE this does not make the artifact
-      # runnable on macOS 12: brew's ffmpeg is a per-OS bottle carrying the runner's minos,
-      # and GitHub retired the macos-12 runners. This job is aarch64 and is a BUILD CHECK;
-      # x86_64 is built locally on the target Mac instead (README), which is the only way
-      # to get a matching bottle. To RUN on an older macOS, build there.
+      # Claim macOS 12 as the floor for OUR code. Task 117 removed the ffmpeg
+      # bottle that used to pin this harder than MACOSX_DEPLOYMENT_TARGET does —
+      # libvpx is now built from source against this same target, so the artifact
+      # is materially more portable than it was. This job is aarch64 and is a
+      # BUILD CHECK; x86_64 is built locally on the target Mac instead (README).
       - name: macOS deployment target
         if: runner.os == 'macOS'
         run: echo "MACOSX_DEPLOYMENT_TARGET=12.0" >> $GITHUB_ENV
 
-      - name: Windows ffmpeg (prebuilt shared libs + FFMPEG_DIR)
+      # Task 117: libvpx (BSD-3) replaced ffmpeg. Built from the pinned
+      # vendor/libvpx submodule and linked STATICALLY, so no libav* dev packages,
+      # no GPL exposure, and no runtime .so in the artifact.
+      - name: Build libvpx (static)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ./scripts/build-libvpx.sh
+          OUT="$PWD/target/libvpx/$(rustc -vV | awk '/^host:/{print $2}')"
+          {
+            echo "VPX_LIB_DIR=$OUT/lib"
+            echo "VPX_INCLUDE_DIR=$OUT/include"
+            echo "VPX_VERSION=1.16.0"
+            echo "VPX_STATIC=1"
+          } >> "$GITHUB_ENV"
+
+      # Windows uses vcpkg rather than our configure+make script: libvpx's build is
+      # a POSIX configure that emits vpx.sln for msbuild, and vcpkg's port already
+      # drives that dance AND fetches NASM itself.
+      #   -static-md = static lib + DYNAMIC CRT (/MD), which is what rustc's
+      #   x86_64-pc-windows-msvc uses. Plain `-static` (/MT) would give LNK4098,
+      #   and plain `x64-windows` would produce a vpx.dll — reintroducing exactly
+      #   the runtime-DLL problem this task removes.
+      - name: Windows libvpx (vcpkg, static)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Must be a RELEASE build: ffmpeg-next 8.1 binds ffmpeg 7.x/8.0 APIs, while
-          # BtbN's master-latest is post-8.0 master (AVCodec::pix_fmts/sample_fmts removed,
-          # new IAMF/HDR side-data variants) and fails to compile.
-          $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip'
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
-          Expand-Archive ffmpeg.zip -DestinationPath $env:RUNNER_TEMP\ffmpeg
-          $dir = (Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory | Select-Object -First 1).FullName
-          echo "FFMPEG_DIR=$dir" >> $env:GITHUB_ENV
-          echo "$dir\bin" >> $env:GITHUB_PATH
+          vcpkg install libvpx[core,realtime]:x64-windows-static-md
+          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
+          # env-libvpx-sys hardcodes `rustc-link-lib=static=libvpx` on Windows (so
+          # it looks for libvpx.lib), but vcpkg installs vpx.lib. Alias it rather
+          # than routing through pkg-config, which Windows runners may not have.
+          Copy-Item "$root\lib\vpx.lib" "$root\lib\libvpx.lib" -Force
+          echo "VPX_LIB_DIR=$root\lib"         >> $env:GITHUB_ENV
+          echo "VPX_INCLUDE_DIR=$root\include" >> $env:GITHUB_ENV
+          echo "VPX_VERSION=1.16.0"            >> $env:GITHUB_ENV
+          echo "VPX_STATIC=1"                  >> $env:GITHUB_ENV
 
       # Match scripts/build-host-*.{sh,bat}: they all default to P3=1 (--features
       # p3-async). It is NOT in `default`, so a plain `cargo build` yields a host with no

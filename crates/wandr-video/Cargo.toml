@@ -1,0 +1,30 @@
+[package]
+name = "wandr-video"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Portable video codec backends for wandr:video — VP8/VP9 via libvpx, no FFmpeg."
+
+[features]
+# OFF by default so a plain `cargo build` (and the Android cross-build, which
+# uses MediaCodec) needs no media library at all. The desktop host turns it on.
+default = []
+libvpx = ["dep:env-libvpx-sys"]
+
+[dependencies]
+# libvpx (BSD-3) — statically linked from the vendored vendor/libvpx build.
+# `generate` runs bindgen against OUR vendored headers, so the bindings always
+# match the pinned libvpx version (the bundled ones stop at 1.13.0).
+env-libvpx-sys = { version = "5.1", features = ["generate"], optional = true }
+# Pure-Rust SIMD colorspace + resize — the libswscale replacement. These are pure
+# Rust (no system library, cross-compiles anywhere), so they are NOT gated: the
+# shared types and conversion helpers stay available on every target.
+yuv = "0.8"
+fast_image_resize = "6.0"
+log = "0.4"
+
+# The round-trip tests need a real codec, so they are skipped by a bare
+# `cargo test` rather than failing it.
+[[test]]
+name = "roundtrip"
+required-features = ["libvpx"]

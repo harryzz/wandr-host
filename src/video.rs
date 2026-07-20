@@ -137,7 +137,8 @@ pub(crate) fn device_rotation_deg() -> u32 {
 #[cfg(target_os = "android")]
 pub use android::{ensure_binder_threadpool, VideoDecoder, VideoEncoder};
 
-// Desktop (Linux/WSLg/Win/mac) backend: nokhwa camera + ffmpeg software VP8/VP9.
+// Desktop (Linux/WSLg/Win/mac) backend: nokhwa camera + software VP8/VP9 via the
+// wandr-video crate (statically-linked libvpx; task 117 replaced ffmpeg).
 // The cross-platform peer of the android NDK/MediaCodec path below.
 #[cfg(not(target_os = "android"))]
 pub use crate::video_desktop::{ensure_binder_threadpool, VideoDecoder, VideoEncoder};

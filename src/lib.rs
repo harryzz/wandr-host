@@ -40,7 +40,8 @@ mod connectivity_wifi_impl;
 pub mod crypto;
 mod crypto_host_impl;
 pub mod video;
-// Desktop wandr:video backend (nokhwa + ffmpeg VP8/VP9); android uses NDK/MediaCodec.
+// Desktop wandr:video backend (nokhwa + libvpx VP8/VP9 via the wandr-video
+// crate); android uses NDK/MediaCodec.
 #[cfg(not(target_os = "android"))]
 pub mod video_desktop;
 mod video_host_impl;

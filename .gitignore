@@ -40,3 +40,4 @@ core.*
 /vendor/aosp-system-logging/
 /vendor/generated-aidl/
 cpp/build/
+crates/wandr-video/Cargo.lock

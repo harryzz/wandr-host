@@ -46,3 +46,6 @@
 	url = https://codeberg.org/harryzz/rsbinder.git
 	branch = wandr-recursive
 	shallow = true
+[submodule "vendor/libvpx"]
+	path = vendor/libvpx
+	url = https://chromium.googlesource.com/webm/libvpx

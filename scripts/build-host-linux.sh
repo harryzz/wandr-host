@@ -16,6 +16,10 @@ FEATURES=()
 [[ "${P3:-1}" == "1" ]] && FEATURES=(--features p3-async)
 
 cd "$REPO_ROOT"
+
+# Task 117: static libvpx (BSD-3) replaced ffmpeg — builds it on first run.
+. "$REPO_ROOT/scripts/libvpx-env.sh"
+
 echo "Building wandr-host for $TARGET (release${P3:+, p3-async=$P3}) …"
 cargo build --release --target "$TARGET" "${FEATURES[@]}"
 

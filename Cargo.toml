@@ -37,6 +37,12 @@ log                = "0.4"
 # Shared sensor HAL (task 77) — the ISensorManager path, also used by the
 # arbiter's sensor driver. Cross-platform (off-android = no-op stubs).
 wandr-sensors-client  = { path = "crates/wandr-sensors-client" }
+# wandr:video codec types + backends (task 117). Unconditional and types-ONLY
+# here: the shared vocabulary (Codec/VideoRect/EncoderConfig/…) that src/video.rs
+# re-exports is needed on every target, including android. The libvpx backend is
+# a feature, enabled only for desktop below — android encodes from a Surface via
+# MediaCodec and must not pull in a codec library.
+wandr-video           = { path = "crates/wandr-video" }
 android_logger     = { version = "0.14", optional = true }
 env_logger         = { version = "0.11", optional = true }
 raw-window-handle  = "0.6"
@@ -139,16 +145,16 @@ cpal = { version = "0.18" }
 # decode_image in wasi_canvas_002_impl.rs. Already transitively present via nokhwa.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 # Desktop wandr:video backend — cross-platform camera capture (nokhwa: v4l2 Linux /
-# MediaFoundation Windows / AVFoundation macOS) + software VP8/VP9 via ffmpeg
-# (libvpx). ffmpeg-next 7.1 matches system ffmpeg 7.1 (libavcodec 61); only
-# codec+format+software-scaling (no libavfilter/libavdevice dev headers needed).
-# See src/video_desktop.rs; proven in repros/nokhwa-camera-probe.
+# MediaFoundation Windows / AVFoundation macOS). See src/video_desktop.rs;
+# proven in repros/nokhwa-camera-probe.
 nokhwa = { version = "0.10", features = ["input-native"] }
-# 8.1 spans ffmpeg 7.x AND 8.x (version-gated bindings) — Linux/Debian + the
-# Windows BtbN prebuilt are on 7.x, macOS Homebrew ships 8.x. Bumped from 7.1 so
-# the same crate binds whatever ffmpeg the platform provides (7.1 hard-failed on
-# ffmpeg 8: it tried to bind the removed libavcodec/avfft.h).
-ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-scaling"] }
+# Software VP8/VP9 (task 117) — replaces ffmpeg-next. libvpx is BSD-3 and linked
+# STATICALLY from vendor/libvpx, so there is no GPL exposure (distro ffmpeg is
+# built --enable-gpl) and no runtime .so to ship. DESKTOP ONLY: android encodes
+# and decodes in hardware via MediaCodec and links no codec library, which is why
+# this sits in the same target table ffmpeg-next did.
+# Build the static lib first: scripts/build-libvpx.sh (sets VPX_LIB_DIR et al).
+wandr-video = { path = "crates/wandr-video", features = ["libvpx"] }
 
 # Linux-only: add cpal's pure-Rust PulseAudio host on top of the plain cpal above
 # (cargo unions features across target tables). This is the WSLg audio path
