@@ -270,6 +270,17 @@ pub mod ndk {
         pub fn AMediaCodec_createEncoderByType(mime: *const c_char) -> *mut AMediaCodec;
         pub fn AMediaCodec_createDecoderByType(mime: *const c_char) -> *mut AMediaCodec;
         pub fn AMediaCodec_createCodecByName(name: *const c_char) -> *mut AMediaCodec;
+        /// Which component we actually got (API 28+). The only way to tell a HW
+        /// codec from a software one at runtime: `OMX.qcom.*` / `c2.qti.*` are
+        /// vendor HW, `OMX.google.*` / `c2.android.*` are software.
+        ///
+        /// There is NO codec-enumeration API in the NDK on this platform
+        /// (`android.media.MediaCodecList` is ART-side, and `AMediaCodecStore`
+        /// landed in API 36), so capability discovery = try to open each MIME and
+        /// ask what came back. Reading /vendor/etc/media_codecs*.xml would only
+        /// tell us what the device SHIPS, not what actually opens under --no-art.
+        pub fn AMediaCodec_getName(c: *mut AMediaCodec, out_name: *mut *mut c_char) -> c_int;
+        pub fn AMediaCodec_releaseName(c: *mut AMediaCodec, name: *mut c_char);
         pub fn AMediaCodec_configure(c: *mut AMediaCodec, fmt: *const AMediaFormat,
             surface: *mut ANativeWindow, crypto: *mut c_void, flags: u32) -> c_int;
         pub fn AMediaCodec_createInputSurface(c: *mut AMediaCodec, out: *mut *mut ANativeWindow) -> c_int;

@@ -77,6 +77,14 @@ mod android {
             unsafe { run_imagereader(W, H) }
             return;
         }
+        // `--probe-video codecs` → what this device can actually decode/encode,
+        // asked via the codec API rather than read from a config file. Probed at
+        // 1080p because that is the playback-relevant size (task 117 M2), not the
+        // 640x480 the call path uses.
+        if codec_name.as_deref() == Some("codecs") {
+            unsafe { run_codecs(1920, 1080) }
+            return;
+        }
         // `--probe-video decode` → camera → HW VP8 ENCODE → HW VP8 DECODE loopback
         // (task-93 decode-path probe: proves the HW decoder configures + emits frames
         // under --no-art — the one piece the original encode spike never exercised).
@@ -94,6 +102,100 @@ mod android {
     // Decisive camera-delivery test: camera → AImageReader (explicit dims, no
     // encoder). If frames arrive, camera capture works end-to-end under --no-art
     // and the encoder-surface 0x0 was the only gap.
+    /// Every video MIME worth asking about. The point of the probe is that we
+    /// ASK the platform rather than trusting /vendor/etc/media_codecs*.xml: the
+    /// manifest says what the device ships, not what actually opens and
+    /// configures under `--no-art`, which is the only thing that matters here.
+    const VIDEO_MIMES: &[(&str, &str)] = &[
+        ("H.264", "video/avc"),
+        ("H.265", "video/hevc"),
+        ("VP8", "video/x-vnd.on2.vp8"),
+        ("VP9", "video/x-vnd.on2.vp9"),
+        ("AV1", "video/av01"),
+        ("MPEG-4", "video/mp4v-es"),
+        ("H.263", "video/3gpp"),
+    ];
+
+    /// Vendor prefixes = real hardware; google/android prefixes = software.
+    fn is_hw(component: &str) -> bool {
+        !(component.starts_with("OMX.google.") || component.starts_with("c2.android."))
+    }
+
+    /// Ask the codec which component we actually got (API 28+).
+    unsafe fn component_name(c: *mut AMediaCodec) -> Option<String> {
+        let mut raw: *mut std::os::raw::c_char = ptr::null_mut();
+        if AMediaCodec_getName(c, &mut raw) != 0 || raw.is_null() {
+            return None;
+        }
+        let s = CStr::from_ptr(raw).to_string_lossy().into_owned();
+        AMediaCodec_releaseName(c, raw);
+        Some(s)
+    }
+
+    /// `--probe-video codecs` — what this device can actually DECODE/ENCODE,
+    /// discovered by opening each MIME rather than by reading a config file.
+    ///
+    /// For each codec: create → getName (HW or SW?) → configure at `w`x`h` with a
+    /// NULL surface (decode-to-buffer) → start. A codec that opens but fails to
+    /// configure is worse than one that is absent, because the absence is at
+    /// least honest — so all three steps are reported separately.
+    unsafe fn run_codecs(w: i32, h: i32) {
+        p!("=== wandr-host --probe-video codecs — asking the platform ({w}x{h}) ===");
+        p!("(NDK has no enumeration API here: android.media.MediaCodecList is");
+        p!(" ART-side and AMediaCodecStore is API 36, so we open-and-ask.)");
+        p!("");
+        p!("DECODERS");
+        p!("  {:<8} {:<28} {:<4} {}", "codec", "component", "lane", "configure+start");
+        for (label, mime) in VIDEO_MIMES {
+            let cmime = CString::new(*mime).unwrap();
+            let c = AMediaCodec_createDecoderByType(cmime.as_ptr());
+            if c.is_null() {
+                p!("  {label:<8} {:<28} {:<4} {}", "—", "—", "ABSENT");
+                continue;
+            }
+            let name = component_name(c).unwrap_or_else(|| "(getName failed)".into());
+            let lane = if is_hw(&name) { "HW" } else { "SW" };
+
+            let fmt = AMediaFormat_new();
+            AMediaFormat_setString(fmt, b"mime\0".as_ptr() as *const _, cmime.as_ptr());
+            AMediaFormat_setInt32(fmt, b"width\0".as_ptr() as *const _, w);
+            AMediaFormat_setInt32(fmt, b"height\0".as_ptr() as *const _, h);
+            // NULL surface = decode-to-buffer, so this works headless.
+            let cfg = AMediaCodec_configure(c, fmt, ptr::null_mut(), ptr::null_mut(), 0);
+            let verdict = if cfg != 0 {
+                format!("configure FAILED ({cfg})")
+            } else {
+                let st = AMediaCodec_start(c);
+                if st != 0 { format!("start FAILED ({st})") } else { "OK".into() }
+            };
+            p!("  {label:<8} {name:<28} {lane:<4} {verdict}");
+
+            AMediaFormat_delete(fmt);
+            let _ = AMediaCodec_stop(c);
+            AMediaCodec_delete(c);
+        }
+
+        p!("");
+        p!("ENCODERS");
+        p!("  {:<8} {:<28} {:<4}", "codec", "component", "lane");
+        for (label, mime) in VIDEO_MIMES {
+            let cmime = CString::new(*mime).unwrap();
+            let c = AMediaCodec_createEncoderByType(cmime.as_ptr());
+            if c.is_null() {
+                p!("  {label:<8} {:<28} {:<4}", "—", "—");
+                continue;
+            }
+            let name = component_name(c).unwrap_or_else(|| "(getName failed)".into());
+            let lane = if is_hw(&name) { "HW" } else { "SW" };
+            p!("  {label:<8} {name:<28} {lane:<4}");
+            AMediaCodec_delete(c);
+        }
+        p!("");
+        p!("NOTE: 'HW' means a vendor component answered, NOT that it is fast or");
+        p!("      that every level/resolution works — check configure at your");
+        p!("      target size. A .secure variant existing implies DRM-capable.");
+    }
+
     unsafe fn run_imagereader(w: i32, h: i32) {
         let tp = crate::video::ensure_binder_threadpool();
         p!("binder threadpool started: {tp}");
