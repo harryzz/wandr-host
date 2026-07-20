@@ -38,8 +38,13 @@ git submodule update --init --depth 1 contracts crates/wandr-sensors-client vend
 ```bash
 sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
   libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev \
-  libasound2-dev libpulse-dev libfontconfig1-dev clang ninja-build
+  libasound2-dev libpulse-dev libfontconfig1-dev clang ninja-build nasm
 ```
+
+`nasm` assembles libvpx's x86 SIMD — the video backend builds it from
+`vendor/libvpx` on first `cargo build`. Without an assembler libvpx would silently
+fall back to a pure-C build with badly degraded realtime encode, so the build fails
+loudly instead. (No media *library* is needed: nothing links system ffmpeg any more.)
 
 ### Android (cross build)
 
@@ -57,23 +62,32 @@ Convenience wrappers live in `scripts/` (`build-host-linux.sh`, `-macos.sh`,
 `-android.sh`, `build-host-windows.bat`). CI builds every target — see
 `.github/workflows/build.yml`.
 
-### CI artifacts are a build check, not portable binaries
+### Artifact portability
 
-The desktop host links **system ffmpeg**, so a binary is tied to the ffmpeg the build
-machine had:
+Task 117 removed the FFmpeg dependency — video is now **libvpx, built from
+`vendor/libvpx` and linked statically** — so the old "a binary is tied to the ffmpeg
+the build machine had" caveat no longer applies on any platform. No `libav*.so`, no
+`avcodec-*.dll`, no Homebrew bottle.
 
-- **Linux** — the artifact wants the runner's soname (e.g. `libavutil.so.58`) and fails
-  with `error while loading shared libraries` on a machine with a different ffmpeg.
-- **macOS** — Homebrew ships per-OS bottles, so an artifact built on the `macos-13`
-  runner carries `minos 13.0` and will not load on macOS 12. (GitHub retired the
-  `macos-12` runners, so this cannot be matched in CI.) `MACOSX_DEPLOYMENT_TARGET`
-  defaults to 12.0 for *our* code, but it cannot lower ffmpeg's floor.
+- **macOS — portable in practice.** The binary links **only system frameworks**
+  (verified with `otool -L`: `libSystem`, `libc++`, AppKit/Metal/AVFoundation/…, and
+  nothing else). `MACOSX_DEPLOYMENT_TARGET` (default 12.0, override with `MACOS_MIN`)
+  now actually governs the floor, because nothing else pins a higher one.
+  *Verified:* an x86_64 build reports `minos 12.0` and runs on macOS 12.7.6.
+  *Not verified:* a CI-built **aarch64** artifact on an old macOS — plausible, but
+  untested, and arm64 Macs never shipped below macOS 11 anyway.
+- **Linux — still not portable, but for a different reason.** glibc and the X11 /
+  Wayland / GL / audio system libraries remain, so an artifact built on a newer
+  runner can still fail on an older distro. That is now the *only* blocker, and it is
+  what task 118 (redistributable binaries) is about.
+- **Windows** — no media DLL is needed at run time any more; nothing has to be put on
+  `PATH` to launch the exe.
 
-**To run it, build it on the machine you want to run it on** — brew/apt then install a
-matching ffmpeg. For an older macOS:
+Building on the target machine is still the surest thing, and is required for
+macOS x86_64 (CI only covers aarch64):
 
 ```bash
-brew install ffmpeg pkg-config
+brew install nasm                               # libvpx's x86 SIMD assembler
 ARCHS=x86_64 ./scripts/build-host-macos.sh      # MACOS_MIN=12.0 by default
 ```
 
