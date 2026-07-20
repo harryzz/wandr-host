@@ -24,7 +24,6 @@ jobs:
         include:
           - { name: linux-x86_64,   os: ubuntu-latest }
           - { name: macos-aarch64,  os: macos-latest }
-          - { name: macos-x86_64,   os: macos-13 }
           - { name: windows-x86_64, os: windows-latest }
     steps:
       - uses: actions/checkout@v4
@@ -63,9 +62,10 @@ jobs:
         run: brew install ffmpeg pkg-config
 
       # Claim macOS 12 as the floor for OUR code. NOTE this does not make the artifact
-      # runnable on macOS 12: brew's ffmpeg is a per-OS bottle (a macos-13 runner installs
-      # one with minos 13.0), and macos-12 runners were retired by GitHub. To RUN on an
-      # older macOS, build there — see README.
+      # runnable on macOS 12: brew's ffmpeg is a per-OS bottle carrying the runner's minos,
+      # and GitHub retired the macos-12 runners. This job is aarch64 and is a BUILD CHECK;
+      # x86_64 is built locally on the target Mac instead (README), which is the only way
+      # to get a matching bottle. To RUN on an older macOS, build there.
       - name: macOS deployment target
         if: runner.os == 'macOS'
         run: echo "MACOSX_DEPLOYMENT_TARGET=12.0" >> $GITHUB_ENV
