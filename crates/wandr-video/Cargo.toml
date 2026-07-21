@@ -23,6 +23,12 @@ oxideav-h265 = ["dep:oxideav-h265"]
 # linked STATICALLY (no runtime .so). ~60 fps @720p single-thread vs oxideav's
 # ~4 fps. LGPL is task 117's third-choice tier — allowed for a real need.
 libde265 = ["dep:libde265"]
+# Software AV1 via dav1d (VideoLAN, BSD-2). Built from source and linked
+# STATICALLY by dav1d-sys's internal meson path (see the note in the dep below).
+# ~355 fps @720p vs oxideav-av1 failing on standard matroska framing entirely.
+# BSD-2 = task 117's permissive-static tier (cleaner than HEVC's LGPL). Decode
+# only; Android decodes AV1 in MediaCodec HW so this stays desktop-only.
+dav1d = ["dep:dav1d"]
 
 [dependencies]
 # libvpx (BSD-3), built from vendor/libvpx and linked statically by wandr-vpx-sys.
@@ -38,6 +44,11 @@ oxideav-h265 = { version = "=0.0.9", optional = true }
 # `static` builds libde265 from source with cc and links it statically; drop the
 # default `system` feature so there is no runtime .so dependency.
 libde265 = { version = "0.2", default-features = false, features = ["static"], optional = true }
+# dav1d-sys builds dav1d from source with meson and links it statically when
+# `SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always` is set in the build env (the wandr
+# build scripts set it); no runtime .so. Pinned to the version the AV1 bench
+# verified (355 fps on a real AV1 stream, repros/av1-bench).
+dav1d = { version = "0.11", optional = true }
 # Pure-Rust SIMD colorspace + resize — the libswscale replacement. These are pure
 # Rust (no system library, cross-compiles anywhere), so they are NOT gated: the
 # shared types and conversion helpers stay available on every target.

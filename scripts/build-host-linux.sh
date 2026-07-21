@@ -17,9 +17,15 @@ FEATURES=()
 
 cd "$REPO_ROOT"
 
-# Task 117: video is static libvpx (BSD-3), not ffmpeg. crates/wandr-vpx-sys's
-# build script compiles vendor/libvpx on the first build, so there is nothing to
-# set up here — just `nasm` on PATH for its x86 SIMD.
+# Task 117: video codecs are statically linked, not ffmpeg. All three build from
+# source on the first build, so there is nothing to install here — only the
+# toolchains on PATH:
+#   • libvpx  (BSD-3, VP8/VP9)  — wandr-vpx-sys compiles vendor/libvpx  → needs nasm
+#   • libde265 (LGPL, H.265)    — libde265-sys `static` compiles with cc → needs a C compiler
+#   • dav1d   (BSD-2, AV1)      — dav1d-sys builds it with meson/ninja   → needs meson, ninja, nasm
+# SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always tells dav1d-sys to build the vendored
+# dav1d statically instead of looking for a system .so via pkg-config.
+export SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always
 echo "Building wandr-host for $TARGET (release${P3:+, p3-async=$P3}) …"
 cargo build --release --target "$TARGET" "${FEATURES[@]}"
 

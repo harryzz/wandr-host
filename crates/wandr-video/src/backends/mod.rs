@@ -16,3 +16,6 @@ pub mod oxideav_h265;
 
 #[cfg(feature = "libde265")]
 pub mod libde265;
+
+#[cfg(feature = "dav1d")]
+pub mod dav1d;

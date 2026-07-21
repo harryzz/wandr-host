@@ -39,6 +39,10 @@ pub enum Codec {
     /// Android via MediaCodec HW (`OMX.qcom.video.decoder.hevc`, measured).
     /// Decode-only — we never encode HEVC.
     H265,
+    /// Playback (task 117 M2). Desktop decodes it in software via dav1d; Android
+    /// via MediaCodec HW (`c2.android.av1.decoder` / an SoC AV1 decoder where
+    /// present). Decode-only — we never encode AV1.
+    Av1,
 }
 
 impl Codec {
@@ -48,6 +52,7 @@ impl Codec {
             Codec::Vp9 => "video/x-vnd.on2.vp9",
             Codec::H264 => "video/avc",
             Codec::H265 => "video/hevc",
+            Codec::Av1 => "video/av01",
         }
     }
 }

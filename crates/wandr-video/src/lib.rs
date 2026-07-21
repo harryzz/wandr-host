@@ -53,6 +53,7 @@ pub enum Codec {
     Vp9,
     H264,
     H265,
+    Av1,
 }
 
 /// Everything a codec needs to start encoding — and nothing else. Notably absent:
@@ -309,6 +310,8 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(backends::oxideav_h265::OxideH265Backend));
     #[cfg(feature = "libde265")]
     r.register(Box::new(backends::libde265::Libde265Backend));
+    #[cfg(feature = "dav1d")]
+    r.register(Box::new(backends::dav1d::Dav1dBackend));
     // Future: HW backends register here at priority < 100, and oxideav slots in
     // as just another software (or HW-bridge) backend once it is ready.
     r

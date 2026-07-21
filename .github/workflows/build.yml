@@ -52,7 +52,11 @@ jobs:
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev \
             libasound2-dev libpulse-dev libfontconfig1-dev clang ninja-build \
-            pkg-config nasm
+            pkg-config nasm meson
+          # dav1d (AV1, BSD-2) builds from source via meson; tell dav1d-sys to do
+          # so statically instead of looking for a system .so. (meson+ninja+nasm
+          # above are its toolchain.)
+          echo "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always" >> $GITHUB_ENV
 
       # nasm assembles libvpx's x86 SIMD. Without it libvpx silently falls back to
       # a pure-C build with badly degraded realtime encode performance, so
@@ -60,7 +64,11 @@ jobs:
       # assembler — NEON goes through the C compiler.)
       - name: macOS system deps
         if: runner.os == 'macOS'
-        run: brew install nasm pkg-config
+        run: |
+          # nasm: libvpx SIMD. meson+ninja: dav1d's build (AV1). arm64 dav1d uses
+          # NEON so nasm isn't strictly needed for it, but the x86 path wants it.
+          brew install nasm pkg-config meson ninja
+          echo "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always" >> $GITHUB_ENV
 
       # Claim macOS 12 as the floor for OUR code. Task 117 removed the ffmpeg
       # bottle that used to pin this harder than MACOSX_DEPLOYMENT_TARGET does —
@@ -93,6 +101,20 @@ jobs:
           $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
           echo "VPX_LIB_DIR=$root\lib"         >> $env:GITHUB_ENV
           echo "VPX_INCLUDE_DIR=$root\include" >> $env:GITHUB_ENV
+
+      # dav1d (AV1, BSD-2) — UNLIKE libvpx, dav1d's build system is meson, which is
+      # MSVC-native (no POSIX configure, so no vcpkg needed). dav1d-sys builds it
+      # statically from source when SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always; its
+      # toolchain is meson (pip) + ninja + nasm. CI-iterate leg — not locally
+      # verifiable on the Linux dev box.
+      - name: Windows dav1d toolchain (AV1)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pip install meson
+          choco install ninja nasm -y
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+          echo "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always" >> $env:GITHUB_ENV
 
       # Match scripts/build-host-*.{sh,bat}: they all default to P3=1 (--features
       # p3-async). It is NOT in `default`, so a plain `cargo build` yields a host with no

@@ -35,6 +35,11 @@ if not exist "%VPX_ROOT%\lib\vpx.lib" (
 set "VPX_LIB_DIR=%VPX_ROOT%\lib"
 set "VPX_INCLUDE_DIR=%VPX_ROOT%\include"
 
+REM dav1d (AV1) builds from source via meson, which is MSVC-native (no POSIX
+REM configure), so it needs no vcpkg — just meson (pip install meson) + ninja +
+REM nasm on PATH. Build it statically from source instead of resolving a system lib.
+set "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always"
+
 call "%VCVARS%" x64 >nul
 cd /d "%~dp0.."
 
