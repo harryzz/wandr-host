@@ -15,6 +15,10 @@ libvpx = ["dep:wandr-vpx-sys"]
 # library. Android decodes H.264 in hardware via MediaCodec and never enables
 # this, which is why it is a separate opt-in feature like `libvpx`.
 openh264 = ["dep:openh264"]
+# Software H.265/HEVC (oxideav-h265, pure-Rust MIT) — the DESKTOP software
+# decoder. Fills the H.265 gap task 117 flagged, without LGPL libde265. Android
+# decodes HEVC in MediaCodec HW, so this is desktop-only like the others.
+oxideav-h265 = ["dep:oxideav-h265"]
 
 [dependencies]
 # libvpx (BSD-3), built from vendor/libvpx and linked statically by wandr-vpx-sys.
@@ -23,6 +27,10 @@ openh264 = ["dep:openh264"]
 # needs no system media library and no pre-build step.
 wandr-vpx-sys = { path = "../wandr-vpx-sys", optional = true }
 openh264 = { version = "0.9", optional = true }
+# Pure-Rust HEVC decoder (MIT). We depend ONLY on the codec crate — oxideav's
+# registry and its unfinished HW backends are not used. Pinned to the version the
+# spike verified (300/300 on a real HEVC MP4).
+oxideav-h265 = { version = "=0.0.9", optional = true }
 # Pure-Rust SIMD colorspace + resize — the libswscale replacement. These are pure
 # Rust (no system library, cross-compiles anywhere), so they are NOT gated: the
 # shared types and conversion helpers stay available on every target.

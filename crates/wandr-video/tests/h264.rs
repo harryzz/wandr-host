@@ -65,12 +65,18 @@ fn registry_routes_codecs_to_the_right_backend() {
     );
     assert!(hw_only.is_err(), "require_hardware must not silently use software");
 
-    // And a codec no backend handles fails cleanly, not panics.
-    let none = reg.open_decoder(
+    // H.265 routing depends on which backends are compiled in: with the
+    // oxideav-h265 feature there IS a software decoder, without it there is not.
+    // Either way the registry must answer cleanly (never panic).
+    let h265 = reg.open_decoder(
         &DecoderParams { codec: Codec::H265, width: W, height: H },
         Preferences::default(),
     );
-    assert!(none.is_err(), "H.265 has no software backend yet");
+    if cfg!(feature = "oxideav-h265") {
+        assert!(h265.is_ok(), "oxideav-h265 backend should decode H.265");
+    } else {
+        assert!(h265.is_err(), "no H.265 software backend without the feature");
+    }
 }
 
 /// The load-bearing decode test: encode H.264, decode it, and the decoded pixels

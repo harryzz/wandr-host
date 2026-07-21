@@ -10,3 +10,6 @@ pub mod libvpx;
 
 #[cfg(feature = "openh264")]
 pub mod openh264;
+
+#[cfg(feature = "oxideav-h265")]
+pub mod oxideav_h265;
