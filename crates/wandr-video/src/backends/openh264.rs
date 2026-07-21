@@ -20,7 +20,7 @@
 
 use std::collections::VecDeque;
 
-use openh264::decoder::Decoder as OhDecoder;
+use openh264::decoder::{Decoder as OhDecoder, DecoderConfig, Flush};
 use openh264::encoder::{
     BitRate, Encoder as OhEncoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType,
 };
@@ -197,10 +197,24 @@ unsafe impl Send for H264Decoder {}
 
 impl H264Decoder {
     pub fn open(_p: &DecoderParams) -> Result<Self, CodecError> {
-        let dec = OhDecoder::new().map_err(|e| {
-            log::warn!("wandr-video: openh264 decoder init: {e}");
-            CodecError::InitFailed
-        })?;
+        Self::new_decoder()
+    }
+
+    /// One place to build the decoder so `open` and `reset` stay identical.
+    ///
+    /// ‼️ `Flush::NoFlush` is load-bearing. OpenH264 defaults to flushing after
+    /// every decode, which the crate's own docs warn causes decoder errors — and
+    /// it does: on a real B-frame MP4 the reorder buffer overflows at the second
+    /// GOP (OOM, then cascading no-param-sets). With NoFlush the decoder holds
+    /// frames for reordering and we drain them explicitly in `flush()`.
+    fn new_decoder() -> Result<Self, CodecError> {
+        let cfg = DecoderConfig::new().flush_after_decode(Flush::NoFlush);
+        let dec = OhDecoder::with_api_config(openh264::OpenH264API::from_source(), cfg).map_err(
+            |e| {
+                log::warn!("wandr-video: openh264 decoder init: {e}");
+                CodecError::InitFailed
+            },
+        )?;
         Ok(Self {
             dec,
             pts_fifo: VecDeque::new(),
@@ -234,23 +248,35 @@ fn copy_i420(yuv: &openh264::decoder::DecodedYUV<'_>) -> DecodedFrame {
 impl Decoder for H264Decoder {
     fn decode(&mut self, chunk: crate::Chunk<'_>) -> Result<(), CodecError> {
         self.pts_fifo.push_back(chunk.timestamp_us);
-        // Copy out inside the match so the `self.dec` borrow ends before we touch
-        // `self.pts_fifo` / `self.out`.
-        let frame = match self.dec.decode(chunk.data) {
-            Ok(Some(yuv)) => Some(copy_i420(&yuv)),
-            // No frame yet (SPS/PPS only, or buffering) — the PTS stays queued.
-            Ok(None) => None,
-            Err(e) => {
-                log::warn!("wandr-video: openh264 decode: {e}");
-                self.pts_fifo.pop_back(); // this packet produced nothing
-                return Err(CodecError::BadFrame);
+        // ‼️ Feed NAL-BY-NAL. OpenH264's `decode_frame_no_delay` processes ONE NAL
+        // per call: handed a whole access unit (SPS+PPS+slice, or a multi-slice
+        // frame) it consumes only the first NAL and the rest report
+        // `dsNoParamSets`. The frame pops out on the access unit's last slice NAL.
+        // `nal_units` splits an Annex-B buffer; a caller passing a single NAL just
+        // gets a one-element iterator.
+        let mut frame: Option<DecodedFrame> = None;
+        let mut errored = false;
+        for nal in openh264::nal_units(chunk.data) {
+            match self.dec.decode(nal) {
+                Ok(Some(yuv)) => frame = Some(copy_i420(&yuv)),
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!("wandr-video: openh264 decode: {e}");
+                    errored = true;
+                }
             }
-        };
+        }
         if let Some(mut f) = frame {
             f.pts_us = self.pts_fifo.pop_front().unwrap_or(0);
             self.out.push_back(f);
+            Ok(())
+        } else if errored {
+            self.pts_fifo.pop_back(); // this access unit produced nothing
+            Err(CodecError::BadFrame)
+        } else {
+            // No frame yet (headers only, or reorder delay) — PTS stays queued.
+            Ok(())
         }
-        Ok(())
     }
 
     fn flush(&mut self) -> Result<(), CodecError> {
@@ -274,10 +300,7 @@ impl Decoder for H264Decoder {
         // A fresh decoder is the reliable seek: OpenH264 has no documented
         // in-place reset, and this drops all reference state. The caller feeds a
         // keyframe next.
-        self.dec = OhDecoder::new().map_err(|_| CodecError::InitFailed)?;
-        self.pts_fifo.clear();
-        self.out.clear();
-        self.current = None;
+        *self = Self::new_decoder()?;
         Ok(())
     }
 
