@@ -382,6 +382,9 @@ mod video_host_bindings {
         with: {
             "wandr:video/encoder.video-encoder": crate::video_host_impl::EncoderState,
             "wandr:video/decoder.video-decoder": crate::video_host_impl::DecoderState,
+            // Playback (task 117 M2): one decoded frame the guest holds while it
+            // decides when to present it.
+            "wandr:video/decoder.decoded-frame": crate::video_host_impl::DecodedFrameState,
         },
     });
 }

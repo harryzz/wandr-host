@@ -88,6 +88,10 @@ thread_local! {
 /// wasi:canvas host `present` AFTER the guest UI (above-ui) and before swap.
 /// Rects are absolute surface pixels.
 pub fn composite_video_surfaces(canvas: &skia_safe::Canvas) {
+    // Paint any guest-scheduled frames that have come due (task 117 M2). This
+    // runs before compositing so a frame scheduled for "now" appears in THIS
+    // host frame rather than the next one.
+    drain_scheduled();
     SURFACES.with(|m| {
         for s in m.borrow().values() {
             if !s.visible || s.rgba.is_empty() || s.rect.w <= 0 || s.rect.h <= 0 {
@@ -406,6 +410,88 @@ struct PendingFrame {
     h: u32,
 }
 
+/// A decoded frame handed OUT to the guest as a `wandr:video` `decoded-frame`
+/// resource (task 117 M2 stage 1).
+///
+/// Deliberately self-contained — it carries its own target surface — so
+/// `present`/`discard` never need the decoder back. That matters because the
+/// guest may hold a frame across decoder calls, and it keeps the resource's
+/// lifetime independent of the decoder's borrow.
+pub struct TakenFrame {
+    pts_us: i64,
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+    surface_id: Option<u32>,
+}
+
+impl TakenFrame {
+    pub fn timestamp_us(&self) -> i64 {
+        self.pts_us
+    }
+    /// Paint it now. `surface_id == None` = decode-to-buffer, so this is the
+    /// counted-and-dropped diagnostic path and presenting is a no-op.
+    pub fn present_now(self) {
+        if let Some(id) = self.surface_id {
+            surface_set_frame(id, self.rgba, self.w, self.h);
+        }
+    }
+}
+
+/// Frames the guest scheduled for a FUTURE `at-ns`, ordered by deadline.
+///
+/// The guest calls `present(at-ns)` on the wasi:clocks monotonic timeline; the
+/// host owns the actual paint. Draining happens in `composite_video_surfaces`,
+/// which already runs once per host frame — so scheduling costs no new thread,
+/// timer or tick. On Android this queue does not exist at all:
+/// `AMediaCodec_releaseOutputBufferAtTime` hands the timestamp straight to the
+/// HW compositor.
+thread_local! {
+    static SCHEDULED: RefCell<Vec<(u64, TakenFrame)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Monotonic host clock in nanoseconds — the timeline `present(at-ns)` speaks.
+pub fn monotonic_now_ns() -> u64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
+/// Schedule `frame` for `at_ns`; presents immediately if already due.
+pub fn schedule_present(at_ns: u64, frame: TakenFrame) {
+    if at_ns <= monotonic_now_ns() {
+        frame.present_now();
+        return;
+    }
+    SCHEDULED.with(|s| {
+        let mut s = s.borrow_mut();
+        let at = s.partition_point(|(t, _)| *t <= at_ns);
+        s.insert(at, (at_ns, frame));
+    });
+}
+
+/// Paint every scheduled frame whose deadline has passed. Called once per host
+/// frame from `composite_video_surfaces`.
+///
+/// Frame-drop policy matches `present_due`: when several frames on the SAME
+/// surface are due, only the newest is painted — showing the older ones would
+/// be showing the past. That is player policy, which is why it lives here on
+/// the host adapter and not in the codec.
+fn drain_scheduled() {
+    let now = monotonic_now_ns();
+    let due: Vec<TakenFrame> = SCHEDULED.with(|s| {
+        let mut s = s.borrow_mut();
+        let n = s.partition_point(|(t, _)| *t <= now);
+        s.drain(..n).map(|(_, f)| f).collect()
+    });
+    let mut newest: std::collections::HashMap<Option<u32>, TakenFrame> = Default::default();
+    for f in due {
+        newest.insert(f.surface_id, f);
+    }
+    for (_, f) in newest {
+        f.present_now();
+    }
+}
+
 pub struct VideoDecoder {
     dec: Box<dyn wandr_video::Decoder>,
     decoded: u64,
@@ -522,6 +608,25 @@ impl VideoDecoder {
                 self.pending.insert(at, PendingFrame { pts_us, rgba, w, h });
             }
         }
+    }
+
+    /// Take the next decoded frame in DISPLAY order and hand ownership to the
+    /// caller (the `decoded-frame` resource). `pending` is already PTS-ordered,
+    /// so the front is the correct next frame even for B-frame streams.
+    ///
+    /// This is the guest-driven counterpart to `present_due`: there the HOST
+    /// decides what to show against a clock it is given; here the GUEST decides,
+    /// which is what a real player needs in order to slave video to the audio
+    /// master clock.
+    pub fn take_next_decoded(&mut self) -> Option<TakenFrame> {
+        let f = self.pending.pop_front()?;
+        Some(TakenFrame {
+            pts_us: f.pts_us,
+            rgba: f.rgba,
+            w: f.w,
+            h: f.h,
+            surface_id: self.surface_id,
+        })
     }
 
     /// Present whatever is due at `clock_us` and return its PTS.

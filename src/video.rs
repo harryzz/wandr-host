@@ -152,11 +152,34 @@ pub(crate) fn device_rotation_deg() -> u32 {
 #[cfg(target_os = "android")]
 pub use android::{ensure_binder_threadpool, VideoDecoder, VideoEncoder};
 
+// Playback scheduling (task 117 M2 stage 1). Android has no CPU-side queue —
+// `AMediaCodec_releaseOutputBufferAtTime` gives the timestamp to the HW
+// compositor — so these are stubs until that path is written. See the
+// `submit_for_playback` comment in `mod android`.
+#[cfg(target_os = "android")]
+pub struct TakenFrame(());
+#[cfg(target_os = "android")]
+impl TakenFrame {
+    pub fn timestamp_us(&self) -> i64 {
+        0
+    }
+    pub fn present_now(self) {}
+}
+#[cfg(target_os = "android")]
+pub fn monotonic_now_ns() -> u64 {
+    0
+}
+#[cfg(target_os = "android")]
+pub fn schedule_present(_at_ns: u64, _frame: TakenFrame) {}
+
 // Desktop (Linux/WSLg/Win/mac) backend: nokhwa camera + software VP8/VP9 via the
 // wandr-video crate (statically-linked libvpx; task 117 replaced ffmpeg).
 // The cross-platform peer of the android NDK/MediaCodec path below.
 #[cfg(not(target_os = "android"))]
-pub use crate::video_desktop::{ensure_binder_threadpool, VideoDecoder, VideoEncoder};
+pub use crate::video_desktop::{
+    ensure_binder_threadpool, monotonic_now_ns, schedule_present, TakenFrame, VideoDecoder,
+    VideoEncoder,
+};
 
 // ── NDK FFI (shared with video_probe.rs) ──────────────────────────────────
 #[cfg(target_os = "android")]
@@ -1124,6 +1147,41 @@ mod android {
 
         pub fn decoded_frames(&self) -> u64 {
             self.decoded
+        }
+
+        // ── PLAYBACK (task 117 M2 stage 1) — NOT YET IMPLEMENTED ON ANDROID ──
+        //
+        // Playback was built desktop-first, so these are honest stubs rather
+        // than silent no-ops: a guest that tries file playback on Android gets
+        // a clear `unsupported-codec` instead of a decoder that accepts frames
+        // and never shows anything (the silent-failure mode this project has
+        // been bitten by before).
+        //
+        // The Android implementation is NOT a port of the desktop one. Desktop
+        // holds decoded RGBA in a CPU queue because it must; Android should use
+        // `AMediaCodec_releaseOutputBufferAtTime(codec, idx, at_ns)`, which
+        // hands the presentation timestamp straight to the HW compositor —
+        // frames never reach the CPU. That maps 1:1 onto `present(at-ns)` and
+        // is precisely why the contract was shaped this way.
+
+        /// Push a frame carrying a real presentation timestamp.
+        pub fn submit_for_playback(&mut self, _data: &[u8], _pts_us: i64) -> Result<(), VideoError> {
+            Err(VideoError::UnsupportedCodec)
+        }
+
+        /// End of stream — drain what the codec held back for reordering.
+        pub fn finish_playback(&mut self) -> Result<(), VideoError> {
+            Err(VideoError::UnsupportedCodec)
+        }
+
+        /// Seek — drop queued input and held references.
+        pub fn seek_reset(&mut self) -> Result<(), VideoError> {
+            Err(VideoError::UnsupportedCodec)
+        }
+
+        /// Take the next decoded frame in display order.
+        pub fn take_next_decoded(&mut self) -> Option<super::TakenFrame> {
+            None
         }
 
         /// Move/resize the video surface (no-op in decode-to-buffer mode).

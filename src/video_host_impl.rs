@@ -30,6 +30,8 @@ fn codec2b(c: wit::types::Codec) -> Result<video::Codec, wit::types::VideoError>
         // Desktop software (openh264 / oxideav-h265) or Android MediaCodec HW.
         wit::types::Codec::H264 => Ok(video::Codec::H264),
         wit::types::Codec::H265 => Ok(video::Codec::H265),
+        // Playback-only (task 117 M2): dav1d on desktop, MediaCodec on Android.
+        wit::types::Codec::Av1 => Ok(video::Codec::Av1),
     }
 }
 
@@ -199,7 +201,85 @@ impl wit::decoder::HostVideoDecoder for HostState {
             .unwrap_or(0)
     }
 
+    // ── PLAYBACK (task 117 M2 stage 1) ───────────────────────────────────────
+
+    fn submit_timed(
+        &mut self,
+        self_: Resource<DecoderState>,
+        frame: wit::types::TimedFrame,
+    ) -> Result<(), wit::types::VideoError> {
+        let st = self
+            .table
+            .get_mut(&self_)
+            .map_err(|_| wit::types::VideoError::BadFrame)?;
+        st.0.submit_for_playback(&frame.data, frame.timestamp_us)
+            .map_err(err2w)
+    }
+
+    fn next_decoded(
+        &mut self,
+        self_: Resource<DecoderState>,
+    ) -> Option<Resource<DecodedFrameState>> {
+        let taken = self.table.get_mut(&self_).ok()?.0.take_next_decoded()?;
+        // If the table is full the frame is dropped rather than leaked — the
+        // guest simply sees `none` and retries.
+        self.table.push(DecodedFrameState(Some(taken))).ok()
+    }
+
+    fn flush(&mut self, self_: Resource<DecoderState>) -> Result<(), wit::types::VideoError> {
+        let st = self
+            .table
+            .get_mut(&self_)
+            .map_err(|_| wit::types::VideoError::BadFrame)?;
+        st.0.finish_playback().map_err(err2w)
+    }
+
+    fn reset(&mut self, self_: Resource<DecoderState>) -> Result<(), wit::types::VideoError> {
+        let st = self
+            .table
+            .get_mut(&self_)
+            .map_err(|_| wit::types::VideoError::BadFrame)?;
+        st.0.seek_reset().map_err(err2w)
+    }
+
     fn drop(&mut self, rep: Resource<DecoderState>) -> wasmtime::Result<()> {
+        self.table.delete(rep)?;
+        Ok(())
+    }
+}
+
+/// The `decoded-frame` resource: one decoded frame the guest holds while it
+/// decides when to show it. `Option` because `present`/`discard` consume the
+/// frame but WIT resource methods take `&self` — taking it out leaves the
+/// handle inert, and a later `drop` is then a no-op rather than a double-free.
+pub struct DecodedFrameState(Option<video::TakenFrame>);
+
+impl wit::decoder::HostDecodedFrame for HostState {
+    fn timestamp_us(&mut self, self_: Resource<DecodedFrameState>) -> i64 {
+        self.table
+            .get(&self_)
+            .ok()
+            .and_then(|s| s.0.as_ref().map(|f| f.timestamp_us()))
+            .unwrap_or(0)
+    }
+
+    fn present(&mut self, self_: Resource<DecodedFrameState>, at_ns: u64) {
+        if let Ok(st) = self.table.get_mut(&self_) {
+            if let Some(frame) = st.0.take() {
+                video::schedule_present(at_ns, frame);
+            }
+        }
+    }
+
+    fn discard(&mut self, self_: Resource<DecodedFrameState>) {
+        if let Ok(st) = self.table.get_mut(&self_) {
+            st.0 = None; // released without painting
+        }
+    }
+
+    /// Dropping without `present` or `discard` is equivalent to `discard` — the
+    /// buffer goes with the state, so a frame can never be leaked.
+    fn drop(&mut self, rep: Resource<DecodedFrameState>) -> wasmtime::Result<()> {
         self.table.delete(rep)?;
         Ok(())
     }
