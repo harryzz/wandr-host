@@ -3361,6 +3361,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d211803b9b6b570f68772237e415a029d5a50c65d382910b879fb19d3271f94d"
 
 [[package]]
+name = "oxideav-core"
+version = "0.1.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c35bccec0ce0967c6ba505aca16bad585ece6ef581c8f784924272093d887987"
+dependencies = [
+ "bytemuck",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "oxideav-h265"
+version = "0.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "220f1220c6181200c7a46a063c1c70dfeee8086757663c316bca36ba106f1635"
+dependencies = [
+ "oxideav-core",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4985,6 +5005,7 @@ dependencies = [
  "fast_image_resize",
  "log",
  "openh264",
+ "oxideav-h265",
  "wandr-vpx-sys",
  "yuv",
 ]

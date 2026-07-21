@@ -48,6 +48,7 @@ fn codec_of(c: Codec) -> wandr_video::Codec {
         Codec::Vp8 => wandr_video::Codec::Vp8,
         Codec::Vp9 => wandr_video::Codec::Vp9,
         Codec::H264 => wandr_video::Codec::H264,
+        Codec::H265 => wandr_video::Codec::H265,
     }
 }
 

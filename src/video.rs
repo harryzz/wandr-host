@@ -35,6 +35,10 @@ pub enum Codec {
     /// openh264; Android via MediaCodec HW (`OMX.qcom.video.decoder.avc`, present
     /// on the device — measured). Signal calls still negotiate VP8.
     H264,
+    /// Playback (task 117 M2). Desktop decodes it in software via oxideav-h265;
+    /// Android via MediaCodec HW (`OMX.qcom.video.decoder.hevc`, measured).
+    /// Decode-only — we never encode HEVC.
+    H265,
 }
 
 impl Codec {
@@ -43,6 +47,7 @@ impl Codec {
             Codec::Vp8 => "video/x-vnd.on2.vp8",
             Codec::Vp9 => "video/x-vnd.on2.vp9",
             Codec::H264 => "video/avc",
+            Codec::H265 => "video/hevc",
         }
     }
 }

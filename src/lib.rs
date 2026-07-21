@@ -1709,7 +1709,6 @@ pub fn font_probe() {
 pub fn video_decode_file(path: &str) -> anyhow::Result<()> {
     use crate::video::{Codec, DecoderConfig, VideoRect, ZLayer};
     use mp4::Mp4Reader;
-    use std::io::BufReader;
     use std::time::Instant;
 
     const START: [u8; 4] = [0, 0, 0, 1];
@@ -1735,25 +1734,54 @@ pub fn video_decode_file(path: &str) -> anyhow::Result<()> {
         out
     }
 
-    let f = std::fs::File::open(path)?;
-    let size = f.metadata()?.len();
-    let mut mp4 = Mp4Reader::read_header(BufReader::new(f), size)?;
-    let (tid, timescale, sps, pps, n) = {
+    // H.265 param sets are in hvcC (not exposed by the mp4 crate) — parse the raw
+    // box for the start-coded VPS/SPS/PPS blob. §8.3.3.
+    fn parse_hvcc(file: &[u8]) -> Option<Vec<u8>> {
+        let p = file.windows(4).position(|w| w == b"hvcC")?;
+        let pl = &file[p + 4..];
+        let num_arrays = *pl.get(22)? as usize;
+        let mut out = Vec::new();
+        let mut i = 23;
+        for _ in 0..num_arrays {
+            let num = u16::from_be_bytes([*pl.get(i + 1)?, *pl.get(i + 2)?]) as usize;
+            i += 3;
+            for _ in 0..num {
+                let l = u16::from_be_bytes([*pl.get(i)?, *pl.get(i + 1)?]) as usize;
+                i += 2;
+                out.extend_from_slice(&START);
+                out.extend_from_slice(pl.get(i..i + l)?);
+                i += l;
+            }
+        }
+        Some(out)
+    }
+
+    let file_bytes = std::fs::read(path)?;
+    let size = file_bytes.len() as u64;
+    let mut mp4 = Mp4Reader::read_header(std::io::Cursor::new(&file_bytes[..]), size)?;
+    let (tid, timescale, codec, sps, pps, n) = {
         let t = mp4
             .tracks()
             .values()
-            .find(|t| matches!(t.media_type(), Ok(mp4::MediaType::H264)))
-            .ok_or_else(|| anyhow::anyhow!("no H.264 track in {path}"))?;
+            .find(|t| matches!(t.media_type(), Ok(mp4::MediaType::H264 | mp4::MediaType::H265)))
+            .ok_or_else(|| anyhow::anyhow!("no H.264/H.265 track in {path}"))?;
+        let is264 = matches!(t.media_type(), Ok(mp4::MediaType::H264));
         (
             t.track_id(),
             t.timescale() as i64,
-            t.sequence_parameter_set().map_err(|e| anyhow::anyhow!("sps: {e}"))?.to_vec(),
-            t.picture_parameter_set().map_err(|e| anyhow::anyhow!("pps: {e}"))?.to_vec(),
+            if is264 { Codec::H264 } else { Codec::H265 },
+            if is264 { t.sequence_parameter_set().map_err(|e| anyhow::anyhow!("sps: {e}"))?.to_vec() } else { Vec::new() },
+            if is264 { t.picture_parameter_set().map_err(|e| anyhow::anyhow!("pps: {e}"))?.to_vec() } else { Vec::new() },
             t.sample_count(),
         )
     };
     let (vw, vh) = (mp4.tracks()[&tid].width() as u32, mp4.tracks()[&tid].height() as u32);
-    log::info!("decode-file: {path} — H.264 {vw}x{vh}, {n} samples");
+    let hevc_prefix = if codec == Codec::H265 {
+        parse_hvcc(&file_bytes).ok_or_else(|| anyhow::anyhow!("could not parse hvcC"))?
+    } else {
+        Vec::new()
+    };
+    log::info!("decode-file: {path} — {codec:?} {vw}x{vh}, {n} samples");
 
     // Read every sample up front (demux is not what we are timing), in file =
     // decode order, each with its true presentation time (DTS + ctts).
@@ -1763,13 +1791,20 @@ pub fn video_decode_file(path: &str) -> anyhow::Result<()> {
         let s = mp4.read_sample(tid, sid)?.ok_or_else(|| anyhow::anyhow!("sample {sid}"))?;
         any_b |= s.rendering_offset != 0;
         let pts_us = (s.start_time as i64 + s.rendering_offset as i64) * 1_000_000 / timescale;
-        units.push((annex_b(&s.bytes, &sps, &pps, s.is_sync), pts_us));
+        // H.264: SPS/PPS prepended at keyframes by annex_b. H.265: prepend the
+        // hvcC VPS/SPS/PPS blob at keyframes, then start-code-convert the NALs.
+        let mut au = Vec::new();
+        if s.is_sync && codec == Codec::H265 {
+            au.extend_from_slice(&hevc_prefix);
+        }
+        au.extend_from_slice(&annex_b(&s.bytes, &sps, &pps, s.is_sync && codec == Codec::H264));
+        units.push((au, pts_us));
     }
     log::info!("decode-file: has B-frames = {any_b}");
 
     let (sw, sh) = (vw.min(1280), vh.min(720));
     let mut dec = crate::video_desktop::VideoDecoder::open(&DecoderConfig {
-        codec: Codec::H264,
+        codec,
         width: vw,
         height: vh,
         rect: Some(VideoRect { x: 0, y: 0, w: sw as i32, h: sh as i32 }),
