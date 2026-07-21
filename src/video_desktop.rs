@@ -47,6 +47,7 @@ fn codec_of(c: Codec) -> wandr_video::Codec {
     match c {
         Codec::Vp8 => wandr_video::Codec::Vp8,
         Codec::Vp9 => wandr_video::Codec::Vp9,
+        Codec::H264 => wandr_video::Codec::H264,
     }
 }
 
@@ -508,7 +509,15 @@ impl VideoDecoder {
             let pts_us = f.timestamp_us;
             let mut rgba = Vec::new();
             if wandr_video::i420_to_rgba(&f, &mut rgba).is_ok() {
-                self.pending.push_back(PendingFrame { pts_us, rgba, w, h });
+                // Insert in PTS order — this makes `pending` a reorder buffer.
+                // Codecs with B-frames (H.264/H.265) emit in DECODE order, so
+                // frames arrive out of presentation order; `present_due` needs the
+                // front to be the smallest PTS. VP8/VP9 (no B-frames) always
+                // insert at the back, so this costs them nothing. The decode-ahead
+                // cushion the player keeps must exceed the stream's reorder depth,
+                // else a late earlier-PTS frame would arrive after its slot passed.
+                let at = self.pending.partition_point(|p| p.pts_us <= pts_us);
+                self.pending.insert(at, PendingFrame { pts_us, rgba, w, h });
             }
         }
     }

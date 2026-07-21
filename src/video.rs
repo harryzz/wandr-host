@@ -31,6 +31,10 @@ pub enum VideoError {
 pub enum Codec {
     Vp8,
     Vp9,
+    /// Playback/interop (task 117 M2). Desktop decodes it in software via
+    /// openh264; Android via MediaCodec HW (`OMX.qcom.video.decoder.avc`, present
+    /// on the device — measured). Signal calls still negotiate VP8.
+    H264,
 }
 
 impl Codec {
@@ -38,6 +42,7 @@ impl Codec {
         match self {
             Codec::Vp8 => "video/x-vnd.on2.vp8",
             Codec::Vp9 => "video/x-vnd.on2.vp9",
+            Codec::H264 => "video/avc",
         }
     }
 }

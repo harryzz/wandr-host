@@ -38,6 +38,27 @@ fn main() {
     }
     // Desktop `--video-selfview-test`: reproduce/measure the Signal self-view
     // freeze — a 60fps render loop pumping the blocking camera encoder.
+    // Desktop `--video-decode-file <path.mp4>`: task 117 M2 — play a real H.264
+    // MP4 through the host decoder (h264_mp4toannexb + openh264 + reorder buffer +
+    // paced present), reporting frames/drift/order.
+    #[cfg(not(target_os = "android"))]
+    if let Some(i) = args.iter().position(|a| a == "--video-decode-file") {
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("info"),
+        )
+        .try_init();
+        let path = args.get(i + 1).cloned().unwrap_or_default();
+        if path.is_empty() {
+            eprintln!("wandr-host --video-decode-file: requires <path.mp4>");
+            std::process::exit(2);
+        }
+        if let Err(e) = wasm_android_host::video_decode_file(&path) {
+            eprintln!("wandr-host --video-decode-file: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Desktop `--video-playback-test`: task 117 M2 step 1b — decode a synthetic
     // VP9 clip and present each frame at its PTS against an independent clock,
     // reporting measured drift. No camera, no file, no network.

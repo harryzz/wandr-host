@@ -27,10 +27,10 @@ fn codec2b(c: wit::types::Codec) -> Result<video::Codec, wit::types::VideoError>
     match c {
         wit::types::Codec::Vp8 => Ok(video::Codec::Vp8),
         wit::types::Codec::Vp9 => Ok(video::Codec::Vp9),
-        // No HW H264/H265 path wired (and Signal negotiates VP8/VP9).
-        wit::types::Codec::H264 | wit::types::Codec::H265 => {
-            Err(wit::types::VideoError::UnsupportedCodec)
-        }
+        // H.264: desktop software (openh264) or Android MediaCodec HW (task 117 M2).
+        wit::types::Codec::H264 => Ok(video::Codec::H264),
+        // H.265 has no software backend on desktop (HW-only); not wired yet.
+        wit::types::Codec::H265 => Err(wit::types::VideoError::UnsupportedCodec),
     }
 }
 

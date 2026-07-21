@@ -1697,6 +1697,144 @@ pub fn font_probe() {
     log::info!("font-probe DONE. Real metrics = count_families>0 AND unitsPerEm>0 AND glyphs>0.");
 }
 
+/// `--video-decode-file <path.mp4>` — task 117 M2 step 2. Plays a REAL H.264 MP4
+/// through the actual host `VideoDecoder`, exercising the whole file-playback path
+/// on real content: the `h264_mp4toannexb` conversion, openh264 decode, the
+/// reorder buffer (real files have B-frames → decode order != presentation order),
+/// and paced presentation. Reports frames decoded/presented, drift, and order.
+///
+/// The MP4 demux here is DIAGNOSTIC ONLY — in production the guest demuxes (see
+/// wasi-media-source/NOTES.md). This proves the host codec + reorder + present.
+#[cfg(not(target_os = "android"))]
+pub fn video_decode_file(path: &str) -> anyhow::Result<()> {
+    use crate::video::{Codec, DecoderConfig, VideoRect, ZLayer};
+    use mp4::Mp4Reader;
+    use std::io::BufReader;
+    use std::time::Instant;
+
+    const START: [u8; 4] = [0, 0, 0, 1];
+    fn annex_b(sample: &[u8], sps: &[u8], pps: &[u8], keyframe: bool) -> Vec<u8> {
+        let mut out = Vec::with_capacity(sample.len() + 64);
+        if keyframe {
+            out.extend_from_slice(&START);
+            out.extend_from_slice(sps);
+            out.extend_from_slice(&START);
+            out.extend_from_slice(pps);
+        }
+        let mut i = 0;
+        while i + 4 <= sample.len() {
+            let n = u32::from_be_bytes([sample[i], sample[i + 1], sample[i + 2], sample[i + 3]]) as usize;
+            i += 4;
+            if i + n > sample.len() {
+                break;
+            }
+            out.extend_from_slice(&START);
+            out.extend_from_slice(&sample[i..i + n]);
+            i += n;
+        }
+        out
+    }
+
+    let f = std::fs::File::open(path)?;
+    let size = f.metadata()?.len();
+    let mut mp4 = Mp4Reader::read_header(BufReader::new(f), size)?;
+    let (tid, timescale, sps, pps, n) = {
+        let t = mp4
+            .tracks()
+            .values()
+            .find(|t| matches!(t.media_type(), Ok(mp4::MediaType::H264)))
+            .ok_or_else(|| anyhow::anyhow!("no H.264 track in {path}"))?;
+        (
+            t.track_id(),
+            t.timescale() as i64,
+            t.sequence_parameter_set().map_err(|e| anyhow::anyhow!("sps: {e}"))?.to_vec(),
+            t.picture_parameter_set().map_err(|e| anyhow::anyhow!("pps: {e}"))?.to_vec(),
+            t.sample_count(),
+        )
+    };
+    let (vw, vh) = (mp4.tracks()[&tid].width() as u32, mp4.tracks()[&tid].height() as u32);
+    log::info!("decode-file: {path} — H.264 {vw}x{vh}, {n} samples");
+
+    // Read every sample up front (demux is not what we are timing), in file =
+    // decode order, each with its true presentation time (DTS + ctts).
+    let mut units: Vec<(Vec<u8>, i64)> = Vec::with_capacity(n as usize);
+    let mut any_b = false;
+    for sid in 1..=n {
+        let s = mp4.read_sample(tid, sid)?.ok_or_else(|| anyhow::anyhow!("sample {sid}"))?;
+        any_b |= s.rendering_offset != 0;
+        let pts_us = (s.start_time as i64 + s.rendering_offset as i64) * 1_000_000 / timescale;
+        units.push((annex_b(&s.bytes, &sps, &pps, s.is_sync), pts_us));
+    }
+    log::info!("decode-file: has B-frames = {any_b}");
+
+    let (sw, sh) = (vw.min(1280), vh.min(720));
+    let mut dec = crate::video_desktop::VideoDecoder::open(&DecoderConfig {
+        codec: Codec::H264,
+        width: vw,
+        height: vh,
+        rect: Some(VideoRect { x: 0, y: 0, w: sw as i32, h: sh as i32 }),
+        rotation: 0,
+        layer: ZLayer::AboveUi,
+    })
+    .map_err(|e| anyhow::anyhow!("decoder open: {e:?}"))?;
+
+    let mut r = crate::canvas_impl::SkiaRenderer::new_headless(sw, sh)?;
+    const CUSHION: usize = 6; // must exceed the stream's reorder depth
+    let (mut feed, mut presented, mut sum_drift, mut max_drift) = (0usize, 0u64, 0i64, 0i64);
+    let (mut last_pts, mut ordered) = (i64::MIN, true);
+
+    let start = Instant::now();
+    loop {
+        while dec.queued_frames() < CUSHION && feed < units.len() {
+            let (data, pts) = &units[feed];
+            dec.submit_for_playback(data, *pts).map_err(|e| anyhow::anyhow!("submit: {e:?}"))?;
+            feed += 1;
+        }
+        if feed >= units.len() {
+            dec.finish_playback().map_err(|e| anyhow::anyhow!("flush: {e:?}"))?;
+        }
+        let clock = start.elapsed().as_micros() as i64;
+        if let Some(pts) = dec.present_due(clock) {
+            let drift = clock - pts;
+            sum_drift += drift;
+            max_drift = max_drift.max(drift);
+            presented += 1;
+            if pts < last_pts {
+                ordered = false;
+            }
+            last_pts = pts;
+            r.canvas().clear(skia_safe::Color::from_argb(255, 20, 24, 40));
+            crate::video_desktop::composite_video_surfaces(r.canvas());
+        }
+        if dec.queued_frames() == 0 && feed >= units.len() {
+            break;
+        }
+        if start.elapsed().as_secs() > 60 {
+            anyhow::bail!("decode-file: timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_micros(1_000));
+    }
+
+    let avg = if presented > 0 { sum_drift / presented as i64 } else { 0 };
+    let ok = ordered && dec.decoded_frames() == n as u64;
+    log::warn!(
+        "decode-file RESULT: {n} samples → {} decoded, {presented} presented, {} dropped | \
+         B-frames {any_b} | presentation order {} | drift avg {avg} us / max {max_drift} us — {}",
+        dec.decoded_frames(),
+        dec.dropped_frames(),
+        if ordered { "OK" } else { "BROKEN" },
+        if ok { "ok" } else { "FAIL" },
+    );
+    if let Some(png) = r.snapshot_png() {
+        let _ = std::fs::write("/tmp/decode-file.png", &png);
+        log::info!("decode-file: wrote /tmp/decode-file.png");
+    }
+    if !ok {
+        anyhow::bail!("decode-file: playback did not hold (see RESULT)");
+    }
+    Ok(())
+}
+
 /// `--video-playback-test` — task 117 M2 step 1b. Drives the PLAYBACK path
 /// end-to-end on the desktop backend and reports measured A/V drift.
 ///
