@@ -154,7 +154,7 @@ nokhwa = { version = "0.10", features = ["input-native"] }
 # and decodes in hardware via MediaCodec and links no codec library, which is why
 # this sits in the same target table ffmpeg-next did.
 # Build the static lib first: scripts/build-libvpx.sh (sets VPX_LIB_DIR et al).
-wandr-video = { path = "crates/wandr-video", features = ["libvpx", "openh264", "oxideav-h265"] }
+wandr-video = { path = "crates/wandr-video", features = ["libvpx", "openh264", "libde265"] }
 # Pure-Rust MP4 demuxer — ONLY for the `--video-decode-file` diagnostic (task 117
 # M2), which plays a real .mp4 through the host decoder to prove H.264 + the
 # reorder buffer on real content. In production, demux is guest-side (see

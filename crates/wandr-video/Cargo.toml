@@ -19,6 +19,10 @@ openh264 = ["dep:openh264"]
 # decoder. Fills the H.265 gap task 117 flagged, without LGPL libde265. Android
 # decodes HEVC in MediaCodec HW, so this is desktop-only like the others.
 oxideav-h265 = ["dep:oxideav-h265"]
+# Real-time software H.265/HEVC via libde265 (LGPL-2.1). Built from source and
+# linked STATICALLY (no runtime .so). ~60 fps @720p single-thread vs oxideav's
+# ~4 fps. LGPL is task 117's third-choice tier — allowed for a real need.
+libde265 = ["dep:libde265"]
 
 [dependencies]
 # libvpx (BSD-3), built from vendor/libvpx and linked statically by wandr-vpx-sys.
@@ -31,6 +35,9 @@ openh264 = { version = "0.9", optional = true }
 # registry and its unfinished HW backends are not used. Pinned to the version the
 # spike verified (300/300 on a real HEVC MP4).
 oxideav-h265 = { version = "=0.0.9", optional = true }
+# `static` builds libde265 from source with cc and links it statically; drop the
+# default `system` feature so there is no runtime .so dependency.
+libde265 = { version = "0.2", default-features = false, features = ["static"], optional = true }
 # Pure-Rust SIMD colorspace + resize — the libswscale replacement. These are pure
 # Rust (no system library, cross-compiles anywhere), so they are NOT gated: the
 # shared types and conversion helpers stay available on every target.

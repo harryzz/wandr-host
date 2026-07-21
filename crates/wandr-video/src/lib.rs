@@ -307,6 +307,8 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(backends::openh264::OpenH264Backend));
     #[cfg(feature = "oxideav-h265")]
     r.register(Box::new(backends::oxideav_h265::OxideH265Backend));
+    #[cfg(feature = "libde265")]
+    r.register(Box::new(backends::libde265::Libde265Backend));
     // Future: HW backends register here at priority < 100, and oxideav slots in
     // as just another software (or HW-bridge) backend once it is ready.
     r

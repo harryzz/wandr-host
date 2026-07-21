@@ -13,3 +13,6 @@ pub mod openh264;
 
 #[cfg(feature = "oxideav-h265")]
 pub mod oxideav_h265;
+
+#[cfg(feature = "libde265")]
+pub mod libde265;

@@ -72,10 +72,10 @@ fn registry_routes_codecs_to_the_right_backend() {
         &DecoderParams { codec: Codec::H265, width: W, height: H },
         Preferences::default(),
     );
-    if cfg!(feature = "oxideav-h265") {
-        assert!(h265.is_ok(), "oxideav-h265 backend should decode H.265");
+    if cfg!(any(feature = "oxideav-h265", feature = "libde265")) {
+        assert!(h265.is_ok(), "an H.265 software backend should decode H.265");
     } else {
-        assert!(h265.is_err(), "no H.265 software backend without the feature");
+        assert!(h265.is_err(), "no H.265 software backend without a feature");
     }
 }
 
