@@ -27,7 +27,7 @@
 mod backends;
 pub mod convert;
 
-pub use convert::{i420_to_rgba, Rgb24Frame};
+pub use convert::{i420_to_rgba, i420_to_rgba_with, Rgb24Frame};
 
 // ── codec vocabulary ─────────────────────────────────────────────────────────
 // Only what a codec actually needs. The host's WIT-shaped types (VideoRect,
@@ -188,6 +188,58 @@ pub trait Decoder: Send {
     fn next_frame(&mut self) -> Option<Frame<'_>>;
 }
 
+/// How a frame's YUV samples map to RGB.
+///
+/// ‼️ NOT A DETAIL. Get this wrong and the picture is still sharp, still moving,
+/// still passes every frame counter and pixel-variance check — just subtly wrong
+/// in colour. It is exactly the class of bug this path keeps producing, so it is
+/// carried explicitly rather than assumed anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorInfo {
+    pub matrix: ColorMatrix,
+    /// `false` = studio/limited (16-235), `true` = full (0-255).
+    pub full_range: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMatrix {
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
+impl ColorInfo {
+    /// What to assume when the stream does not signal — and most do not
+    /// (H.264 `colour_primaries` defaults to 2 = *unspecified*).
+    ///
+    /// The resolution rule is what ffmpeg, mpv and every player use: SD is
+    /// BT.601, HD is BT.709. It is a HEURISTIC and can be wrong, so callers
+    /// should say when they fall back to it rather than let a guess look like a
+    /// fact.
+    pub fn for_resolution(width: u32, height: u32) -> Self {
+        let _ = width;
+        ColorInfo {
+            matrix: if height >= 720 { ColorMatrix::Bt709 } else { ColorMatrix::Bt601 },
+            full_range: false,
+        }
+    }
+
+    /// From H.264 VUI `matrix_coefficients` (ITU-T H.273 / Table E-5) plus the
+    /// range flag. `None` for values that do not name a matrix we can apply —
+    /// 0 (identity/RGB), 2 (unspecified) and anything unrecognised — so the
+    /// caller falls back explicitly instead of silently picking one.
+    pub fn from_h264_vui(matrix_coefficients: u8, full_range: bool) -> Option<Self> {
+        let matrix = match matrix_coefficients {
+            1 => ColorMatrix::Bt709,
+            // 4 = FCC, 5 = BT.470BG, 6 = SMPTE 170M. All are the BT.601 matrix.
+            4 | 5 | 6 => ColorMatrix::Bt601,
+            9 | 10 => ColorMatrix::Bt2020,
+            _ => return None,
+        };
+        Some(ColorInfo { matrix, full_range })
+    }
+}
+
 /// One decoded picture, OPAQUE over where its pixels live.
 ///
 /// That opacity is the whole point. A backend answers "here is a picture", not
@@ -202,7 +254,10 @@ pub trait Decoder: Send {
 /// `decoded-frame` is opaque in the WIT: adding a variant later (VideoToolbox
 /// `CVPixelBuffer`, MediaCodec buffer indices, V4L2 MMAP) touches the accessors
 /// and nothing else, instead of every `match` in the tree.
-pub struct Frame<'a>(FrameInner<'a>);
+pub struct Frame<'a> {
+    inner: FrameInner<'a>,
+    color: ColorInfo,
+}
 
 enum FrameInner<'a> {
     /// Pixels on the CPU — borrowed from the codec's own memory (libvpx) or from
@@ -222,29 +277,42 @@ pub enum FrameLocation {
 }
 
 impl<'a> Frame<'a> {
+    /// Colour defaults to the resolution heuristic. A backend that KNOWS (because
+    /// it parsed the stream's VUI) calls `with_color`.
     pub fn cpu(r: I420Ref<'a>) -> Self {
-        Frame(FrameInner::Cpu(r))
+        let color = ColorInfo::for_resolution(r.width, r.height);
+        Frame { inner: FrameInner::Cpu(r), color }
     }
     pub fn gpu(g: GpuFrame) -> Self {
-        Frame(FrameInner::Gpu(g))
+        let color = g.color;
+        Frame { inner: FrameInner::Gpu(g), color }
+    }
+    pub fn with_color(mut self, color: ColorInfo) -> Self {
+        self.color = color;
+        self
+    }
+    /// How to convert this frame's YUV to RGB — used by both the CPU converter
+    /// and the GPU sampler, so the two lanes cannot disagree.
+    pub fn color(&self) -> ColorInfo {
+        self.color
     }
 
     pub fn timestamp_us(&self) -> i64 {
-        match &self.0 {
+        match &self.inner {
             FrameInner::Cpu(r) => r.timestamp_us,
             FrameInner::Gpu(g) => g.timestamp_us,
         }
     }
 
     pub fn dimensions(&self) -> (u32, u32) {
-        match &self.0 {
+        match &self.inner {
             FrameInner::Cpu(r) => (r.width, r.height),
             FrameInner::Gpu(g) => (g.width, g.height),
         }
     }
 
     pub fn location(&self) -> FrameLocation {
-        match &self.0 {
+        match &self.inner {
             FrameInner::Cpu(_) => FrameLocation::Cpu,
             FrameInner::Gpu(_) => FrameLocation::Gpu,
         }
@@ -253,7 +321,7 @@ impl<'a> Frame<'a> {
     /// CPU view WITHOUT materialising anything — `None` for a GPU frame. A
     /// caller that gets `None` and genuinely needs bytes calls `read_i420`.
     pub fn as_i420(&self) -> Option<&I420Ref<'a>> {
-        match &self.0 {
+        match &self.inner {
             FrameInner::Cpu(r) => Some(r),
             FrameInner::Gpu(_) => None,
         }
@@ -262,9 +330,9 @@ impl<'a> Frame<'a> {
     /// Take the GPU handle. Returns the frame back UNTOUCHED as `Err` when it
     /// was a CPU frame — no panic, no unwrap, and the caller can still read it.
     pub fn into_gpu(self) -> Result<GpuFrame, Frame<'a>> {
-        match self.0 {
+        match self.inner {
             FrameInner::Gpu(g) => Ok(g),
-            cpu @ FrameInner::Cpu(_) => Err(Frame(cpu)),
+            cpu @ FrameInner::Cpu(_) => Err(Frame { inner: cpu, color: self.color }),
         }
     }
 
@@ -275,7 +343,7 @@ impl<'a> Frame<'a> {
         let (w, h) = self.dimensions();
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let (y_len, c_len) = ((w * h) as usize, (cw * ch) as usize);
-        match &self.0 {
+        match &self.inner {
             FrameInner::Cpu(r) => {
                 scratch.clear();
                 scratch.reserve(y_len + 2 * c_len);
@@ -327,11 +395,17 @@ pub struct GpuFrame {
     /// cannot pass this on MUST refuse rather than guess.
     pub modifier: u64,
     pub planes: Vec<DmabufPlane>,
+    /// How the sampler must convert these samples. Travels WITH the frame so the
+    /// compositor never has to guess, and so the zero-copy and readback lanes
+    /// convert identically — otherwise WANDR_VIDEO_ZEROCOPY=0 stops being a
+    /// valid A/B.
+    pub color: ColorInfo,
     /// Keeps the underlying surface alive AND knows how to read it back.
     owner: Box<dyn GpuFrameOwner>,
 }
 
 impl GpuFrame {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         width: u32,
         height: u32,
@@ -339,9 +413,10 @@ impl GpuFrame {
         fourcc: u32,
         modifier: u64,
         planes: Vec<DmabufPlane>,
+        color: ColorInfo,
         owner: Box<dyn GpuFrameOwner>,
     ) -> Self {
-        Self { width, height, timestamp_us, fourcc, modifier, planes, owner }
+        Self { width, height, timestamp_us, fourcc, modifier, planes, color, owner }
     }
 }
 

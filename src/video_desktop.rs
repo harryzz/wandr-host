@@ -112,7 +112,7 @@ fn image_for(
             let data = skia_safe::Data::new_copy(rgba);
             skia_safe::images::raster_from_data(&info, data, (w * 4) as usize)
         }
-        SurfaceContent::Texture(tref) => {
+        SurfaceContent::Texture(tref, color) => {
             let mut ctx = canvas.direct_context()?;
             let (y_tex, uv_tex) =
                 TEXTURES.with(|m| m.borrow().get(&tref.0).map(|t| (t.y_tex, t.uv_tex)))?;
@@ -148,17 +148,26 @@ fn image_for(
                 })
                 .collect();
 
-            // ‼️ BT.601 LIMITED is the H.264 SD/HD default and what these VLD
-            // decoders emit; it also matches `convert.rs`, so the two lanes agree.
-            // The RIGHT source is the stream's VUI (colour_primaries /
-            // matrix_coefficients / video_full_range_flag) — carrying that through
-            // is a follow-up, and until then this is a documented assumption
-            // rather than a silent one.
+            // The frame's OWN colour, read from the stream's SPS VUI where it is
+            // signalled and from the resolution heuristic where it is not. The
+            // readback lane converts with the same value, so the two lanes agree
+            // and WANDR_VIDEO_ZEROCOPY=0 stays a valid A/B.
+            let cs = match (color.matrix, color.full_range) {
+                (wandr_video::ColorMatrix::Bt709, false) => skia_safe::YUVColorSpace::Rec709_Limited,
+                (wandr_video::ColorMatrix::Bt709, true) => skia_safe::YUVColorSpace::Rec709_Full,
+                (wandr_video::ColorMatrix::Bt601, false) => skia_safe::YUVColorSpace::Rec601_Limited,
+                // Skia spells BT.601 full range "JPEG".
+                (wandr_video::ColorMatrix::Bt601, true) => skia_safe::YUVColorSpace::JPEG,
+                (wandr_video::ColorMatrix::Bt2020, false) => {
+                    skia_safe::YUVColorSpace::BT2020_8bit_Limited
+                }
+                (wandr_video::ColorMatrix::Bt2020, true) => skia_safe::YUVColorSpace::BT2020_8bit_Full,
+            };
             let yuva = skia_safe::YUVAInfo::new(
                 (w as i32, h as i32),
                 skia_safe::yuva_info::PlaneConfig::Y_UV,
                 skia_safe::yuva_info::Subsampling::S420,
-                skia_safe::YUVColorSpace::Rec601_Limited,
+                cs,
                 None,
                 None,
             )?;
@@ -515,7 +524,7 @@ pub(crate) enum SurfaceContent {
     /// whatever thread dropped the frame — undefined behaviour, intermittently.
     /// Carrying a `u64` keeps every GL object strictly thread-local; the worst a
     /// wrong-thread drop can now do is leak, loudly.
-    Texture(TextureRef),
+    Texture(TextureRef, wandr_video::ColorInfo),
     Rgba(Vec<u8>),
 }
 
@@ -564,7 +573,7 @@ impl Drop for TextureRef {
 impl SurfaceContent {
     fn is_empty(&self) -> bool {
         match self {
-            SurfaceContent::Texture(_) => false,
+            SurfaceContent::Texture(..) => false,
             SurfaceContent::Rgba(v) => v.is_empty(),
         }
     }
@@ -906,6 +915,7 @@ impl VideoDecoder {
             self.decoded += 1;
             let (w, h) = f.dimensions();
             let pts_us = f.timestamp_us();
+            let color = f.color();
             let mut scratch = std::mem::take(&mut self.gpu_scratch);
             let content = match f.into_gpu() {
                 // ZERO-COPY: the decoded frame is still in GPU memory. Import it
@@ -913,7 +923,7 @@ impl VideoDecoder {
                 // here rather than at composite time so a failure falls back to
                 // the readback while we still hold the frame.
                 Ok(gpu) => match crate::video_gl::import_nv12(gpu) {
-                    Ok(t) => Some(SurfaceContent::Texture(TextureRef::insert(t))),
+                    Ok(t) => Some(SurfaceContent::Texture(TextureRef::insert(t), color)),
                     // Import unavailable or refused — no GL context (every
                     // headless diagnostic), no extension, or a modifier we cannot
                     // describe. The frame comes BACK, so read it out the same way
@@ -924,7 +934,9 @@ impl VideoDecoder {
                         let mut rgba = Vec::new();
                         let ok = f
                             .read_i420(&mut scratch)
-                            .map(|i420| wandr_video::i420_to_rgba(&i420, &mut rgba).is_ok())
+                            .map(|i420| {
+                                wandr_video::i420_to_rgba_with(&i420, color, &mut rgba).is_ok()
+                            })
                             .unwrap_or(false);
                         ok.then_some(SurfaceContent::Rgba(rgba))
                     }
@@ -932,10 +944,12 @@ impl VideoDecoder {
                 Err(cpu) => {
                     let mut rgba = Vec::new();
                     let ok = match cpu.as_i420() {
-                        Some(i420) => wandr_video::i420_to_rgba(i420, &mut rgba).is_ok(),
+                        Some(i420) => wandr_video::i420_to_rgba_with(i420, color, &mut rgba).is_ok(),
                         None => cpu
                             .read_i420(&mut scratch)
-                            .map(|i420| wandr_video::i420_to_rgba(&i420, &mut rgba).is_ok())
+                            .map(|i420| {
+                                wandr_video::i420_to_rgba_with(&i420, color, &mut rgba).is_ok()
+                            })
                             .unwrap_or(false),
                     };
                     ok.then_some(SurfaceContent::Rgba(rgba))

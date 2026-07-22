@@ -398,6 +398,7 @@ impl crate::GpuFrameOwner for VaSurfaceOwner {
 fn gpu_frame_from_prime(
     mut desc: libva::DrmPrimeSurfaceDescriptor,
     decoded: Decoded,
+    color: crate::ColorInfo,
 ) -> Option<crate::GpuFrame> {
     // Copy the scalars out before touching `objects` — `layers` borrows `desc`.
     let (drm_format, num_planes, offsets, pitches) = {
@@ -431,6 +432,7 @@ fn gpu_frame_from_prime(
         drm_format,
         modifier,
         planes,
+        color,
         Box::new(VaSurfaceOwner { decoded }),
     ))
 }
@@ -451,6 +453,15 @@ pub struct VaapiDecoder {
     /// The CPU frame the most recent `next_frame` materialised, if it had to.
     /// Kept alive so its borrow stays valid until the following `next_frame`.
     current: Option<DecodedI420>,
+    /// The stream's signalled colour, from the SPS VUI. `None` until an SPS is
+    /// seen (or when it signals nothing usable), in which case the resolution
+    /// heuristic applies — see `ColorInfo::for_resolution`.
+    color: Option<crate::ColorInfo>,
+    /// cros-codecs' own H.264 parser, used ONLY to read the VUI. The decoder
+    /// parses the SPS internally too but does not expose it, and hand-rolling an
+    /// SPS reader (exp-golomb, scaling lists, HRD) to recover three fields would
+    /// be a needless second implementation to get wrong.
+    parser: cros_codecs::codec::h264::parser::Parser,
     /// Whether to export DMA-bufs (zero-copy) or read back. Latched per stream
     /// from the FIRST export attempt: capability bits lie in both directions on
     /// these drivers, so the only trustworthy probe is doing it once for real.
@@ -481,6 +492,8 @@ impl VaapiDecoder {
             out: VecDeque::new(),
             current: None,
             export: ExportState::Untried,
+            color: None,
+            parser: Default::default(),
         })
     }
 
@@ -568,6 +581,41 @@ impl Decoder for VaapiDecoder {
         // bytes it took, so a caller handing us a whole access unit (SPS+PPS+
         // slices) needs splitting and looping. `NalIterator` does the Annex-B
         // split; a caller passing a single NAL just gets a one-element iterator.
+        // Read the stream's own colour signalling once, from the SPS. Assuming a
+        // matrix instead is the difference between a correct picture and one that
+        // is subtly, silently wrong — no counter downstream can detect it. Costs a
+        // scan only until an SPS is seen, then never again.
+        if self.color.is_none() {
+            let mut cursor = std::io::Cursor::new(chunk.data);
+            while let Ok(nalu) = H264Nalu::next(&mut cursor) {
+                if !matches!(nalu.header.type_, cros_codecs::codec::h264::parser::NaluType::Sps) {
+                    continue;
+                }
+                if let Ok(sps) = self.parser.parse_sps(&nalu) {
+                    let vui = &sps.vui_parameters;
+                    let signalled =
+                        sps.vui_parameters_present_flag && vui.colour_description_present_flag;
+                    self.color = signalled
+                        .then(|| {
+                            crate::ColorInfo::from_h264_vui(
+                                vui.matrix_coefficients,
+                                vui.video_full_range_flag,
+                            )
+                        })
+                        .flatten();
+                    match self.color {
+                        Some(c) => log::info!("wandr-video: vaapi: stream signals {c:?}"),
+                        None => log::info!(
+                            "wandr-video: vaapi: no usable colour signalled (VUI present={}) \
+                             — using the resolution heuristic",
+                            sps.vui_parameters_present_flag
+                        ),
+                    }
+                }
+                break;
+            }
+        }
+
         let ts = chunk.timestamp_us as u64;
         for nal in NalIterator::<H264Nalu>::new(chunk.data) {
             let bitstream = nal.as_ref();
@@ -659,7 +707,10 @@ impl Decoder for VaapiDecoder {
                         self.export = ExportState::Exports;
                     }
                     drop(inner);
-                    if let Some(g) = gpu_frame_from_prime(desc, d) {
+                    let color = self
+                        .color
+                        .unwrap_or_else(|| crate::ColorInfo::for_resolution(d.w, d.h));
+                    if let Some(g) = gpu_frame_from_prime(desc, d, color) {
                         return Some(Frame::gpu(g));
                     }
                     // Export succeeded but its shape is not one we can describe
@@ -696,6 +747,7 @@ impl Decoder for VaapiDecoder {
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let y_len = (w * h) as usize;
         let c_len = (cw * ch) as usize;
+        let color = self.color.unwrap_or_else(|| crate::ColorInfo::for_resolution(w, h));
         Some(Frame::cpu(I420Ref {
             y: &f.buf[..y_len],
             y_stride: w,
