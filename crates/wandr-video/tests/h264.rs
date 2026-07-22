@@ -100,17 +100,17 @@ fn h264_roundtrip_preserves_image_and_pts() {
         while let Some(pkt) = enc.next_packet() {
             dec.decode(Chunk::new(&pkt.data, pts_us(i))).ok(); // SPS/PPS may yield nothing
             while let Some(f) = dec.next_frame() {
-                assert_eq!((f.width, f.height), (W, H));
-                got_pts.push(f.timestamp_us);
+                assert_eq!(f.dimensions(), (W, H));
+                got_pts.push(f.timestamp_us());
                 let mut rgba = Vec::new();
-                wandr_video::i420_to_rgba(&f, &mut rgba).expect("i420->rgba");
+                wandr_video::i420_to_rgba(f.as_i420().expect("software backend must return a CPU frame"), &mut rgba).expect("i420->rgba");
                 last_rgba = Some(rgba);
             }
         }
     }
     dec.flush().expect("flush");
     while let Some(f) = dec.next_frame() {
-        got_pts.push(f.timestamp_us);
+        got_pts.push(f.timestamp_us());
     }
 
     assert!(got_pts.len() >= 8, "too few frames decoded: {}", got_pts.len());

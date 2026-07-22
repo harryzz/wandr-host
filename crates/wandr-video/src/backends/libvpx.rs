@@ -26,6 +26,7 @@ use crate::convert::{chroma_dims, rgb24_into_i420, Rgb24Frame};
 use crate::{
     Chunk, Codec, CodecError, Decoder, DecoderParams, Encoder, EncoderParams, I420Ref, Packet,
 };
+use crate::Frame;
 
 /// Speed/quality knob. 8 is the WebRTC realtime range for both VP8 and VP9.
 const CPU_USED: i32 = 8;
@@ -426,7 +427,7 @@ impl Decoder for LibvpxDecoder {
         Ok(())
     }
 
-    fn next_frame(&mut self) -> Option<I420Ref<'_>> {
+    fn next_frame(&mut self) -> Option<Frame<'_>> {
         unsafe {
             let img = vpx::vpx_codec_get_frame(&mut self.ctx, &mut self.iter);
             if img.is_null() {
@@ -443,7 +444,7 @@ impl Decoder for LibvpxDecoder {
             let (w, h) = (img.d_w, img.d_h);
             let (_, ch) = chroma_dims(w, h);
             let (ys, us, vs) = (img.stride[0] as u32, img.stride[1] as u32, img.stride[2] as u32);
-            Some(I420Ref {
+            Some(Frame::cpu(I420Ref {
                 y: std::slice::from_raw_parts(img.planes[0], ys as usize * h as usize),
                 y_stride: ys,
                 u: std::slice::from_raw_parts(img.planes[1], us as usize * ch as usize),
@@ -454,7 +455,7 @@ impl Decoder for LibvpxDecoder {
                 height: h,
                 // The PTS handed to vpx_codec_decode, back out unchanged.
                 timestamp_us: img.user_priv as usize as i64,
-            })
+            }))
         }
     }
 }

@@ -541,6 +541,8 @@ pub struct VideoDecoder {
     surface_id: Option<u32>,
     /// Reused RGBA staging, so steady-state decode-to-surface doesn't allocate.
     rgba: Vec<u8>,
+    /// Reused I420 staging for materialising a GPU frame on the readback path.
+    gpu_scratch: Vec<u8>,
     /// PLAYBACK mode (task 117 M2): frames decoded ahead, each held until the
     /// caller's media clock reaches its PTS. Empty on the call path, which
     /// presents immediately because the network is the pacer.
@@ -635,7 +637,7 @@ impl VideoDecoder {
                 rect.w, rect.h, rect.x, rect.y, config.rotation);
             alloc_surface(rect, false, config.rotation)
         });
-        Ok(Self { dec, decoded: 0, surface_id, rgba: Vec::new(),
+        Ok(Self { dec, decoded: 0, surface_id, rgba: Vec::new(), gpu_scratch: Vec::new(),
                   pending: VecDeque::new(), dropped: 0,
                   in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                   in_flight_cap: 0, backend })
@@ -654,10 +656,24 @@ impl VideoDecoder {
         while let Some(frame) = self.dec.next_frame() {
             self.decoded += 1;
             let Some(id) = self.surface_id else { continue };
-            let (w, h) = (frame.width, frame.height);
+            let (w, h) = frame.dimensions();
             // Only convert in decode-to-surface mode — decode-to-buffer must not
             // pay for a colorspace conversion it throws away.
-            if wandr_video::i420_to_rgba(&frame, &mut self.rgba).is_ok() {
+            //
+            // The CALL path presents immediately, so a GPU frame is materialised
+            // here rather than kept: the network is the pacer and nothing holds
+            // frames. Zero-copy pays off in the PLAYBACK path, where frames are
+            // queued (see `queue_decoded`).
+            let mut scratch = std::mem::take(&mut self.gpu_scratch);
+            let ok = match frame.as_i420() {
+                Some(i420) => wandr_video::i420_to_rgba(i420, &mut self.rgba).is_ok(),
+                None => frame
+                    .read_i420(&mut scratch)
+                    .map(|i420| wandr_video::i420_to_rgba(&i420, &mut self.rgba).is_ok())
+                    .unwrap_or(false),
+            };
+            self.gpu_scratch = scratch;
+            if ok {
                 surface_set_frame(id, self.rgba.clone(), w, h);
             }
         }
@@ -720,10 +736,22 @@ impl VideoDecoder {
     fn queue_decoded(&mut self) {
         while let Some(f) = self.dec.next_frame() {
             self.decoded += 1;
-            let (w, h) = (f.width, f.height);
-            let pts_us = f.timestamp_us;
+            let (w, h) = f.dimensions();
+            let pts_us = f.timestamp_us();
             let mut rgba = Vec::new();
-            if wandr_video::i420_to_rgba(&f, &mut rgba).is_ok() {
+            let mut scratch = std::mem::take(&mut self.gpu_scratch);
+            let converted = match f.as_i420() {
+                Some(i420) => wandr_video::i420_to_rgba(i420, &mut rgba).is_ok(),
+                // GPU frame: materialise for now. Step 3 replaces this branch
+                // with an EGL/GL import so the pixels never reach the CPU — the
+                // readback here is what makes step 2 behaviour-neutral.
+                None => f
+                    .read_i420(&mut scratch)
+                    .map(|i420| wandr_video::i420_to_rgba(&i420, &mut rgba).is_ok())
+                    .unwrap_or(false),
+            };
+            self.gpu_scratch = scratch;
+            if converted {
                 // Insert in PTS order — this makes `pending` a reorder buffer.
                 // Codecs with B-frames (H.264/H.265) emit in DECODE order, so
                 // frames arrive out of presentation order; `present_due` needs the

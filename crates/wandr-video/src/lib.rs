@@ -185,7 +185,181 @@ pub trait Decoder: Send {
     /// valid until the next `decode` call — a raw pointer would leave that to a
     /// comment. Returns I420 rather than RGBA so decode-to-buffer mode (frame
     /// counting) never pays for a colorspace conversion it throws away.
-    fn next_frame(&mut self) -> Option<I420Ref<'_>>;
+    fn next_frame(&mut self) -> Option<Frame<'_>>;
+}
+
+/// One decoded picture, OPAQUE over where its pixels live.
+///
+/// That opacity is the whole point. A backend answers "here is a picture", not
+/// "here is a CPU buffer" — so a hardware decoder can hand back a frame that is
+/// still in GPU memory and a software decoder can hand back one that never left
+/// the CPU, through the same exit. Before this existed the only exit was
+/// `I420Ref`, which forced every VA-API frame through a readback: pixels went
+/// GPU -> CPU -> GPU, five copies and ~415 MB/s at 720p30, and the hardware
+/// decode saved less CPU than the plumbing burned.
+///
+/// It is an enum INSIDE an opaque type, not a public enum, for the same reason
+/// `decoded-frame` is opaque in the WIT: adding a variant later (VideoToolbox
+/// `CVPixelBuffer`, MediaCodec buffer indices, V4L2 MMAP) touches the accessors
+/// and nothing else, instead of every `match` in the tree.
+pub struct Frame<'a>(FrameInner<'a>);
+
+enum FrameInner<'a> {
+    /// Pixels on the CPU — borrowed from the codec's own memory (libvpx) or from
+    /// the backend's staging slot (openh264, dav1d, libde265, oxideav).
+    Cpu(I420Ref<'a>),
+    /// Pixels still in GPU memory, exported as a DMA-buf. Self-owning, which is
+    /// why `into_gpu` can move it out of the decoder's borrow.
+    Gpu(GpuFrame),
+}
+
+/// Where a `Frame`'s pixels are. Diagnostics and policy only — a caller decides
+/// what to DO via `as_i420` / `into_gpu`, not by branching on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameLocation {
+    Cpu,
+    Gpu,
+}
+
+impl<'a> Frame<'a> {
+    pub fn cpu(r: I420Ref<'a>) -> Self {
+        Frame(FrameInner::Cpu(r))
+    }
+    pub fn gpu(g: GpuFrame) -> Self {
+        Frame(FrameInner::Gpu(g))
+    }
+
+    pub fn timestamp_us(&self) -> i64 {
+        match &self.0 {
+            FrameInner::Cpu(r) => r.timestamp_us,
+            FrameInner::Gpu(g) => g.timestamp_us,
+        }
+    }
+
+    pub fn dimensions(&self) -> (u32, u32) {
+        match &self.0 {
+            FrameInner::Cpu(r) => (r.width, r.height),
+            FrameInner::Gpu(g) => (g.width, g.height),
+        }
+    }
+
+    pub fn location(&self) -> FrameLocation {
+        match &self.0 {
+            FrameInner::Cpu(_) => FrameLocation::Cpu,
+            FrameInner::Gpu(_) => FrameLocation::Gpu,
+        }
+    }
+
+    /// CPU view WITHOUT materialising anything — `None` for a GPU frame. A
+    /// caller that gets `None` and genuinely needs bytes calls `read_i420`.
+    pub fn as_i420(&self) -> Option<&I420Ref<'a>> {
+        match &self.0 {
+            FrameInner::Cpu(r) => Some(r),
+            FrameInner::Gpu(_) => None,
+        }
+    }
+
+    /// Take the GPU handle. Returns the frame back UNTOUCHED as `Err` when it
+    /// was a CPU frame — no panic, no unwrap, and the caller can still read it.
+    pub fn into_gpu(self) -> Result<GpuFrame, Frame<'a>> {
+        match self.0 {
+            FrameInner::Gpu(g) => Ok(g),
+            cpu @ FrameInner::Cpu(_) => Err(Frame(cpu)),
+        }
+    }
+
+    /// Materialise tightly-packed I420 into a caller-owned buffer: a copy for a
+    /// CPU frame, the backend's own readback for a GPU one. The caller owns
+    /// `scratch` so steady state does not allocate.
+    pub fn read_i420<'s>(&self, scratch: &'s mut Vec<u8>) -> Result<I420Ref<'s>, CodecError> {
+        let (w, h) = self.dimensions();
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let (y_len, c_len) = ((w * h) as usize, (cw * ch) as usize);
+        match &self.0 {
+            FrameInner::Cpu(r) => {
+                scratch.clear();
+                scratch.reserve(y_len + 2 * c_len);
+                for row in 0..h as usize {
+                    let o = row * r.y_stride as usize;
+                    scratch.extend_from_slice(r.y.get(o..o + w as usize).ok_or(CodecError::BadFrame)?);
+                }
+                for (plane, stride) in [(r.u, r.u_stride), (r.v, r.v_stride)] {
+                    for row in 0..ch as usize {
+                        let o = row * stride as usize;
+                        scratch
+                            .extend_from_slice(plane.get(o..o + cw as usize).ok_or(CodecError::BadFrame)?);
+                    }
+                }
+            }
+            FrameInner::Gpu(g) => g.owner.read_i420(scratch)?,
+        }
+        if scratch.len() < y_len + 2 * c_len {
+            return Err(CodecError::BadFrame);
+        }
+        Ok(I420Ref {
+            y: &scratch[..y_len],
+            y_stride: w,
+            u: &scratch[y_len..y_len + c_len],
+            u_stride: cw,
+            v: &scratch[y_len + c_len..y_len + 2 * c_len],
+            v_stride: cw,
+            width: w,
+            height: h,
+            timestamp_us: self.timestamp_us(),
+        })
+    }
+}
+
+/// A decoded picture living in GPU memory, exported as a DMA-buf.
+///
+/// The currency is a DMA-BUF and deliberately not a GL texture or an `SkImage`:
+/// this crate's header excludes skia and compositing on purpose, and a dma-buf
+/// is also what a future Wayland/DRM SCANOUT path wants — a texture would
+/// already have committed us to sampling.
+pub struct GpuFrame {
+    pub width: u32,
+    pub height: u32,
+    pub timestamp_us: i64,
+    /// DRM fourcc — `NV12` for every VLD decoder here.
+    pub fourcc: u32,
+    /// DRM format modifier. ‼️ Load-bearing: Intel decode output is TILED, and a
+    /// tiled buffer imported as linear renders silent garbage. An importer that
+    /// cannot pass this on MUST refuse rather than guess.
+    pub modifier: u64,
+    pub planes: Vec<DmabufPlane>,
+    /// Keeps the underlying surface alive AND knows how to read it back.
+    owner: Box<dyn GpuFrameOwner>,
+}
+
+impl GpuFrame {
+    pub fn new(
+        width: u32,
+        height: u32,
+        timestamp_us: i64,
+        fourcc: u32,
+        modifier: u64,
+        planes: Vec<DmabufPlane>,
+        owner: Box<dyn GpuFrameOwner>,
+    ) -> Self {
+        Self { width, height, timestamp_us, fourcc, modifier, planes, owner }
+    }
+}
+
+pub struct DmabufPlane {
+    pub fd: std::os::fd::OwnedFd,
+    pub offset: u32,
+    pub pitch: u32,
+}
+
+/// Backend-supplied CPU materialisation for a GPU frame.
+///
+/// ‼️ Kept in the BACKEND, not in a generic "mmap the dma-buf" helper, because
+/// the right way to read one is API-specific and getting it wrong is expensive
+/// rather than broken. For VA-API this must stay `vaGetImage`: `vaDeriveImage`
+/// hands back tiled memory and measured 16.6 s vs 1.15 s for 300 frames of 720p
+/// on Ivybridge. A generic dma-buf mmap would reintroduce exactly that.
+pub trait GpuFrameOwner: Send {
+    fn read_i420(&self, out: &mut Vec<u8>) -> Result<(), CodecError>;
 }
 
 /// A borrowed, non-owning view of a decoded I420 frame.

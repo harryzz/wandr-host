@@ -69,9 +69,9 @@ fn vp8_roundtrip_preserves_the_image() {
             assert!(!pkt.data.is_empty(), "empty packet");
             dec.decode(Chunk::new(&pkt.data, 0)).expect("decode");
             while let Some(frame) = dec.next_frame() {
-                assert_eq!((frame.width, frame.height), (W, H));
+                assert_eq!(frame.dimensions(), (W, H));
                 let mut rgba = Vec::new();
-                wandr_video::i420_to_rgba(&frame, &mut rgba).expect("i420->rgba");
+                wandr_video::i420_to_rgba(frame.as_i420().expect("software backend must return a CPU frame"), &mut rgba).expect("i420->rgba");
                 last_rgba = Some(rgba);
                 decoded_count += 1;
             }
@@ -129,7 +129,7 @@ fn encodes_when_source_resolution_differs() {
         while let Some(pkt) = enc.next_packet() {
             dec.decode(Chunk::new(&pkt.data, 0)).expect("decode");
             while let Some(f) = dec.next_frame() {
-                assert_eq!((f.width, f.height), (W, H), "decoded at the ENCODE size");
+                assert_eq!(f.dimensions(), (W, H), "decoded at the ENCODE size");
                 decoded += 1;
             }
         }

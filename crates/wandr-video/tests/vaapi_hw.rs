@@ -30,7 +30,7 @@
 
 #![cfg(feature = "vaapi")]
 
-use wandr_video::{default_registry, Chunk, Codec, DecoderParams, Preferences};
+use wandr_video::{default_registry, Chunk, Codec, DecoderParams, FrameLocation, Preferences};
 
 /// Split Annex-B into ACCESS UNITS (one coded picture each): a new AU begins at a
 /// VCL NAL when the current AU already holds one. Feeding NALs individually would
@@ -118,17 +118,25 @@ fn vaapi_decodes_h264_in_hardware() {
     let mut got = 0usize;
     let mut seen: Vec<i64> = Vec::new();
     let mut checked_picture = false;
+    // Did any frame come back still in GPU memory? That is the zero-copy path
+    // working, and it is invisible to every other assertion here — the pixel
+    // checks below pass identically whether the frame was exported or read back.
+    let mut saw_gpu = false;
+    let mut scratch: Vec<u8> = Vec::new();
 
     let drain = |dec: &mut Box<dyn wandr_video::Decoder>,
                  got: &mut usize,
                  seen: &mut Vec<i64>,
-                 checked: &mut bool| {
+                 checked: &mut bool,
+                 saw_gpu: &mut bool,
+                 scratch: &mut Vec<u8>| {
         while let Some(f) = dec.next_frame() {
+            *saw_gpu |= f.location() == FrameLocation::Gpu;
             // 3. TAG FIDELITY, not monotonicity — see the header. Record what came
             //    back; the permutation check happens once the stream is drained.
-            seen.push(f.timestamp_us);
+            seen.push(f.timestamp_us());
             if *got < 12 {
-                eprintln!("  out[{got}] tag {}", f.timestamp_us);
+                eprintln!("  out[{got}] tag {} ({:?})", f.timestamp_us(), f.location());
             }
 
             // 4. THE PICTURE ITSELF. Mid-clip so it is an inter-predicted frame,
@@ -136,6 +144,13 @@ fn vaapi_decodes_h264_in_hardware() {
             //    a fine-looking first frame.
             if *got == 150 && !*checked {
                 *checked = true;
+                // ‼️ `read_i420` is now what exercises the NV12->I420
+                // de-interleave: on the zero-copy path it is the backend's
+                // readback thunk, on the fallback path it is the same code that
+                // always ran. Either way this stays the only pixel-level check
+                // the HW backend has, which is why it materialises rather than
+                // skipping GPU frames.
+                let f = f.read_i420(scratch).expect("materialise frame 150");
                 let n = (f.width * f.height) as usize;
                 let mean: f64 = f.y[..n].iter().map(|&p| p as f64).sum::<f64>() / n as f64;
                 let min = *f.y[..n].iter().min().unwrap();
@@ -153,10 +168,12 @@ fn vaapi_decodes_h264_in_hardware() {
             }
             if let Some(d) = &dump_dir {
                 if matches!(*got, 0 | 60 | 150 | 240) {
-                    dump_ppm(
-                        &format!("{d}/hw_frame_{got:04}.ppm"),
-                        f.y, f.u, f.v, f.y_stride, f.u_stride, f.width, f.height,
-                    );
+                    if let Ok(p) = f.read_i420(scratch) {
+                        dump_ppm(
+                            &format!("{d}/hw_frame_{got:04}.ppm"),
+                            p.y, p.u, p.v, p.y_stride, p.u_stride, p.width, p.height,
+                        );
+                    }
                 }
             }
             *got += 1;
@@ -165,12 +182,12 @@ fn vaapi_decodes_h264_in_hardware() {
 
     for (i, au) in aus.iter().enumerate() {
         dec.decode(Chunk::new(au, pts_of(i))).expect("decode access unit");
-        drain(&mut dec, &mut got, &mut seen, &mut checked_picture);
+        drain(&mut dec, &mut got, &mut seen, &mut checked_picture, &mut saw_gpu, &mut scratch);
     }
     // 2. EVERY AU. Without flush the frames the DPB holds for reordering never
     //    come out and the tail of the clip silently disappears.
     dec.flush().expect("flush");
-    drain(&mut dec, &mut got, &mut seen, &mut checked_picture);
+    drain(&mut dec, &mut got, &mut seen, &mut checked_picture, &mut saw_gpu, &mut scratch);
 
     eprintln!("HW decoded {got}/{} access units", aus.len());
     assert_eq!(got, aus.len(), "decoded {got} frames from {} access units", aus.len());
@@ -194,6 +211,17 @@ fn vaapi_decodes_h264_in_hardware() {
         if ascending { "ascending" } else { "PERMUTED — reordered to display order" }
     );
     assert!(checked_picture, "never reached frame 150 — picture never verified");
+
+    // Zero-copy is the default; WANDR_VIDEO_ZEROCOPY=0 forces the readback lane,
+    // and both must work. Asserting only when it is ON keeps this test honest on
+    // a driver that cannot export (it falls back and still decodes correctly).
+    let zc_off = std::env::var("WANDR_VIDEO_ZEROCOPY").is_ok_and(|v| v == "0");
+    eprintln!("frames arrived {} (zero-copy {})",
+        if saw_gpu { "in GPU memory" } else { "on the CPU" },
+        if zc_off { "forced off" } else { "on" });
+    if zc_off {
+        assert!(!saw_gpu, "WANDR_VIDEO_ZEROCOPY=0 but frames still came back as GPU handles");
+    }
 
     // Seek: reset must drop reference state and accept a fresh keyframe.
     dec.reset().expect("reset");

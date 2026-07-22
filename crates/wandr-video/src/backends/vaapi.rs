@@ -52,6 +52,7 @@ use crate::{
     BackendKind, Chunk, Codec, CodecBackend, CodecError, Decoder, DecoderParams, Encoder,
     EncoderParams, I420Ref,
 };
+use crate::Frame;
 
 /// Upstream cros-codecs 0.0.6 builds a throwaway 16x16 placeholder context at
 /// backend construction and `.expect()`s the result. A driver whose decode
@@ -260,6 +261,27 @@ impl VideoFrame for VaSurfaceFrame {
 
 // ── readback: VA surface -> owned, tightly-packed I420 ───────────────────────
 
+/// A decoded picture still living in its VA surface.
+struct Decoded {
+    /// `cros_codecs`' own `DecodedHandle` alias is pub(crate), so name what it
+    /// actually is — `VaapiDecodedHandle` itself is public. Avoids a third patch
+    /// to the vendored fork just to widen a type alias.
+    handle: Rc<RefCell<cros_codecs::backend::vaapi::decoder::VaapiDecodedHandle<VaSurfaceFrame>>>,
+    w: u32,
+    h: u32,
+    pts_us: i64,
+}
+
+/// Whether this stream exports DMA-bufs. Latched after the first attempt: an
+/// export that fails on frame 1 will fail on frame 300, and retrying per frame
+/// would cost a syscall each time to learn the same thing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportState {
+    Untried,
+    Exports,
+    ReadsBack,
+}
+
 /// One decoded frame, owned as tightly-packed I420 (the `I420Ref` shape).
 struct DecodedI420 {
     buf: Vec<u8>,
@@ -338,6 +360,81 @@ fn readback_i420(surface: &Surface<()>, w: u32, h: u32, pts_us: i64) -> Result<D
     Ok(DecodedI420 { buf, w, h, pts_us })
 }
 
+/// Operator escape hatch, matching WANDR_VIDEO_BACKEND / WANDR_VIDEO_NO_HW: forces
+/// the readback path so the two lanes can be compared on one machine, and gives a
+/// one-env-var rollback if an import turns out to be wrong on some driver.
+fn zerocopy_disabled() -> bool {
+    std::env::var("WANDR_VIDEO_ZEROCOPY").is_ok_and(|v| v == "0")
+}
+
+/// Keeps the decoded VA surface alive for as long as the exported DMA-buf is in
+/// use, and knows the ONE correct way to read it back.
+struct VaSurfaceOwner {
+    decoded: Decoded,
+}
+
+// SAFETY: same invariant as `VaapiDecoder` — the handle and its `Rc` graph are a
+// self-contained object used from one thread at a time (the store thread). `Sync`
+// is deliberately NOT claimed, so sharing is still a compile error.
+unsafe impl Send for VaSurfaceOwner {}
+
+impl crate::GpuFrameOwner for VaSurfaceOwner {
+    fn read_i420(&self, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        let inner = self.decoded.handle.borrow();
+        let f = readback_i420(inner.surface(), self.decoded.w, self.decoded.h, self.decoded.pts_us)?;
+        out.clear();
+        out.extend_from_slice(&f.buf);
+        Ok(())
+    }
+}
+
+/// Turn a `VADRMPRIMESurfaceDescriptor` into the crate's `GpuFrame`.
+///
+/// Only the single-object / single-layer shape is accepted, which is what
+/// `export_prime` produces for NV12 (it asks for COMPOSED_LAYERS). Anything else
+/// returns `None` and the caller reads back — describing a shape we have not
+/// seen and cannot test would be guessing at the exact point where a wrong guess
+/// renders silent garbage.
+fn gpu_frame_from_prime(
+    mut desc: libva::DrmPrimeSurfaceDescriptor,
+    decoded: Decoded,
+) -> Option<crate::GpuFrame> {
+    // Copy the scalars out before touching `objects` — `layers` borrows `desc`.
+    let (drm_format, num_planes, offsets, pitches) = {
+        let l = desc.layers.first()?;
+        (l.drm_format, l.num_planes as usize, l.offset, l.pitch)
+    };
+    // Only the single-object shape is accepted. `export_prime` asks for
+    // COMPOSED_LAYERS, so NV12 comes back as one object with one layer; anything
+    // else is a shape we have never seen and cannot test, and guessing at it is
+    // exactly where a wrong guess renders silent garbage.
+    if desc.objects.len() != 1 || num_planes == 0 || num_planes > 4 {
+        return None;
+    }
+    let obj = desc.objects.pop()?;
+    let modifier = obj.drm_format_modifier;
+    let mut planes = Vec::with_capacity(num_planes);
+    for i in 0..num_planes {
+        // All planes live in the same buffer object, so each gets its own dup of
+        // the one fd — independently closed, no shared-ownership bookkeeping.
+        planes.push(crate::DmabufPlane {
+            fd: obj.fd.try_clone().ok()?,
+            offset: offsets[i],
+            pitch: pitches[i],
+        });
+    }
+    let (w, h, pts) = (decoded.w, decoded.h, decoded.pts_us);
+    Some(crate::GpuFrame::new(
+        w,
+        h,
+        pts,
+        drm_format,
+        modifier,
+        planes,
+        Box::new(VaSurfaceOwner { decoded }),
+    ))
+}
+
 // ── decoder ──────────────────────────────────────────────────────────────────
 
 type CrosDecoder = StatelessDecoder<H264, CrosVaapiBackend<VaSurfaceFrame>>;
@@ -349,11 +446,15 @@ pub struct VaapiDecoder {
     /// Stream resolution, learned from `FormatChanged`. The frame-allocation
     /// callback reads it, which is why it is shared rather than owned.
     res: Rc<RefCell<Resolution>>,
-    /// Frames decoded and read back, oldest first.
-    out: VecDeque<DecodedI420>,
-    /// The frame the most recent `next_frame` returned — kept alive so its borrow
-    /// stays valid until the following `next_frame`.
+    /// Frames decoded and synced, oldest first — still in GPU memory.
+    out: VecDeque<Decoded>,
+    /// The CPU frame the most recent `next_frame` materialised, if it had to.
+    /// Kept alive so its borrow stays valid until the following `next_frame`.
     current: Option<DecodedI420>,
+    /// Whether to export DMA-bufs (zero-copy) or read back. Latched per stream
+    /// from the FIRST export attempt: capability bits lie in both directions on
+    /// these drivers, so the only trustworthy probe is doing it once for real.
+    export: ExportState,
 }
 
 // SAFETY: the same reasoning as every other backend in this crate (openh264,
@@ -379,6 +480,7 @@ impl VaapiDecoder {
             res: Rc::new(RefCell::new(Resolution::from((0, 0)))),
             out: VecDeque::new(),
             current: None,
+            export: ExportState::Untried,
         })
     }
 
@@ -434,11 +536,13 @@ impl VaapiDecoder {
                     }
                     let r = handle.display_resolution();
                     let pts_us = handle.timestamp() as i64;
-                    let inner = handle.borrow();
-                    match readback_i420(inner.surface(), r.width, r.height, pts_us) {
-                        Ok(f) => self.out.push_back(f),
-                        Err(e) => log::warn!("wandr-video: vaapi: readback: {e:?}"),
-                    }
+                    // Park the HANDLE, decoded and synced, without touching the
+                    // pixels. Whether they ever reach the CPU is `next_frame`'s
+                    // decision — and in the zero-copy path they never do. This
+                    // used to call `readback_i420` right here, which meant even
+                    // decode-to-BUFFER (frame counting, which throws the pixels
+                    // away) paid a full vaGetImage + de-interleave per frame.
+                    self.out.push_back(Decoded { handle, w: r.width, h: r.height, pts_us });
                 }
                 DecoderEvent::FormatChanged => {
                     if let Some(info) = self.dec.stream_info() {
@@ -529,16 +633,70 @@ impl Decoder for VaapiDecoder {
         Ok(())
     }
 
-    fn next_frame(&mut self) -> Option<I420Ref<'_>> {
-        // Move the next frame into `current` so the returned borrow stays valid
-        // until the following call; None when drained.
-        self.current = self.out.pop_front();
+    fn next_frame(&mut self) -> Option<Frame<'_>> {
+        let d = self.out.pop_front()?;
+
+        // ZERO-COPY FIRST. `export_prime` hands back a DMA-buf fd for the very
+        // memory the hardware decoded into: no readback, no de-interleave, no
+        // colour conversion, and the host can import it straight as a texture.
+        // Falling back to a readback when it fails is not defensive clutter — a
+        // driver that decodes perfectly but cannot export is still a perfectly
+        // good decoder, and declining the whole backend would drop us to
+        // openh264 over a PRESENTATION limitation. That is why this lives here
+        // and not in `caps()`.
+        if self.export != ExportState::ReadsBack && !zerocopy_disabled() {
+            let inner = d.handle.borrow();
+            match inner.surface().export_prime() {
+                Ok(desc) => {
+                    if self.export == ExportState::Untried {
+                        log::info!(
+                            "wandr-video: vaapi: zero-copy ON — export_prime gave {} object(s), \
+                             {} layer(s), modifier {:#x}",
+                            desc.objects.len(),
+                            desc.layers.len(),
+                            desc.objects.first().map(|o| o.drm_format_modifier).unwrap_or(0),
+                        );
+                        self.export = ExportState::Exports;
+                    }
+                    drop(inner);
+                    if let Some(g) = gpu_frame_from_prime(desc, d) {
+                        return Some(Frame::gpu(g));
+                    }
+                    // Export succeeded but its shape is not one we can describe
+                    // (multi-object, or no layer). Nothing is wrong with the
+                    // decode, so read back rather than lose the frame — but say
+                    // so once, because it means zero-copy is silently off.
+                    log::warn!("wandr-video: vaapi: export shape unusable — reading back instead");
+                    self.export = ExportState::ReadsBack;
+                    return None;
+                }
+                Err(e) => {
+                    log::info!(
+                        "wandr-video: vaapi: export_prime unavailable ({e:?}) — readback path"
+                    );
+                    self.export = ExportState::ReadsBack;
+                }
+            }
+        }
+
+        // Readback path: identical to what this backend always did.
+        let inner = d.handle.borrow();
+        match readback_i420(inner.surface(), d.w, d.h, d.pts_us) {
+            Ok(f) => {
+                drop(inner);
+                self.current = Some(f);
+            }
+            Err(e) => {
+                log::warn!("wandr-video: vaapi: readback: {e:?}");
+                return None;
+            }
+        }
         let f = self.current.as_ref()?;
         let (w, h) = (f.w, f.h);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let y_len = (w * h) as usize;
         let c_len = (cw * ch) as usize;
-        Some(I420Ref {
+        Some(Frame::cpu(I420Ref {
             y: &f.buf[..y_len],
             y_stride: w,
             u: &f.buf[y_len..y_len + c_len],
@@ -548,6 +706,7 @@ impl Decoder for VaapiDecoder {
             width: w,
             height: h,
             timestamp_us: f.pts_us,
-        })
+        }))
     }
+
 }

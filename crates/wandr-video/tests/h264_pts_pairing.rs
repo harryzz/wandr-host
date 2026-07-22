@@ -95,12 +95,12 @@ fn openh264_pairs_container_pts_to_the_right_frames() {
     for (au, pts) in &aus {
         dec.decode(Chunk::new(au, *pts)).expect("decode");
         while let Some(f) = dec.next_frame() {
-            seen.push(f.timestamp_us);
+            seen.push(f.timestamp_us());
         }
     }
     dec.flush().expect("flush");
     while let Some(f) = dec.next_frame() {
-        seen.push(f.timestamp_us);
+        seen.push(f.timestamp_us());
     }
 
     eprintln!("first 12 PTS out: {:?}", &seen[..seen.len().min(12)]);

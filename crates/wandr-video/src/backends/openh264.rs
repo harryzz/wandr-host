@@ -41,7 +41,7 @@ use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource};
 
 use crate::convert::Rgb24Frame;
 use crate::{
-    BackendKind, Codec, CodecBackend, CodecError, Decoder, DecoderParams, Encoder, EncoderParams,
+    BackendKind, Codec, CodecBackend, CodecError, Decoder, DecoderParams, Encoder, EncoderParams, Frame,
     I420Ref, Packet,
 };
 
@@ -332,7 +332,7 @@ impl Decoder for H264Decoder {
         Ok(())
     }
 
-    fn next_frame(&mut self) -> Option<I420Ref<'_>> {
+    fn next_frame(&mut self) -> Option<Frame<'_>> {
         // Move the next decoded frame into `current` so the returned borrow stays
         // valid until the following call; None when drained.
         self.current = self.out.pop_front();
@@ -341,7 +341,7 @@ impl Decoder for H264Decoder {
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let y_len = (w * h) as usize;
         let c_len = (cw * ch) as usize;
-        Some(I420Ref {
+        Some(Frame::cpu(I420Ref {
             y: &f.buf[..y_len],
             y_stride: w,
             u: &f.buf[y_len..y_len + c_len],
@@ -351,6 +351,6 @@ impl Decoder for H264Decoder {
             width: w,
             height: h,
             timestamp_us: f.pts_us,
-        })
+        }))
     }
 }

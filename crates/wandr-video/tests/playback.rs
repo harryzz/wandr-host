@@ -83,12 +83,12 @@ fn pts_survives_the_codec_and_pairs_correctly() {
     for (data, pts, _) in &clip.frames {
         dec.decode(Chunk::new(data, *pts)).expect("decode");
         while let Some(f) = dec.next_frame() {
-            got.push(f.timestamp_us);
+            got.push(f.timestamp_us());
         }
     }
     dec.flush().expect("flush");
     while let Some(f) = dec.next_frame() {
-        got.push(f.timestamp_us);
+        got.push(f.timestamp_us());
     }
 
     let want: Vec<i64> = clip.frames.iter().map(|(_, p, _)| *p).collect();
@@ -180,7 +180,7 @@ fn reset_seeks_without_reopening_the_decoder() {
     for (data, pts, _) in clip.frames.iter().skip(seek_idx) {
         dec.decode(Chunk::new(data, *pts)).expect("decode after seek");
         while let Some(f) = dec.next_frame() {
-            after_seek.push(f.timestamp_us);
+            after_seek.push(f.timestamp_us());
         }
     }
 
@@ -210,12 +210,12 @@ fn frames_can_be_paced_against_an_external_clock() {
     for (data, pts, _) in &clip.frames {
         dec.decode(Chunk::new(data, *pts)).expect("decode");
         while let Some(f) = dec.next_frame() {
-            queue.push_back(f.timestamp_us);
+            queue.push_back(f.timestamp_us());
         }
     }
     dec.flush().expect("flush");
     while let Some(f) = dec.next_frame() {
-        queue.push_back(f.timestamp_us);
+        queue.push_back(f.timestamp_us());
     }
     let decoded = queue.len();
     assert!(decoded >= 30, "not enough frames to pace: {decoded}");
@@ -264,7 +264,7 @@ fn pts_survives_values_that_would_wrap_a_90khz_u32() {
         let pts = BIG_US + i as i64 * 33_333;
         dec.decode(Chunk::new(data, pts)).expect("decode");
         while let Some(f) = dec.next_frame() {
-            got.push(f.timestamp_us);
+            got.push(f.timestamp_us());
         }
     }
     assert!(!got.is_empty());
