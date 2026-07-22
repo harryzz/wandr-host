@@ -35,6 +35,29 @@ fn codec2b(c: wit::types::Codec) -> Result<video::Codec, wit::types::VideoError>
     }
 }
 
+/// wandr-video codec -> WIT codec. `None` for anything the WIT vocabulary does
+/// not name, so a new backend codec cannot silently masquerade as another.
+#[cfg(not(target_os = "android"))]
+fn codec2w(c: wandr_video::Codec) -> Option<wit::types::Codec> {
+    Some(match c {
+        wandr_video::Codec::Vp8 => wit::types::Codec::Vp8,
+        wandr_video::Codec::Vp9 => wit::types::Codec::Vp9,
+        wandr_video::Codec::H264 => wit::types::Codec::H264,
+        wandr_video::Codec::H265 => wit::types::Codec::H265,
+        wandr_video::Codec::Av1 => wit::types::Codec::Av1,
+    })
+}
+
+#[cfg(not(target_os = "android"))]
+fn accel2b(a: wit::decoder::Acceleration) -> video::Accel {
+    match a {
+        wit::decoder::Acceleration::NoPreference => video::Accel::NoPreference,
+        wit::decoder::Acceleration::PreferHardware => video::Accel::PreferHardware,
+        wit::decoder::Acceleration::PreferSoftware => video::Accel::PreferSoftware,
+        wit::decoder::Acceleration::RequireHardware => video::Accel::RequireHardware,
+    }
+}
+
 fn layer2b(l: wit::types::ZLayer) -> video::ZLayer {
     match l {
         wit::types::ZLayer::BehindUi => video::ZLayer::BehindUi,
@@ -136,11 +159,51 @@ impl wit::encoder::HostVideoEncoder for HostState {
     }
 }
 
-impl wit::decoder::Host for HostState {}
+impl wit::decoder::Host for HostState {
+    /// PROBED per call, not cached at startup: a driver can appear or disappear
+    /// (a GPU reset, a container gaining /dev/dri) and a guest asking "can you
+    /// decode this" deserves the current answer. The probe itself is cached inside
+    /// the backend, so this is cheap after the first call.
+    fn list_decoders(&mut self) -> Vec<wit::decoder::DecoderInfo> {
+        #[cfg(not(target_os = "android"))]
+        {
+            wandr_video::describe_backends()
+                .into_iter()
+                .flat_map(|b| {
+                    let (name, hardware) = (b.name.to_string(), b.is_hardware());
+                    b.decode.into_iter().filter_map(move |c| {
+                        Some(wit::decoder::DecoderInfo {
+                            codec: codec2w(c)?,
+                            name: name.clone(),
+                            hardware,
+                        })
+                    })
+                })
+                .collect()
+        }
+        // Android decodes everything through MediaCodec, which IS the hardware
+        // path; there is no registry to enumerate and no software alternative
+        // linked in. Reporting the codec set it supports would mean asking
+        // MediaCodec, which is a bigger job than this verb is worth today —
+        // an empty list honestly says "not enumerable here" rather than lying.
+        #[cfg(target_os = "android")]
+        {
+            Vec::new()
+        }
+    }
+}
 impl wit::decoder::HostVideoDecoder for HostState {
     fn open(
         &mut self,
         config: wit::types::DecoderConfig,
+    ) -> Result<Resource<DecoderState>, wit::types::VideoError> {
+        self.open_accelerated(config, wit::decoder::Acceleration::NoPreference)
+    }
+
+    fn open_accelerated(
+        &mut self,
+        config: wit::types::DecoderConfig,
+        accel: wit::decoder::Acceleration,
     ) -> Result<Resource<DecoderState>, wit::types::VideoError> {
         let cfg = video::DecoderConfig {
             codec: codec2b(config.codec)?,
@@ -151,10 +214,43 @@ impl wit::decoder::HostVideoDecoder for HostState {
             rotation: config.rotation,
             layer: layer2b(config.layer),
         };
-        let dec = video::VideoDecoder::open(&cfg).map_err(err2w)?;
+        #[cfg(not(target_os = "android"))]
+        let dec = video::VideoDecoder::open_with_accel(&cfg, accel2b(accel)).map_err(err2w)?;
+        // Android is MediaCodec-only: every decoder there IS the hardware path, so
+        // a preference has nothing to choose between and is accepted as satisfied.
+        #[cfg(target_os = "android")]
+        let dec = {
+            let _ = accel;
+            video::VideoDecoder::open(&cfg).map_err(err2w)?
+        };
         self.table
             .push(DecoderState(dec))
             .map_err(|_| wit::types::VideoError::CodecInitFailed)
+    }
+
+    fn implementation(&mut self, self_: Resource<DecoderState>) -> wit::decoder::DecoderInfo {
+        #[cfg(not(target_os = "android"))]
+        {
+            let (name, hardware) = self
+                .table
+                .get(&self_)
+                .map(|st| st.0.backend())
+                .unwrap_or(("unknown", false));
+            wit::decoder::DecoderInfo {
+                codec: wit::types::Codec::H264,
+                name: name.to_string(),
+                hardware,
+            }
+        }
+        #[cfg(target_os = "android")]
+        {
+            let _ = self_;
+            wit::decoder::DecoderInfo {
+                codec: wit::types::Codec::H264,
+                name: "mediacodec".to_string(),
+                hardware: true,
+            }
+        }
     }
 
     fn submit(

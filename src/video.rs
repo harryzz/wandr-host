@@ -177,7 +177,7 @@ pub fn schedule_present(_at_ns: u64, _frame: TakenFrame) {}
 // The cross-platform peer of the android NDK/MediaCodec path below.
 #[cfg(not(target_os = "android"))]
 pub use crate::video_desktop::{
-    ensure_binder_threadpool, monotonic_now_ns, schedule_present, TakenFrame, VideoDecoder,
+    ensure_binder_threadpool, monotonic_now_ns, schedule_present, Accel, TakenFrame, VideoDecoder,
     VideoEncoder,
 };
 

@@ -56,6 +56,26 @@ pub enum Codec {
     Av1,
 }
 
+impl Codec {
+    /// Every codec in the vocabulary — what capability listing iterates.
+    pub const ALL: [Codec; 5] = [Codec::Vp8, Codec::Vp9, Codec::H264, Codec::H265, Codec::Av1];
+
+    /// Lower-case name, as used on the command line and in listings.
+    pub fn name(self) -> &'static str {
+        match self {
+            Codec::Vp8 => "vp8",
+            Codec::Vp9 => "vp9",
+            Codec::H264 => "h264",
+            Codec::H265 => "h265",
+            Codec::Av1 => "av1",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Codec> {
+        Codec::ALL.into_iter().find(|c| c.name().eq_ignore_ascii_case(s))
+    }
+}
+
 /// Everything a codec needs to start encoding — and nothing else. Notably absent:
 /// camera facing and the PiP preview rect, which are host concerns.
 #[derive(Debug, Clone, Copy)]
@@ -213,6 +233,29 @@ pub struct Preferences {
     /// Refuse to fall back to software — surface the HW error instead of silently
     /// degrading. The opt-out for a caller that genuinely needs HW.
     pub require_hardware: bool,
+    /// Use ONLY this backend, by `name()`. For A/B-ing one implementation against
+    /// another on the same machine — the question "is this the codec or the rest
+    /// of the pipeline?" is otherwise very hard to answer. An unknown name matches
+    /// nothing and the open fails, deliberately: silently ignoring it would give a
+    /// measurement of the wrong thing, which is worse than an error.
+    pub backend: Option<&'static str>,
+}
+
+/// What one backend can do. The shape `--list-codecs` prints and the guest-facing
+/// listing is built from.
+#[derive(Debug, Clone)]
+pub struct BackendInfo {
+    pub name: &'static str,
+    pub kind: BackendKind,
+    pub priority: u32,
+    pub decode: Vec<Codec>,
+    pub encode: Vec<Codec>,
+}
+
+impl BackendInfo {
+    pub fn is_hardware(&self) -> bool {
+        self.kind == BackendKind::Hardware
+    }
 }
 
 /// The set of compiled-in backends, sorted by priority.
@@ -237,13 +280,35 @@ impl Registry {
         self.backends.sort_by_key(|b| b.priority());
     }
 
+    /// Every registered backend and what it supports, in priority order.
+    ///
+    /// ‼️ This ASKS each backend, it does not read a table: a HW backend's
+    /// `supports_decode` probes the driver, so the answer is what this machine can
+    /// actually do rather than what the build could theoretically do. That is the
+    /// whole point of listing it — on a box with no VA driver, vaapi appears with
+    /// an EMPTY decode list rather than not appearing at all, which is the
+    /// difference between "not built in" and "built in but unusable here".
+    pub fn describe(&self) -> Vec<BackendInfo> {
+        self.backends
+            .iter()
+            .map(|b| BackendInfo {
+                name: b.name(),
+                kind: b.kind(),
+                priority: b.priority(),
+                decode: Codec::ALL.into_iter().filter(|c| b.supports_decode(*c)).collect(),
+                encode: Codec::ALL.into_iter().filter(|c| b.supports_encode(*c)).collect(),
+            })
+            .collect()
+    }
+
     fn candidates(&self, prefs: Preferences) -> impl Iterator<Item = &dyn CodecBackend> {
-        // Two independent exclusions — kept as two clauses on purpose; clippy's
-        // De-Morgan merge into one `!(… || …)` reads worse than the intent.
+        // Three independent exclusions — kept as separate clauses on purpose;
+        // clippy's De-Morgan merge into one `!(… || …)` reads worse than the intent.
         #[allow(clippy::nonminimal_bool)]
         self.backends.iter().map(|b| b.as_ref()).filter(move |b| {
             !(prefs.no_hardware && b.kind() == BackendKind::Hardware)
                 && !(prefs.require_hardware && b.kind() == BackendKind::Software)
+                && prefs.backend.is_none_or(|want| b.name() == want)
         })
     }
 
@@ -252,12 +317,32 @@ impl Registry {
         params: &DecoderParams,
         prefs: Preferences,
     ) -> Result<Box<dyn Decoder>, CodecError> {
+        self.open_decoder_named(params, prefs).map(|(d, _)| d)
+    }
+
+    /// `open_decoder`, also reporting WHICH backend served it.
+    ///
+    /// A caller that asked for hardware and silently got software has no way to
+    /// know otherwise — and "why is this dropping frames" is unanswerable without
+    /// it. The guest-facing `implementation()` verb is built on this.
+    pub fn open_decoder_named(
+        &self,
+        params: &DecoderParams,
+        prefs: Preferences,
+    ) -> Result<(Box<dyn Decoder>, BackendInfo), CodecError> {
         let mut last = CodecError::Unsupported;
         for b in self.candidates(prefs).filter(|b| b.supports_decode(params.codec)) {
             match b.open_decoder(params) {
                 Ok(d) => {
                     log::info!("wandr-video: {:?} decode via {}", params.codec, b.name());
-                    return Ok(d);
+                    let info = BackendInfo {
+                        name: b.name(),
+                        kind: b.kind(),
+                        priority: b.priority(),
+                        decode: Codec::ALL.into_iter().filter(|c| b.supports_decode(*c)).collect(),
+                        encode: Codec::ALL.into_iter().filter(|c| b.supports_encode(*c)).collect(),
+                    };
+                    return Ok((d, info));
                 }
                 Err(e) => {
                     log::warn!("wandr-video: {} declined {:?} decode: {e:?}", b.name(), params.codec);
@@ -329,10 +414,33 @@ fn global_registry() -> &'static Registry {
     REG.get_or_init(default_registry)
 }
 
+/// Describe every backend in the process default registry — `--list-codecs` and
+/// the guest-facing capability list both come from here.
+pub fn describe_backends() -> Vec<BackendInfo> {
+    global_registry().describe()
+}
+
 /// Open a decoder for `params.codec` using the process default registry and
 /// default preferences (HW first, software fallback).
 pub fn open_decoder(params: &DecoderParams) -> Result<Box<dyn Decoder>, CodecError> {
-    global_registry().open_decoder(params, Preferences::default())
+    open_decoder_with(params, Preferences::default())
+}
+
+/// Open a decoder against the process default registry with explicit policy —
+/// the entry point for forcing HW, forcing SW, or pinning one named backend.
+pub fn open_decoder_with(
+    params: &DecoderParams,
+    prefs: Preferences,
+) -> Result<Box<dyn Decoder>, CodecError> {
+    global_registry().open_decoder(params, prefs)
+}
+
+/// `open_decoder_with`, also reporting which backend served it.
+pub fn open_decoder_named(
+    params: &DecoderParams,
+    prefs: Preferences,
+) -> Result<(Box<dyn Decoder>, BackendInfo), CodecError> {
+    global_registry().open_decoder_named(params, prefs)
 }
 
 /// Open an encoder for `params.codec` using the process default registry.

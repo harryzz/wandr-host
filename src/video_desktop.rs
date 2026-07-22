@@ -511,16 +511,75 @@ pub struct VideoDecoder {
     pending: VecDeque<PendingFrame>,
     /// Frames dropped because a newer one was already due (playback only).
     dropped: u64,
+    /// Which backend actually served this decoder. Reported to the guest via
+    /// `implementation()`: `acceleration` is a preference, so a guest that asked
+    /// for hardware and got software must be able to find out.
+    backend: wandr_video::BackendInfo,
+}
+
+/// A guest's hardware/software preference for a decoder (the WIT `acceleration`
+/// enum, kept out of the WIT bindings so `video.rs` stays binding-agnostic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Accel {
+    #[default]
+    NoPreference,
+    PreferHardware,
+    PreferSoftware,
+    RequireHardware,
 }
 
 impl VideoDecoder {
     pub fn open(config: &DecoderConfig) -> Result<Self, VideoError> {
-        let dec = wandr_video::open_decoder(&DecoderParams {
+        Self::open_with_accel(config, Accel::NoPreference)
+    }
+
+    /// Open with an explicit acceleration preference.
+    ///
+    /// `prefer-*` are HINTS and must still open if the preference cannot be met —
+    /// a player that refuses to play is worse than one that plays in software.
+    /// Only `require-hardware` may turn a working decode into an error, which is
+    /// the point of it. The operator's env policy still wins over the guest's
+    /// preference: a machine-level "no hardware here" is a statement of fact, and
+    /// letting an app override it would make measurements meaningless.
+    pub fn open_with_accel(config: &DecoderConfig, accel: Accel) -> Result<Self, VideoError> {
+        Self::open_impl(config, accel)
+    }
+
+    fn open_impl(config: &DecoderConfig, accel: Accel) -> Result<Self, VideoError> {
+        // Backend policy comes from the environment (WANDR_VIDEO_BACKEND /
+        // WANDR_VIDEO_NO_HW / WANDR_VIDEO_REQUIRE_HW), so the SAME app and the same
+        // clip can be run against hardware and software on one machine. Default is
+        // unchanged: hardware first, software fallback.
+        let params = DecoderParams {
             codec: codec_of(config.codec),
             width: config.width,
             height: config.height,
-        })
-        .map_err(map_err)?;
+        };
+        let mut prefs = crate::video_prefs_from_env();
+        // Guest preference, applied UNDER the operator's env policy (which is why
+        // these are `||=` rather than assignments — env-forced software stays
+        // forced even if the guest asks for hardware).
+        match accel {
+            Accel::NoPreference => {}
+            Accel::PreferSoftware => prefs.no_hardware = true,
+            Accel::RequireHardware => prefs.require_hardware = true,
+            Accel::PreferHardware => {} // already the default order: HW first
+        }
+        let (dec, backend) = match wandr_video::open_decoder_named(&params, prefs) {
+            Ok(d) => d,
+            // A HINT that could not be met must not fail the open — retry with the
+            // host's default policy. `require-hardware` deliberately does not get
+            // this second chance.
+            Err(e) if matches!(accel, Accel::PreferSoftware | Accel::PreferHardware) => {
+                log::warn!(
+                    "video_desktop: {accel:?} could not be satisfied ({e:?}) — \
+                     falling back to default backend policy"
+                );
+                wandr_video::open_decoder_named(&params, crate::video_prefs_from_env())
+                    .map_err(map_err)?
+            }
+            Err(e) => return Err(map_err(e)),
+        };
 
         // A real rect = decode-to-SURFACE (composite on screen, upright per the
         // peer's CVO rotation); empty/None = decode-to-buffer (count only).
@@ -530,7 +589,7 @@ impl VideoDecoder {
             alloc_surface(rect, false, config.rotation)
         });
         Ok(Self { dec, decoded: 0, surface_id, rgba: Vec::new(),
-                  pending: VecDeque::new(), dropped: 0 })
+                  pending: VecDeque::new(), dropped: 0, backend })
     }
 
     pub fn submit(&mut self, data: &[u8], timestamp: u32) -> Result<(), VideoError> {
@@ -558,6 +617,11 @@ impl VideoDecoder {
 
     pub fn decoded_frames(&self) -> u64 {
         self.decoded
+    }
+
+    /// Which backend served this decoder — name and whether it is hardware.
+    pub fn backend(&self) -> (&'static str, bool) {
+        (self.backend.name, self.backend.is_hardware())
     }
 
     // ── playback mode (task 117 M2) ──────────────────────────────────────────

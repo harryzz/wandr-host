@@ -38,6 +38,21 @@ fn main() {
     }
     // Desktop `--video-selfview-test`: reproduce/measure the Signal self-view
     // freeze — a 60fps render loop pumping the blocking camera encoder.
+    // Desktop `--list-codecs`: what this build can ACTUALLY decode/encode on THIS
+    // machine. Not a compile-time table — a hardware backend probes its driver
+    // when asked, so a box with no VA driver lists vaapi with an empty codec set
+    // rather than omitting it, which distinguishes "not built in" from "built in
+    // but unusable here". That distinction is most of the diagnostic value.
+    #[cfg(not(target_os = "android"))]
+    if args.iter().any(|a| a == "--list-codecs") {
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("warn"),
+        )
+        .try_init();
+        wasm_android_host::list_codecs();
+        return;
+    }
+
     // Desktop `--video-decode-file <path.mp4>`: task 117 M2 — play a real H.264
     // MP4 through the host decoder (h264_mp4toannexb + openh264 + reorder buffer +
     // paced present), reporting frames/drift/order.

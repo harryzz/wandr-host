@@ -1700,6 +1700,91 @@ pub fn font_probe() {
     log::info!("font-probe DONE. Real metrics = count_families>0 AND unitsPerEm>0 AND glyphs>0.");
 }
 
+/// `--list-codecs` — what this build can decode/encode ON THIS MACHINE.
+///
+/// Each backend is ASKED, not read from a table: a hardware backend probes its
+/// driver inside `supports_decode`, so a machine with no usable VA driver lists
+/// `vaapi` with an empty codec set instead of not listing it at all. "Built in but
+/// unusable here" and "not built in" are different problems and this is what tells
+/// them apart.
+#[cfg(not(target_os = "android"))]
+pub fn list_codecs() {
+    let backends = wandr_video::describe_backends();
+    println!("wandr-video backends (priority order — lower is tried first):\n");
+    println!("  {:<10} {:<9} {:>4}  {:<24} {}", "BACKEND", "KIND", "PRI", "DECODE", "ENCODE");
+    for b in &backends {
+        let names = |v: &[wandr_video::Codec]| {
+            if v.is_empty() {
+                "-".to_string()
+            } else {
+                v.iter().map(|c| c.name()).collect::<Vec<_>>().join(",")
+            }
+        };
+        println!(
+            "  {:<10} {:<9} {:>4}  {:<24} {}",
+            b.name,
+            if b.is_hardware() { "HARDWARE" } else { "software" },
+            b.priority,
+            names(&b.decode),
+            names(&b.encode),
+        );
+    }
+    let hw: Vec<&str> =
+        backends.iter().filter(|b| b.is_hardware() && !b.decode.is_empty()).map(|b| b.name).collect();
+    println!();
+    if hw.is_empty() {
+        println!("  no usable HARDWARE decoder here — everything decodes in software");
+    } else {
+        println!("  hardware decode available via: {}", hw.join(", "));
+    }
+    println!(
+        "\n  force one with WANDR_VIDEO_BACKEND=<backend>, or WANDR_VIDEO_NO_HW=1 for software.\n\
+           \x20 An unknown name FAILS the open rather than falling back — a silent fallback\n\
+           \x20 would measure the wrong thing."
+    );
+}
+
+/// Backend-selection policy from the environment — the operator knob behind
+/// `--list-codecs`'s footer, and how the same clip gets A/B'd on one machine.
+///
+/// Env rather than a per-app manifest key ON PURPOSE: which codec implementation
+/// runs is a property of the MACHINE and of what is being measured, not of the
+/// app. An app asks for a codec; it does not get to pin the host's implementation
+/// of it (see the no-per-app-hardcoding rule in CLAUDE.md).
+#[cfg(not(target_os = "android"))]
+pub fn video_prefs_from_env() -> wandr_video::Preferences {
+    let mut prefs = wandr_video::Preferences::default();
+    if std::env::var("WANDR_VIDEO_NO_HW").is_ok_and(|v| v != "0") {
+        prefs.no_hardware = true;
+    }
+    if std::env::var("WANDR_VIDEO_REQUIRE_HW").is_ok_and(|v| v != "0") {
+        prefs.require_hardware = true;
+    }
+    if let Ok(want) = std::env::var("WANDR_VIDEO_BACKEND") {
+        if !want.is_empty() {
+            // Map to the registry's own &'static str so `Preferences` stays Copy.
+            // An unmatched name leaves `backend` as a leaked string that matches
+            // nothing, so the open fails loudly instead of quietly using another
+            // backend — see the doc on `Preferences::backend`.
+            let known = wandr_video::describe_backends().into_iter().find(|b| b.name == want);
+            prefs.backend = Some(match known {
+                Some(b) => b.name,
+                None => {
+                    log::warn!(
+                        "WANDR_VIDEO_BACKEND={want}: no such backend (see --list-codecs); \
+                         video open will fail rather than silently pick another"
+                    );
+                    Box::leak(want.into_boxed_str())
+                }
+            });
+        }
+    }
+    if prefs.no_hardware || prefs.require_hardware || prefs.backend.is_some() {
+        log::info!("wandr-video: backend policy from env: {prefs:?}");
+    }
+    prefs
+}
+
 /// `--video-decode-file <path.mp4>` — task 117 M2 step 2. Plays a REAL H.264 MP4
 /// through the actual host `VideoDecoder`, exercising the whole file-playback path
 /// on real content: the `h264_mp4toannexb` conversion, openh264 decode, the
