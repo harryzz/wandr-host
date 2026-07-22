@@ -88,6 +88,7 @@ pub fn run_with_engine(engine: &Engine, app_id: &str) -> Result<()> {
     log::info!("run_once: loaded {}", loaded.source_label);
 
     let mut wasi_builder = WasiCtxBuilder::new();
+    crate::host_clock::install(&mut wasi_builder);
     wasi_builder.inherit_stdin().inherit_stdout();
     #[cfg(target_os = "android")]
     wasi_builder.stderr(crate::wasi_stderr::LogcatStderr);

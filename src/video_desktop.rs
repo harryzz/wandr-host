@@ -452,8 +452,10 @@ thread_local! {
 
 /// Monotonic host clock in nanoseconds — the timeline `present(at-ns)` speaks.
 pub fn monotonic_now_ns() -> u64 {
-    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    // THE host timeline (host_clock) — shared with wasi:clocks and on-frame, so
+    // a deadline a guest computes is one this scheduler understands. This used
+    // to be its own `Instant` origin, which is why `present(at-ns)` never worked.
+    crate::host_clock::now_ns()
 }
 
 /// Schedule `frame` for `at_ns`; presents immediately if already due.

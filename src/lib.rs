@@ -39,6 +39,7 @@ mod task_manager_host_impl;
 mod connectivity_wifi_impl;
 pub mod crypto;
 mod crypto_host_impl;
+pub mod host_clock;
 pub mod video;
 // Desktop wandr:video backend (nokhwa + libvpx VP8/VP9 via the wandr-video
 // crate); android uses NDK/MediaCodec.
@@ -862,6 +863,7 @@ impl ApplicationHandler for App {
             // on a worker task that won't drain before a SIGILL trap kills
             // the process. See wasi_stderr.rs for details.
             let mut wasi_builder = WasiCtxBuilder::new();
+            crate::host_clock::install(&mut wasi_builder);
             wasi_builder.inherit_stdin().inherit_stdout();
             #[cfg(target_os = "android")]
             { wasi_builder.stderr(wasi_stderr::LogcatStderr); }
@@ -1049,10 +1051,12 @@ impl ApplicationHandler for App {
                 if let Some(s) = self.store.as_mut() {
                     let sh = self.shell_events.as_ref();
                     // No init() call needed — appMain() runs on the first render-frame.
-                    let nanos = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64;
+                    // THE host timeline (host_clock) — the same clock the guest
+                    // reads via wasi:clocks and the same one `present(at-ns)` is
+                    // scheduled against, so a guest can derive a deadline from
+                    // this value. Was SystemTime, which shared an origin with
+                    // nothing; see host_clock.rs.
+                    let nanos = crate::host_clock::now_ns();
 
                     // Task 108 — pump the guest's background engine on its
                     // authored cadence BEFORE rendering. audio.player scans the

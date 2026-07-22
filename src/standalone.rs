@@ -526,6 +526,7 @@ fn run_cwasm_loop(
 
     // ── Cold start — mirrors App::resumed's cold path ────────────────────
     let mut wasi_builder = WasiCtxBuilder::new();
+    crate::host_clock::install(&mut wasi_builder);
     wasi_builder.inherit_stdin().inherit_stdout();
     wasi_builder.stderr(crate::wasi_stderr::LogcatStderr);
     // Task 38 — installed apps with an `assets/` dir get it preopened
@@ -952,10 +953,8 @@ fn run_cwasm_loop(
             }
         }
 
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        // THE host timeline — see host_clock.rs (was SystemTime).
+        let nanos = crate::host_clock::now_ns();
 
         // Drain InputFlinger events and dispatch them to the guest. The
         // shim's input channel is non-blocking; this is the standalone
@@ -1570,10 +1569,7 @@ fn run_cwasm_loop(
     {
         log::warn!("standalone: on_lifecycle_changed(Destroyed) failed: {e:#}");
     }
-    let drain_nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
+    let drain_nanos = crate::host_clock::now_ns();
     for _ in 0..3 {
         if let Err(e) = crate::input::dispatch_frame(&mut store, &guest_input, drain_nanos)
         {

@@ -167,7 +167,12 @@ impl TakenFrame {
 }
 #[cfg(target_os = "android")]
 pub fn monotonic_now_ns() -> u64 {
-    0
+    // Real CLOCK_MONOTONIC, not the old `0` stub: this is the clock
+    // `AMediaCodec_releaseOutputBufferAtTime` takes, so when the Android
+    // playback lane is written it needs no conversion. Nothing consumes it yet
+    // (playback returns UnsupportedCodec here), so this is inert until then —
+    // and UNVERIFIED on device.
+    crate::host_clock::now_ns()
 }
 #[cfg(target_os = "android")]
 pub fn schedule_present(_at_ns: u64, _frame: TakenFrame) {}
