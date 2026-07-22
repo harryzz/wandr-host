@@ -1914,7 +1914,16 @@ pub fn video_decode_file(path: &str) -> anyhow::Result<()> {
     loop {
         while dec.queued_frames() < CUSHION && feed < units.len() {
             let (data, pts) = &units[feed];
-            dec.submit_for_playback(data, *pts).map_err(|e| anyhow::anyhow!("submit: {e:?}"))?;
+            // QueueFull is BACK-PRESSURE, not an error: stop feeding this round
+            // and retry the SAME unit next time round. Today this cushion (6) is
+            // far below the host's in-flight cap so it cannot trigger, but
+            // treating it as fatal would turn a lowered cap into a hard failure
+            // of the diagnostic rather than the pause it is meant to be.
+            match dec.submit_for_playback(data, *pts) {
+                Ok(()) => {}
+                Err(crate::video::VideoError::QueueFull) => break,
+                Err(e) => return Err(anyhow::anyhow!("submit: {e:?}")),
+            }
             feed += 1;
         }
         if feed >= units.len() {
@@ -2042,8 +2051,12 @@ pub fn video_playback_test() -> anyhow::Result<()> {
         // Refill the cushion — a player's decode thread, inlined.
         while dec.queued_frames() < CUSHION && feed < clip.len() {
             let (data, pts) = &clip[feed];
-            dec.submit_for_playback(data, *pts)
-                .map_err(|e| anyhow::anyhow!("submit: {e:?}"))?;
+            // Back-pressure, not an error — same reasoning as --video-decode-file.
+            match dec.submit_for_playback(data, *pts) {
+                Ok(()) => {}
+                Err(crate::video::VideoError::QueueFull) => break,
+                Err(e) => return Err(anyhow::anyhow!("submit: {e:?}")),
+            }
             feed += 1;
         }
         if feed >= clip.len() {

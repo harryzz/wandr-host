@@ -162,6 +162,23 @@ pub trait Decoder: Send {
     /// feed a keyframe next. (= WebCodecs `reset()`.)
     fn reset(&mut self) -> Result<(), CodecError>;
 
+    /// How many decoded frames a caller may hold before this decoder can no
+    /// longer make progress, or `None` for "bounded only by host memory".
+    ///
+    /// `None` is the honest answer for every SOFTWARE backend here: they hand
+    /// back a borrow of their own or a copy the caller owns, so nothing the
+    /// caller keeps can starve the codec. A backend whose output is a FIXED POOL
+    /// must report its real budget — MediaCodec output-buffer indices, a V4L2
+    /// CAPTURE queue, a VA surface pool — because there every frame the caller
+    /// still holds is a buffer the codec cannot decode into, and exceeding it
+    /// stops decoding dead rather than erroring.
+    ///
+    /// The host turns this into `queue-full` back-pressure, which is what lets a
+    /// guest feed until told to stop instead of guessing a decode-ahead cushion.
+    fn frames_in_flight_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Next decoded frame from the last `decode`, as a borrowed I420 view.
     ///
     /// The borrow is what enforces libvpx's rule that the returned image is only

@@ -402,12 +402,45 @@ impl VideoEncoder {
 
 // ── decoder (decode-to-surface, or decode-to-buffer when rect is empty) ───────
 
+/// Total decoded-frame memory one decoder may have outstanding.
+///
+/// Bounded in BYTES, not frames, so the answer is resolution-independent: a 4K
+/// stream gets fewer frames in flight than a 720p one for the same footprint,
+/// which is the behaviour you want and a frame count cannot express. 64 MiB is
+/// ~17 frames at 1280x720 RGBA and ~4 at 4K.
+const MAX_IN_FLIGHT_BYTES: usize = 64 * 1024 * 1024;
+
+/// …but never fewer frames than a codec needs to REORDER, or decode deadlocks:
+/// the codec waits for output slots the caller cannot free because the frames it
+/// needs have not been emitted yet. H.264 allows 16 frames in the DPB (Annex A
+/// MaxDpbMbs), so 17 is the smallest floor that is safe for any conformant
+/// stream. This is the host-side twin of the guest's own cushion — see
+/// wandr.video.player's MAX_H264_DPB.
+const MIN_IN_FLIGHT_FRAMES: usize = 17;
+
+/// Decrements a decoder's in-flight count when the frame it guards is finally
+/// released — presented, discarded, or dropped.
+///
+/// A COUNTER rather than a decoder back-reference on purpose: `TakenFrame` is
+/// deliberately self-contained so `present`/`discard` never need the decoder
+/// back, and the guest may outlive it. An `Arc<AtomicUsize>` keeps that property
+/// while still letting the decoder see how much memory it is responsible for.
+struct InFlight(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// A decoded frame waiting for its presentation time (playback mode only).
 struct PendingFrame {
     pts_us: i64,
     rgba: Vec<u8>,
     w: u32,
     h: u32,
+    /// Released when this frame's memory is, wherever it ends up.
+    _in_flight: InFlight,
 }
 
 /// A decoded frame handed OUT to the guest as a `wandr:video` `decoded-frame`
@@ -423,6 +456,11 @@ pub struct TakenFrame {
     w: u32,
     h: u32,
     surface_id: Option<u32>,
+    /// Moved over from `PendingFrame`: a frame the guest holds, or one parked in
+    /// SCHEDULED awaiting its deadline, is still memory this decoder owns. That
+    /// is the whole point — presenting with a FUTURE deadline is exactly how a
+    /// player accumulates frames in the host, and it must count.
+    _in_flight: InFlight,
 }
 
 impl TakenFrame {
@@ -513,6 +551,13 @@ pub struct VideoDecoder {
     pending: VecDeque<PendingFrame>,
     /// Frames dropped because a newer one was already due (playback only).
     dropped: u64,
+    /// Decoded frames whose memory this decoder still owns: queued in `pending`,
+    /// held by the guest as a `decoded-frame`, or parked in SCHEDULED. Shared
+    /// with each frame's `InFlight` guard, which decrements on release.
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Cap on the above, derived from the frame size once it is known (0 = not
+    /// yet). See MAX_IN_FLIGHT_BYTES / MIN_IN_FLIGHT_FRAMES.
+    in_flight_cap: usize,
     /// Which backend actually served this decoder. Reported to the guest via
     /// `implementation()`: `acceleration` is a preference, so a guest that asked
     /// for hardware and got software must be able to find out.
@@ -591,7 +636,9 @@ impl VideoDecoder {
             alloc_surface(rect, false, config.rotation)
         });
         Ok(Self { dec, decoded: 0, surface_id, rgba: Vec::new(),
-                  pending: VecDeque::new(), dropped: 0, backend })
+                  pending: VecDeque::new(), dropped: 0,
+                  in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                  in_flight_cap: 0, backend })
     }
 
     pub fn submit(&mut self, data: &[u8], timestamp: u32) -> Result<(), VideoError> {
@@ -635,6 +682,20 @@ impl VideoDecoder {
     /// Decode a chunk carrying a real presentation timestamp, queueing the frames
     /// it produces rather than presenting them.
     pub fn submit_for_playback(&mut self, data: &[u8], pts_us: i64) -> Result<(), VideoError> {
+        // ‼️ BACK-PRESSURE, BEFORE DECODING. `queue-full` has been in the
+        // contract since stage 1 ("NOT loss: retry the SAME frame") and the
+        // desktop host never once returned it, so a guest had no signal to feed
+        // against and could only GUESS a decode-ahead cushion — guess low and it
+        // deadlocks silently, guess high and it decodes a whole file into host
+        // memory. Refusing here is what turns feeding into a conversation.
+        //
+        // Checked before `decode` on purpose: decoding first would materialise
+        // the very frame we have no room for.
+        if self.in_flight_cap != 0
+            && self.in_flight.load(std::sync::atomic::Ordering::Relaxed) >= self.in_flight_cap
+        {
+            return Err(VideoError::QueueFull);
+        }
         self.dec
             .decode(wandr_video::Chunk::new(data, pts_us))
             .map_err(map_err)?;
@@ -670,8 +731,22 @@ impl VideoDecoder {
                 // insert at the back, so this costs them nothing. The decode-ahead
                 // cushion the player keeps must exceed the stream's reorder depth,
                 // else a late earlier-PTS frame would arrive after its slot passed.
+                // Derive the cap the first time we know the real frame size; a
+                // decoder's `frames_in_flight_limit` wins when it has a hard
+                // pool (MediaCodec indices, VA surfaces) rather than just memory.
+                if self.in_flight_cap == 0 {
+                    let bytes = (w as usize).saturating_mul(h as usize).saturating_mul(4).max(1);
+                    let by_memory = (MAX_IN_FLIGHT_BYTES / bytes).max(MIN_IN_FLIGHT_FRAMES);
+                    self.in_flight_cap = self.dec.frames_in_flight_limit().unwrap_or(by_memory);
+                    log::info!(
+                        "video_desktop: in-flight cap {} frames ({}x{} RGBA, {} MiB budget)",
+                        self.in_flight_cap, w, h, MAX_IN_FLIGHT_BYTES / (1024 * 1024)
+                    );
+                }
+                self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let guard = InFlight(std::sync::Arc::clone(&self.in_flight));
                 let at = self.pending.partition_point(|p| p.pts_us <= pts_us);
-                self.pending.insert(at, PendingFrame { pts_us, rgba, w, h });
+                self.pending.insert(at, PendingFrame { pts_us, rgba, w, h, _in_flight: guard });
             }
         }
     }
@@ -692,6 +767,9 @@ impl VideoDecoder {
             w: f.w,
             h: f.h,
             surface_id: self.surface_id,
+            // The guard MOVES, it is not recreated: handing a frame to the guest
+            // changes who holds the memory, not whether it is held.
+            _in_flight: f._in_flight,
         })
     }
 
