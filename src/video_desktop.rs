@@ -531,6 +531,13 @@ thread_local! {
 /// pending -> taken -> surface.
 pub(crate) struct TextureRef(u64);
 
+/// How many imported frames the registry currently holds. Should track the
+/// in-flight count and return to ~1 (the displayed frame) at end of stream —
+/// anything that climbs with frame count is a leak.
+pub(crate) fn live_textures() -> usize {
+    TEXTURES.with(|m| m.borrow().len())
+}
+
 impl TextureRef {
     fn insert(t: crate::video_gl::TextureFrame) -> Self {
         let id = TEXTURE_NEXT.with(|n| {
@@ -955,6 +962,16 @@ impl VideoDecoder {
                         self.in_flight_cap, w, h, MAX_IN_FLIGHT_BYTES / (1024 * 1024)
                     );
                 }
+                // Leak watch: the imported-texture registry must track in-flight,
+                // not frame count. Logged every 60 frames so a climb is obvious.
+                if self.decoded % 60 == 0 {
+                    log::info!(
+                        "video_desktop: frame {} — in-flight {}, live textures {}",
+                        self.decoded,
+                        self.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+                        live_textures(),
+                    );
+                }
                 self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let guard = InFlight(std::sync::Arc::clone(&self.in_flight));
                 let at = self.pending.partition_point(|p| p.pts_us <= pts_us);
@@ -1035,8 +1052,23 @@ impl VideoDecoder {
 
 impl Drop for VideoDecoder {
     fn drop(&mut self) {
+        // Order matters: drop everything holding frames FIRST, then the surface,
+        // so the count below reflects what teardown actually released.
+        self.pending.clear();
         if let Some(id) = self.surface_id {
             surface_remove(id);
+        }
+        // Leak check at teardown. Anything left here is an imported frame nobody
+        // released — SCHEDULED entries not yet due are the only legitimate
+        // residue, and they drain on the next composite.
+        let left = live_textures();
+        if left > 0 {
+            log::info!(
+                "video_desktop: decoder closed — {left} imported texture(s) still live \
+                 (scheduled-but-not-yet-drawn; 0 after the next composite)"
+            );
+        } else {
+            log::info!("video_desktop: decoder closed — all imported textures released");
         }
     }
 }
