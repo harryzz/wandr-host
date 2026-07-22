@@ -25,11 +25,12 @@
 //! nothing. Add each codec when there is hardware to prove it on.
 //!
 //! OUTPUT TIERS (see the probe for the full write-up): tier 1 = zero-copy
-//! `export_prime` → DMA-buf, tier 2 = `vaDeriveImage`, tier 3 = `vaGetImage`
-//! copy. We consume tier 2 with a tier-3 fallback, because the `I420Ref` contract
-//! forces a CPU readback regardless of how the pixels got here. Tier 1's saving
-//! only materializes once the host consumes a texture directly — that is the
-//! zero-copy present path, not this crate.
+//! `export_prime` → DMA-buf, tier 2 = `vaDeriveImage` map, tier 3 = `vaGetImage`
+//! copy. We consume TIER 3, with tier 2 as the fallback — counter-intuitive, and
+//! measured: see `readback_i420`. The `I420Ref` contract forces a CPU readback
+//! regardless of how the pixels got here, so tier 1's saving only materialises
+//! once the host consumes a texture directly — that is the zero-copy present
+//! path, not this crate.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -269,28 +270,37 @@ struct DecodedI420 {
 
 /// Pull an NV12 VA surface into an owned I420 frame.
 ///
-/// Tier 2 (`derive_from`) first because it is a map rather than a copy, then the
-/// real tier 3 (`create_from` / vaGetImage). That fallback is load-bearing, not
-/// belt-and-braces: NVDEC decodes into CUDA memory and rejects `vaDeriveImage`
-/// outright, so on a whole vendor class vaGetImage is the only CPU readback there
-/// is. (We no longer have an NVDEC box, but the branch is cheap and its absence
-/// was a real bug once.)
+/// ‼️ TIER 3 (`create_from` / vaGetImage) FIRST, tier 2 (`derive_from`) only as a
+/// fallback — the opposite of what "a map beats a copy" suggests, and MEASURED,
+/// not assumed. `vaDeriveImage` on Intel hands back the surface's own memory,
+/// which is TILED: every CPU read walks a swizzled address pattern with no useful
+/// cache behaviour. `vaGetImage` costs a copy but the driver DETILES it, so the
+/// bytes we then touch are linear. MEASURED on Ivybridge/i965, 300 frames of
+/// 720p: 16.6 s via derive_from vs 1.15 s via create_from — 14x, and the
+/// difference between dropping 251 of 300 frames and running at ~260 fps.
+///
+/// This file originally had it the other way round, on the plausible-sounding
+/// reasoning that a map must beat a copy. It cost more than it saved and nothing
+/// in the frame counters showed it — only wall-clock did. The probe had used
+/// vaGetImage all along; the "optimization" was the regression.
+///
+/// The fallback direction still matters: NVDEC decodes into CUDA memory and
+/// rejects `vaGetImage`-style access patterns differently, so keeping both paths
+/// is what lets one backend serve drivers that disagree about which works at all.
 fn readback_i420(surface: &Surface<()>, w: u32, h: u32, pts_us: i64) -> Result<DecodedI420, CodecError> {
     let res = (w, h);
-    let image = match libva::Image::derive_from(surface, res) {
+    // vaGetImage needs an explicit target format; NV12 is what every VLD decoder
+    // here produces.
+    let mut fmt: libva::VAImageFormat = unsafe { std::mem::zeroed() };
+    fmt.fourcc = u32::from(Fourcc::from(b"NV12"));
+    fmt.byte_order = 1; // VA_LSB_FIRST
+    fmt.bits_per_pixel = 12;
+    let image = match libva::Image::create_from(surface, fmt, res, res) {
         Ok(img) => img,
-        Err(_) => {
-            // vaGetImage needs an explicit target format; NV12 is what every VLD
-            // decoder here produces.
-            let mut fmt: libva::VAImageFormat = unsafe { std::mem::zeroed() };
-            fmt.fourcc = u32::from(Fourcc::from(b"NV12"));
-            fmt.byte_order = 1; // VA_LSB_FIRST
-            fmt.bits_per_pixel = 12;
-            libva::Image::create_from(surface, fmt, res, res).map_err(|e| {
-                log::warn!("wandr-video: vaapi: derive_from and create_from both failed: {e:?}");
-                CodecError::BadFrame
-            })?
-        }
+        Err(_) => libva::Image::derive_from(surface, res).map_err(|e| {
+            log::warn!("wandr-video: vaapi: create_from and derive_from both failed: {e:?}");
+            CodecError::BadFrame
+        })?,
     };
     let va = *image.image();
     let data: &[u8] = image.as_ref();
