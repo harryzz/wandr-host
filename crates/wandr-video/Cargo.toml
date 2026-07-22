@@ -93,6 +93,18 @@ required-features = ["libvpx", "openh264"]
 name = "vaapi_hw"
 required-features = ["vaapi"]
 
+# Answers "does the backend pair timestamps to the right frames?", which needs a
+# container (an elementary stream has no PTS) — hence the mp4 dev-dependency and
+# the WANDR_TEST_MP4 sample. Skips without one.
+[[test]]
+name = "h264_pts_pairing"
+required-features = ["openh264"]
+
+[dev-dependencies]
+# Demux for the timestamp-pairing test ONLY. The crate itself never parses
+# containers — demux is guest-side by design (wasi-media-source/NOTES.md).
+mp4 = "0.14"
+
 # This crate is standalone (its own Cargo.lock), so it needs its own patch entry:
 # a `[patch]` in the host's Cargo.toml only covers builds that go through the
 # host. Same tree, so the two cannot diverge. See vendor/cros-codecs/WANDR-PATCHES.md

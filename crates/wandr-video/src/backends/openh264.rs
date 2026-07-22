@@ -8,15 +8,28 @@
 //! at a lower priority and win when present; this is what runs when they don't.
 //!
 //! ‼️ PTS AND B-FRAMES. OpenH264's decoder does NOT hand a per-frame timestamp
-//! back (unlike libvpx's `user_priv`), so we pair decoded frames to input PTS
-//! with a FIFO. That is correct ONLY while decode order == presentation order,
-//! i.e. NO B-frames. Our own encoder is configured `CameraVideoRealTime`
-//! (low-latency, no B-frames), so the round-trip is sound. A real H.264 *file*
-//! can contain
-//! B-frames, where decode order != presentation order and the FIFO would
-//! mispair — that reorder buffer is the next sub-step (task 117 M2 step 2b),
-//! gated behind a real file + demuxer. Until then this backend asserts its
-//! streams are B-frame-free by construction.
+//! back (unlike libvpx's `user_priv`): the `openh264` crate zeroes an
+//! `SBufferInfo` on every decode and never sets `uiInBsTimeStamp` as an input, so
+//! `DecodedYUV::timestamp()` echoes nothing we supplied — its own source carries a
+//! "TODO: Is this the right one?" on that line. The timestamp must therefore be
+//! re-attached on our side.
+//!
+//! This used to be a FIFO — i-th input timestamp to the i-th output frame — which
+//! is correct ONLY while decode order == presentation order (no B-frames). Fed a
+//! real MP4 it MISPAIRED 102 of 300 frames (tests/h264_pts_pairing.rs), and the
+//! failure was invisible: the host sorts decoded frames by the timestamp the codec
+//! reports (`video_desktop.rs::queue_decoded`), so mispaired timestamps produce a
+//! perfectly ascending stream showing pictures in the WRONG ORDER, with every
+//! counter reading clean.
+//!
+//! The fix is the pairing every player uses for a codec without timestamp
+//! passthrough: openh264 (with `Flush::NoFlush`) emits in DISPLAY order, and the
+//! display-order sequence of presentation times is by definition the SORTED
+//! sequence of the submitted ones — so each output frame takes the SMALLEST
+//! outstanding timestamp, not the oldest. That is exact whenever enough input is
+//! in flight to cover the stream's reorder depth, which the decode-ahead cushion
+//! already guarantees. It also makes the elementary-stream case behave: bitstream-
+//! ordered tags sort back into the same ascending sequence they had.
 
 use std::collections::VecDeque;
 
@@ -183,9 +196,11 @@ struct DecodedFrame {
 
 pub struct H264Decoder {
     dec: OhDecoder,
-    /// Input PTS awaiting a decoded frame. Valid pairing ONLY without B-frames
-    /// (decode order == presentation order) — see the module note.
-    pts_fifo: VecDeque<i64>,
+    /// Submitted timestamps not yet handed to a frame, kept ASCENDING. Sorted
+    /// rather than FIFO because the codec emits in display order — see the module
+    /// note. A Vec beats a heap here: it holds one reorder window (single digits),
+    /// and the error path needs to remove an arbitrary element.
+    pts_pending: Vec<i64>,
     /// Frames decoded since the last drain, oldest first.
     out: VecDeque<DecodedFrame>,
     /// The frame the most recent `next_frame` returned — kept alive so its borrow
@@ -217,12 +232,20 @@ impl H264Decoder {
         )?;
         Ok(Self {
             dec,
-            pts_fifo: VecDeque::new(),
+            pts_pending: Vec::new(),
             out: VecDeque::new(),
             current: None,
         })
     }
 
+    /// The smallest outstanding submitted timestamp — the presentation time of the
+    /// next frame in DISPLAY order. See the module note for why this, not FIFO.
+    fn take_smallest_pts(&mut self) -> i64 {
+        if self.pts_pending.is_empty() {
+            return 0;
+        }
+        self.pts_pending.remove(0)
+    }
 }
 
 /// Copy a `DecodedYUV` into an owned, tightly-packed I420 frame (pts unset). Free
@@ -247,7 +270,8 @@ fn copy_i420(yuv: &openh264::decoder::DecodedYUV<'_>) -> DecodedFrame {
 
 impl Decoder for H264Decoder {
     fn decode(&mut self, chunk: crate::Chunk<'_>) -> Result<(), CodecError> {
-        self.pts_fifo.push_back(chunk.timestamp_us);
+        let at = self.pts_pending.partition_point(|&p| p <= chunk.timestamp_us);
+        self.pts_pending.insert(at, chunk.timestamp_us);
         // ‼️ Feed NAL-BY-NAL. OpenH264's `decode_frame_no_delay` processes ONE NAL
         // per call: handed a whole access unit (SPS+PPS+slice, or a multi-slice
         // frame) it consumes only the first NAL and the rest report
@@ -267,11 +291,15 @@ impl Decoder for H264Decoder {
             }
         }
         if let Some(mut f) = frame {
-            f.pts_us = self.pts_fifo.pop_front().unwrap_or(0);
+            f.pts_us = self.take_smallest_pts();
             self.out.push_back(f);
             Ok(())
         } else if errored {
-            self.pts_fifo.pop_back(); // this access unit produced nothing
+            // This access unit produced nothing, so retract ITS timestamp — not
+            // the smallest, which belongs to a picture still in flight.
+            if let Some(i) = self.pts_pending.iter().position(|&p| p == chunk.timestamp_us) {
+                self.pts_pending.remove(i);
+            }
             Err(CodecError::BadFrame)
         } else {
             // No frame yet (headers only, or reorder delay) — PTS stays queued.
@@ -290,7 +318,7 @@ impl Decoder for H264Decoder {
             }
         };
         for mut f in frames {
-            f.pts_us = self.pts_fifo.pop_front().unwrap_or(0);
+            f.pts_us = self.take_smallest_pts();
             self.out.push_back(f);
         }
         Ok(())
