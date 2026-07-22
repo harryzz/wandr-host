@@ -19,3 +19,9 @@ pub mod libde265;
 
 #[cfg(feature = "dav1d")]
 pub mod dav1d;
+
+// The first HARDWARE backend. Linux-only by construction (VA-API is a Linux API)
+// and additionally excluded on Android, which reaches its HW codecs through
+// MediaCodec and never links a codec library.
+#[cfg(all(feature = "vaapi", target_os = "linux", not(target_os = "android")))]
+pub mod vaapi;

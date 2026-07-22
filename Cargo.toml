@@ -187,6 +187,16 @@ rsbinder-aidl = { git = "https://github.com/hiking90/rsbinder", rev = "5e999e04a
 rsbinder      = { path = "crates/rsbinder/rsbinder" }
 rsbinder-aidl = { path = "crates/rsbinder/rsbinder-aidl" }
 
+# Task 117 M2 stage 3 — VA-API HW decode (crates/wandr-video, feature `vaapi`).
+# cros-codecs 0.0.6 keeps the decoded handle's VA surface `pub(crate)`, which
+# leaves NO public route to decoded pixels for a custom VA-allocated VideoFrame;
+# vendor/cros-codecs widens it, plus fixes a hardcoded 16x16 placeholder context
+# that panics on drivers with a higher decode minimum. Both changes are marked
+# `wandr patch` in-source and documented in vendor/cros-codecs/WANDR-PATCHES.md.
+# Inert unless the `vaapi` feature is on (Linux desktop only).
+[patch.crates-io]
+cros-codecs = { path = "vendor/cros-codecs" }
+
 [features]
 # wasi-canvas default-on since the dioxus-canvas migration (stage 1):
 # additive linker entries, nothing else notices. Disable with
@@ -213,6 +223,14 @@ wasi-canvas = []
 # route through `guest_call!` (block_on(call_async)) when this is on; proven in
 # repros/cma-cross-call-spike (sync apps coexist unchanged on the same engine).
 p3-async = ["wasmtime/component-model-async", "wasmtime-wasi/p3", "wasmtime-wasi-tls/p3", "tokio/time"]
+# Task 117 M2 stage 3 — HARDWARE H.264 decode via VA-API. LINUX DESKTOP ONLY, and
+# off by default because it is the one codec feature that links a SYSTEM library
+# (libva.so): without libva headers the build fails, which must never happen to
+# someone who just wants a host. `scripts/build-host-linux.sh` PROBES for libva
+# and enables this only when it is actually there. With it compiled in but no
+# usable VA driver at runtime, the backend probes, declines, and software decodes
+# exactly as before — so enabling it can slow nothing down and break nothing.
+vaapi = ["wandr-video/vaapi"]
 
 [package.metadata.android]
 package = "com.example.wasmruntime"

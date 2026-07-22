@@ -302,6 +302,11 @@ impl Default for Registry {
 /// it never enters the registry — the "load failure" fallback path.
 pub fn default_registry() -> Registry {
     let mut r = Registry::new();
+    // HARDWARE FIRST (priority 10) — but only registered, never assumed: the
+    // backend probes the driver in `supports_decode` and declines at `open` if it
+    // cannot actually decode, so the software backends below stay the fallback.
+    #[cfg(all(feature = "vaapi", target_os = "linux", not(target_os = "android")))]
+    r.register(Box::new(backends::vaapi::VaapiBackend));
     #[cfg(feature = "libvpx")]
     r.register(Box::new(backends::libvpx::LibvpxBackend));
     #[cfg(feature = "openh264")]
@@ -312,8 +317,9 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(backends::libde265::Libde265Backend));
     #[cfg(feature = "dav1d")]
     r.register(Box::new(backends::dav1d::Dav1dBackend));
-    // Future: HW backends register here at priority < 100, and oxideav slots in
-    // as just another software (or HW-bridge) backend once it is ready.
+    // Future HW backends (VideoToolbox / MediaFoundation) register alongside
+    // vaapi at priority < 100, and oxideav slots in as just another software
+    // backend once it is ready.
     r
 }
 

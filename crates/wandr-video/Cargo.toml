@@ -29,6 +29,14 @@ libde265 = ["dep:libde265"]
 # BSD-2 = task 117's permissive-static tier (cleaner than HEVC's LGPL). Decode
 # only; Android decodes AV1 in MediaCodec HW so this stays desktop-only.
 dav1d = ["dep:dav1d"]
+# HARDWARE H.264 decode via VA-API (task 117 M2 stage 3) — the first HW backend.
+# OFF by default and deliberately so: unlike every other feature here, this one
+# links the SYSTEM libva (`libva.so`, via cros-libva), so enabling it makes the
+# host unbuildable without libva headers and unrunnable without the runtime .so.
+# The Linux build script turns it on; Android (MediaCodec) and Windows/macOS
+# never do. A machine with the feature compiled in but no usable VA driver is
+# fine — the backend probes and declines, and software decodes as before.
+vaapi = ["dep:cros-codecs", "dep:libva"]
 
 [dependencies]
 # libvpx (BSD-3), built from vendor/libvpx and linked statically by wandr-vpx-sys.
@@ -56,6 +64,15 @@ yuv = "0.8"
 fast_image_resize = "6.0"
 log = "0.4"
 
+# VA-API HW decode (feature `vaapi`). cros-codecs supplies the H.264 parser +
+# DPB/reference management; cros-libva is the VA binding. Both are Linux-only, so
+# they sit in a target table — the Android cross-build and Windows/macOS do not
+# even resolve them. Pinned to the versions repros/vaapi-decode-probe verified on
+# real hardware (300/300, checked on pixels).
+[target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
+cros-codecs = { version = "0.0.6", features = ["vaapi"], optional = true }
+libva = { package = "cros-libva", version = "0.0.12", optional = true }
+
 # The round-trip tests need a real codec, so they are skipped by a bare
 # `cargo test` rather than failing it.
 [[test]]
@@ -69,3 +86,16 @@ required-features = ["libvpx"]
 [[test]]
 name = "h264"
 required-features = ["libvpx", "openh264"]
+
+# Needs a GPU and a real Annex-B sample (WANDR_TEST_H264), so it SKIPS rather than
+# fails where either is missing — see the test's own header.
+[[test]]
+name = "vaapi_hw"
+required-features = ["vaapi"]
+
+# This crate is standalone (its own Cargo.lock), so it needs its own patch entry:
+# a `[patch]` in the host's Cargo.toml only covers builds that go through the
+# host. Same tree, so the two cannot diverge. See vendor/cros-codecs/WANDR-PATCHES.md
+# for what is patched and why.
+[patch.crates-io]
+cros-codecs = { path = "../../vendor/cros-codecs" }

@@ -52,7 +52,7 @@ jobs:
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev \
             libasound2-dev libpulse-dev libfontconfig1-dev clang ninja-build \
-            pkg-config nasm meson
+            pkg-config nasm meson libva-dev
           # dav1d (AV1, BSD-2) builds from source via meson; tell dav1d-sys to do
           # so statically instead of looking for a system .so. (meson+ninja+nasm
           # above are its toolchain.)
@@ -120,11 +120,27 @@ jobs:
       # p3-async). It is NOT in `default`, so a plain `cargo build` yields a host with no
       # WASI 0.3 surface — guests importing wasi:sockets@0.3.0 then fail to instantiate
       # with "resource implementation is missing".
+      # `vaapi` (HW H.264 decode) is Linux-only — it links the system libva, which
+      # only the Linux leg installs. It matches what scripts/build-host-linux.sh
+      # enables when it detects libva, so CI compiles the code that ships rather
+      # than a configuration nobody runs. Runners have no GPU, so this is a
+      # COMPILE check: at runtime the backend probes, finds no VA driver, and
+      # declines to software — which is itself the fallback path working.
       - name: Build
+        if: runner.os != 'Linux'
         run: cargo build --release --locked --features p3-async
 
+      - name: Build (Linux, +vaapi)
+        if: runner.os == 'Linux'
+        run: cargo build --release --locked --features p3-async,vaapi
+
       - name: Test
+        if: runner.os != 'Linux'
         run: cargo test --release --locked --features p3-async --no-run
+
+      - name: Test (Linux, +vaapi)
+        if: runner.os == 'Linux'
+        run: cargo test --release --locked --features p3-async,vaapi --no-run
 
       - uses: actions/upload-artifact@v4
         with:

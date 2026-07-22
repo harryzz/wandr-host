@@ -26,6 +26,23 @@ cd "$REPO_ROOT"
 # SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always tells dav1d-sys to build the vendored
 # dav1d statically instead of looking for a system .so via pkg-config.
 export SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always
+
+# Task 117 M2 stage 3: HW H.264 decode via VA-API. Unlike the codecs above this
+# one links the SYSTEM libva, so it is enabled only when libva is actually
+# installed — PROBED, never assumed, so a box without it still gets a working
+# (software-decoding) host instead of a build failure. VAAPI=0 forces it off;
+# VAAPI=1 forces it on and lets the build fail loudly if libva is missing.
+case "${VAAPI:-auto}" in
+  0) echo "VA-API HW decode: disabled (VAAPI=0)" ;;
+  1) FEATURES+=(--features vaapi); echo "VA-API HW decode: forced ON (VAAPI=1)" ;;
+  *) if pkg-config --exists libva libva-drm 2>/dev/null; then
+       FEATURES+=(--features vaapi)
+       echo "VA-API HW decode: ENABLED (libva $(pkg-config --modversion libva) found)"
+     else
+       echo "VA-API HW decode: skipped (no libva — install libva-dev to enable)"
+     fi ;;
+esac
+
 echo "Building wandr-host for $TARGET (release${P3:+, p3-async=$P3}) …"
 cargo build --release --target "$TARGET" "${FEATURES[@]}"
 
