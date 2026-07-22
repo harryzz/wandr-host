@@ -66,7 +66,8 @@ fn codec_of(c: Codec) -> wandr_video::Codec {
 /// SurfaceView child surfaces. z-layer (behind/above-ui) isn't distinguished yet:
 /// everything composites above the UI.
 struct VideoSurface {
-    rgba: Vec<u8>, // tightly-packed RGBA8888, w*h*4 (empty until the first frame)
+    /// `None` until the first frame. GPU textures or CPU RGBA — see SurfaceContent.
+    content: Option<SurfaceContent>,
     w: u32,
     h: u32,
     rect: VideoRect,
@@ -87,6 +88,100 @@ thread_local! {
 /// Composite every visible video surface onto `canvas` — called by the
 /// wasi:canvas host `present` AFTER the guest UI (above-ui) and before swap.
 /// Rects are absolute surface pixels.
+
+/// Turn a surface's content into something Skia can draw.
+///
+/// GPU frames need a `DirectContext`, which `Canvas::direct_context()` supplies
+/// — and returns `None` on the headless RASTER surface that every video
+/// diagnostic and `--run-once` use. That `None` is exactly the runtime gate: no
+/// GPU context, no GPU path, and the CPU lane serves as it always did.
+fn image_for(
+    canvas: &skia_safe::Canvas,
+    content: &SurfaceContent,
+    w: u32,
+    h: u32,
+) -> Option<skia_safe::Image> {
+    match content {
+        SurfaceContent::Rgba(rgba) => {
+            let info = skia_safe::ImageInfo::new(
+                (w as i32, h as i32),
+                skia_safe::ColorType::RGBA8888,
+                skia_safe::AlphaType::Unpremul,
+                None,
+            );
+            let data = skia_safe::Data::new_copy(rgba);
+            skia_safe::images::raster_from_data(&info, data, (w * 4) as usize)
+        }
+        SurfaceContent::Texture(tref) => {
+            let mut ctx = canvas.direct_context()?;
+            let (y_tex, uv_tex) =
+                TEXTURES.with(|m| m.borrow().get(&tref.0).map(|t| (t.y_tex, t.uv_tex)))?;
+            // NV12 as two planes: R8 luma, RG8 interleaved chroma. Skia does the
+            // YUV->RGB itself from the YUVAInfo we hand it — which is the whole
+            // reason for the two-texture shape. The alternative
+            // (GL_TEXTURE_EXTERNAL_OES) can only pass colour as an EGL *hint*
+            // that drivers ignore, defaulting to BT.601 limited whatever the
+            // content is.
+            const GL_TEXTURE_2D: u32 = 0x0DE1;
+            const GL_R8: u32 = 0x8229;
+            const GL_RG8: u32 = 0x822B;
+            let planes = [(y_tex, GL_R8, w, h), (uv_tex, GL_RG8, w.div_ceil(2), h.div_ceil(2))];
+            let textures: Vec<skia_safe::gpu::BackendTexture> = planes
+                .iter()
+                .map(|&(id, fmt, pw, ph)| {
+                    let info = skia_safe::gpu::gl::TextureInfo {
+                        target: GL_TEXTURE_2D,
+                        id,
+                        format: fmt,
+                        protected: skia_safe::gpu::Protected::No,
+                    };
+                    // SAFETY: `t` owns these texture names and outlives the image
+                    // we build from them (it is held by the surface).
+                    unsafe {
+                        skia_safe::gpu::ganesh::gl::backend_textures::make_gl(
+                            (pw as i32, ph as i32),
+                            skia_safe::gpu::Mipmapped::No,
+                            info,
+                            "wandr-video-plane",
+                        )
+                    }
+                })
+                .collect();
+
+            // ‼️ BT.601 LIMITED is the H.264 SD/HD default and what these VLD
+            // decoders emit; it also matches `convert.rs`, so the two lanes agree.
+            // The RIGHT source is the stream's VUI (colour_primaries /
+            // matrix_coefficients / video_full_range_flag) — carrying that through
+            // is a follow-up, and until then this is a documented assumption
+            // rather than a silent one.
+            let yuva = skia_safe::YUVAInfo::new(
+                (w as i32, h as i32),
+                skia_safe::yuva_info::PlaneConfig::Y_UV,
+                skia_safe::yuva_info::Subsampling::S420,
+                skia_safe::YUVColorSpace::Rec601_Limited,
+                None,
+                None,
+            )?;
+            let backend = skia_safe::gpu::YUVABackendTextures::new(
+                &yuva,
+                &textures,
+                skia_safe::gpu::SurfaceOrigin::TopLeft,
+            )?;
+            let img = skia_safe::gpu::ganesh::images::texture_from_yuva_textures(
+                &mut ctx, &backend, None,
+            );
+            // Skia caches GL binding state; our raw GL in video_gl.rs bound and
+            // unbound textures behind its back, so tell it to re-read. Skipping
+            // this makes the NEXT Skia draw sample whatever we left bound —
+            // intermittent, and invisible to every frame counter. The targeted
+            // call rather than a full `reset`, because texture bindings are the
+            // only state video_gl touches.
+            ctx.reset_gl_texture_bindings();
+            img
+        }
+    }
+}
+
 pub fn composite_video_surfaces(canvas: &skia_safe::Canvas) {
     // Paint any guest-scheduled frames that have come due (task 117 M2). This
     // runs before compositing so a frame scheduled for "now" appears in THIS
@@ -94,20 +189,11 @@ pub fn composite_video_surfaces(canvas: &skia_safe::Canvas) {
     drain_scheduled();
     SURFACES.with(|m| {
         for s in m.borrow().values() {
-            if !s.visible || s.rgba.is_empty() || s.rect.w <= 0 || s.rect.h <= 0 {
+            let Some(content) = s.content.as_ref() else { continue };
+            if !s.visible || content.is_empty() || s.rect.w <= 0 || s.rect.h <= 0 {
                 continue;
             }
-            let info = skia_safe::ImageInfo::new(
-                (s.w as i32, s.h as i32),
-                skia_safe::ColorType::RGBA8888,
-                skia_safe::AlphaType::Unpremul,
-                None,
-            );
-            let data = skia_safe::Data::new_copy(&s.rgba);
-            let Some(img) = skia_safe::images::raster_from_data(&info, data, (s.w * 4) as usize)
-            else {
-                continue;
-            };
+            let Some(img) = image_for(canvas, content, s.w, s.h) else { continue };
             let dst = skia_safe::Rect::from_xywh(
                 s.rect.x as f32, s.rect.y as f32, s.rect.w as f32, s.rect.h as f32,
             );
@@ -141,7 +227,7 @@ fn alloc_surface(rect: VideoRect, mirror: bool, rotation: u32) -> u32 {
     });
     SURFACES.with(|m| {
         m.borrow_mut().insert(id, VideoSurface {
-            rgba: Vec::new(), w: 0, h: 0, rect, visible: true, mirror, rotation,
+            content: None, w: 0, h: 0, rect, visible: true, mirror, rotation,
         });
     });
     id
@@ -149,9 +235,18 @@ fn alloc_surface(rect: VideoRect, mirror: bool, rotation: u32) -> u32 {
 
 /// Update a surface's pixels (from the encoder capture / decoder output).
 fn surface_set_frame(id: u32, rgba: Vec<u8>, w: u32, h: u32) {
+    surface_set_content(id, SurfaceContent::Rgba(rgba), w, h);
+}
+
+/// ‼️ Silently no-ops on an unknown id, and `SURFACES` is THREAD-LOCAL — so a
+/// decoder driven from another thread would make video vanish with no error.
+/// `VideoDecoder` is `Send` (the wasmtime ResourceTable requires it), so nothing
+/// stops that at compile time. The host runs single-threaded on the winit loop;
+/// this comment is the guard rail.
+fn surface_set_content(id: u32, content: SurfaceContent, w: u32, h: u32) {
     SURFACES.with(|m| {
         if let Some(s) = m.borrow_mut().get_mut(&id) {
-            s.rgba = rgba;
+            s.content = Some(content);
             s.w = w;
             s.h = h;
         }
@@ -402,6 +497,72 @@ impl VideoEncoder {
 
 // ── decoder (decode-to-surface, or decode-to-buffer when rect is empty) ───────
 
+/// What a video surface currently holds.
+///
+/// Two variants because BOTH are legitimate end states, chosen at RUNTIME: a
+/// hardware frame imported straight into GL textures (zero CPU copies), or CPU
+/// RGBA — which is what software decode produces, what the readback fallback
+/// produces, and what the camera self-view genuinely is. It cannot be a compile
+/// -time choice: `canvas.direct_context()` is `None` on the headless raster
+/// surface every diagnostic uses, so the CPU lane must stay reachable.
+pub(crate) enum SurfaceContent {
+    /// An imported GPU frame, by ID into the thread-local texture registry.
+    ///
+    /// ‼️ AN ID, NOT THE TEXTURE ITSELF, and the compiler is what forced it: a
+    /// `TakenFrame` goes into the wasmtime `ResourceTable`, which requires
+    /// `Send`, and GL objects are only valid on the thread holding the context.
+    /// `unsafe impl Send` would have compiled and then run `glDeleteTextures` on
+    /// whatever thread dropped the frame — undefined behaviour, intermittently.
+    /// Carrying a `u64` keeps every GL object strictly thread-local; the worst a
+    /// wrong-thread drop can now do is leak, loudly.
+    Texture(TextureRef),
+    Rgba(Vec<u8>),
+}
+
+thread_local! {
+    /// Imported GPU frames, owned here so no GL object ever crosses threads.
+    static TEXTURES: RefCell<std::collections::HashMap<u64, crate::video_gl::TextureFrame>> =
+        RefCell::new(std::collections::HashMap::new());
+    static TEXTURE_NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// Owns one entry in the thread-local texture registry; frees it on drop.
+/// Move-only, because exactly one place owns a frame at a time as it travels
+/// pending -> taken -> surface.
+pub(crate) struct TextureRef(u64);
+
+impl TextureRef {
+    fn insert(t: crate::video_gl::TextureFrame) -> Self {
+        let id = TEXTURE_NEXT.with(|n| {
+            let v = n.get();
+            n.set(v.wrapping_add(1));
+            v
+        });
+        TEXTURES.with(|m| m.borrow_mut().insert(id, t));
+        TextureRef(id)
+    }
+}
+
+impl Drop for TextureRef {
+    fn drop(&mut self) {
+        // A miss means this dropped on a thread that never held the textures —
+        // impossible today (single-threaded host) but worth not being silent.
+        let found = TEXTURES.with(|m| m.borrow_mut().remove(&self.0)).is_some();
+        if !found {
+            log::warn!("video_desktop: texture {} dropped off-thread — GL objects LEAKED", self.0);
+        }
+    }
+}
+
+impl SurfaceContent {
+    fn is_empty(&self) -> bool {
+        match self {
+            SurfaceContent::Texture(_) => false,
+            SurfaceContent::Rgba(v) => v.is_empty(),
+        }
+    }
+}
+
 /// Total decoded-frame memory one decoder may have outstanding.
 ///
 /// Bounded in BYTES, not frames, so the answer is resolution-independent: a 4K
@@ -436,7 +597,7 @@ impl Drop for InFlight {
 /// A decoded frame waiting for its presentation time (playback mode only).
 struct PendingFrame {
     pts_us: i64,
-    rgba: Vec<u8>,
+    content: SurfaceContent,
     w: u32,
     h: u32,
     /// Released when this frame's memory is, wherever it ends up.
@@ -452,7 +613,7 @@ struct PendingFrame {
 /// lifetime independent of the decoder's borrow.
 pub struct TakenFrame {
     pts_us: i64,
-    rgba: Vec<u8>,
+    content: SurfaceContent,
     w: u32,
     h: u32,
     surface_id: Option<u32>,
@@ -471,7 +632,7 @@ impl TakenFrame {
     /// counted-and-dropped diagnostic path and presenting is a no-op.
     pub fn present_now(self) {
         if let Some(id) = self.surface_id {
-            surface_set_frame(id, self.rgba, self.w, self.h);
+            surface_set_content(id, self.content, self.w, self.h);
         }
     }
 }
@@ -738,20 +899,43 @@ impl VideoDecoder {
             self.decoded += 1;
             let (w, h) = f.dimensions();
             let pts_us = f.timestamp_us();
-            let mut rgba = Vec::new();
             let mut scratch = std::mem::take(&mut self.gpu_scratch);
-            let converted = match f.as_i420() {
-                Some(i420) => wandr_video::i420_to_rgba(i420, &mut rgba).is_ok(),
-                // GPU frame: materialise for now. Step 3 replaces this branch
-                // with an EGL/GL import so the pixels never reach the CPU — the
-                // readback here is what makes step 2 behaviour-neutral.
-                None => f
-                    .read_i420(&mut scratch)
-                    .map(|i420| wandr_video::i420_to_rgba(&i420, &mut rgba).is_ok())
-                    .unwrap_or(false),
+            let content = match f.into_gpu() {
+                // ZERO-COPY: the decoded frame is still in GPU memory. Import it
+                // as two GL textures and never touch a pixel. Import is attempted
+                // here rather than at composite time so a failure falls back to
+                // the readback while we still hold the frame.
+                Ok(gpu) => match crate::video_gl::import_nv12(gpu) {
+                    Ok(t) => Some(SurfaceContent::Texture(TextureRef::insert(t))),
+                    // Import unavailable or refused — no GL context (every
+                    // headless diagnostic), no extension, or a modifier we cannot
+                    // describe. The frame comes BACK, so read it out the same way
+                    // a CPU frame is materialised. Without this the diagnostics
+                    // decode 300 frames and present none.
+                    Err(gpu) => {
+                        let f = wandr_video::Frame::gpu(gpu);
+                        let mut rgba = Vec::new();
+                        let ok = f
+                            .read_i420(&mut scratch)
+                            .map(|i420| wandr_video::i420_to_rgba(&i420, &mut rgba).is_ok())
+                            .unwrap_or(false);
+                        ok.then_some(SurfaceContent::Rgba(rgba))
+                    }
+                },
+                Err(cpu) => {
+                    let mut rgba = Vec::new();
+                    let ok = match cpu.as_i420() {
+                        Some(i420) => wandr_video::i420_to_rgba(i420, &mut rgba).is_ok(),
+                        None => cpu
+                            .read_i420(&mut scratch)
+                            .map(|i420| wandr_video::i420_to_rgba(&i420, &mut rgba).is_ok())
+                            .unwrap_or(false),
+                    };
+                    ok.then_some(SurfaceContent::Rgba(rgba))
+                }
             };
             self.gpu_scratch = scratch;
-            if converted {
+            if let Some(content) = content {
                 // Insert in PTS order — this makes `pending` a reorder buffer.
                 // Codecs with B-frames (H.264/H.265) emit in DECODE order, so
                 // frames arrive out of presentation order; `present_due` needs the
@@ -774,7 +958,7 @@ impl VideoDecoder {
                 self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let guard = InFlight(std::sync::Arc::clone(&self.in_flight));
                 let at = self.pending.partition_point(|p| p.pts_us <= pts_us);
-                self.pending.insert(at, PendingFrame { pts_us, rgba, w, h, _in_flight: guard });
+                self.pending.insert(at, PendingFrame { pts_us, content, w, h, _in_flight: guard });
             }
         }
     }
@@ -791,7 +975,7 @@ impl VideoDecoder {
         let f = self.pending.pop_front()?;
         Some(TakenFrame {
             pts_us: f.pts_us,
-            rgba: f.rgba,
+            content: f.content,
             w: f.w,
             h: f.h,
             surface_id: self.surface_id,
@@ -817,7 +1001,7 @@ impl VideoDecoder {
         }
         let f = chosen?;
         if let Some(id) = self.surface_id {
-            surface_set_frame(id, f.rgba, f.w, f.h);
+            surface_set_content(id, f.content, f.w, f.h);
         }
         Some(f.pts_us)
     }

@@ -692,6 +692,11 @@ impl SkiaRenderer {
             glutin::surface::SwapInterval::DontWait,
         );
 
+        // Hand the EGL display to the zero-copy video import BEFORE skia takes
+        // over: this is the only place that has the glutin display, and the only
+        // thread where the context is ever made current.
+        crate::video_gl::register(&gl_display);
+
         let interface = skia_safe::gpu::gl::Interface::new_load_with(|name| {
             let Ok(cname) = std::ffi::CString::new(name) else { return std::ptr::null() };
             gl_display.get_proc_address(cname.as_c_str())

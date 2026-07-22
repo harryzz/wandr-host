@@ -45,6 +45,9 @@ pub mod video;
 // crate); android uses NDK/MediaCodec.
 #[cfg(not(target_os = "android"))]
 pub mod video_desktop;
+// Zero-copy DMA-buf -> GL import for hardware-decoded frames (desktop only).
+#[cfg(not(target_os = "android"))]
+pub mod video_gl;
 mod video_host_impl;
 mod events_host_impl;
 mod notify_host_impl;
