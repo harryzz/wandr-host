@@ -100,6 +100,12 @@ required-features = ["vaapi"]
 name = "h264_pts_pairing"
 required-features = ["openh264"]
 
+# Frame-exact colour-matrix check (601 vs 709 on ONE decoded frame). Needs a
+# container for a real frame; software decode, so no GPU. Skips without the MP4.
+[[test]]
+name = "color_matrix"
+required-features = ["openh264"]
+
 [dev-dependencies]
 # Demux for the timestamp-pairing test ONLY. The crate itself never parses
 # containers — demux is guest-side by design (wasi-media-source/NOTES.md).
