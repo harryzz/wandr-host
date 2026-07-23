@@ -722,6 +722,23 @@ pub fn schedule_present(at_ns: u64, frame: TakenFrame) {
     });
 }
 
+/// Time until the next scheduled video frame is due, or `None` when nothing is
+/// scheduled. The desktop render loop folds this into its wake deadline so VIDEO
+/// advances on its OWN timeline — independent of whether the guest's frame-pacing
+/// asks for a redraw. Without it, a player that idles its UI while video plays
+/// (the normal case — the picture changes, the controls do not) would sleep
+/// through its own frames: `on_frame` would not run, so nothing would present,
+/// so `drain_scheduled` would never draw the due frame. This makes the video rect
+/// an independent damage source, which is exactly what browsers do to keep a
+/// promoted video advancing without re-rendering the page.
+#[cfg(not(target_os = "android"))]
+pub fn time_until_next_scheduled() -> Option<std::time::Duration> {
+    // SCHEDULED is sorted by deadline, so the front is the earliest.
+    let earliest = SCHEDULED.with(|s| s.borrow().first().map(|(t, _)| *t))?;
+    let now = crate::host_clock::now_ns();
+    Some(std::time::Duration::from_nanos(earliest.saturating_sub(now)))
+}
+
 /// Paint every scheduled frame whose deadline has passed. Called once per host
 /// frame from `composite_video_surfaces`.
 ///

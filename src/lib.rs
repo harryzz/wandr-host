@@ -996,6 +996,14 @@ impl ApplicationHandler for App {
         if self.bg_tick.is_some() {
             wake = wake.min(self.bg_tick_at);
         }
+        // Video paces itself: a scheduled frame's deadline is a wake source in
+        // its own right, so playback advances even when the guest's UI is idle
+        // and its frame-pacing asks for nothing. Without this the video would
+        // freeze the moment the guest stopped requesting redraws.
+        #[cfg(not(target_os = "android"))]
+        if let Some(d) = crate::video_desktop::time_until_next_scheduled() {
+            wake = wake.min(now + d);
+        }
         if now >= wake {
             if let Some(w) = &self.window { w.request_redraw(); }
         }
