@@ -1088,6 +1088,19 @@ impl VideoDecoder {
             surface_with(id, |s| s.rect = rect);
         }
     }
+    /// Where the video is actually composited — the surface's current rect, or
+    /// `None` before the first frame (decode-to-buffer has no surface). Today the
+    /// compositor stretches to this rect, so it equals what `set_rect` requested;
+    /// once aspect-correct letterboxing lands, this reports the corrected rect and
+    /// callers need no change.
+    pub fn presented_rect(&self) -> Option<VideoRect> {
+        let id = self.surface_id?;
+        SURFACES.with(|m| {
+            m.borrow().get(&id).and_then(|s| {
+                (s.content.is_some() && s.rect.w > 0 && s.rect.h > 0).then_some(s.rect)
+            })
+        })
+    }
     pub fn set_visible(&mut self, visible: bool) {
         if let Some(id) = self.surface_id {
             surface_with(id, |s| s.visible = visible);

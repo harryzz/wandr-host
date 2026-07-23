@@ -1196,6 +1196,14 @@ mod android {
             self.apply_geometry();
         }
 
+        /// Where the video is placed. On Android the compositor is SurfaceFlinger
+        /// and geometry is applied at the layer, so the guest-facing rect is the
+        /// one the guest requested (the panel-space transform is the device's
+        /// business, not the guest's). `None` until a frame has decoded.
+        pub fn presented_rect(&self) -> Option<super::VideoRect> {
+            (self.slot.is_some() && self.decoded > 0).then_some(self.guest_rect)
+        }
+
         /// Update the peer's CVO rotation live (no codec reconfigure — rotation
         /// is applied at the SF layer).
         pub fn set_rotation(&mut self, degrees: u32) {

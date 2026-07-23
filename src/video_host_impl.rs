@@ -265,6 +265,19 @@ impl wit::decoder::HostVideoDecoder for HostState {
         st.0.submit(&frame.data, frame.timestamp).map_err(err2w)
     }
 
+    fn presented_rect(&mut self, self_: Resource<DecoderState>) -> Option<wit::types::VideoRect> {
+        let r = self.table.get(&self_).ok()?.0.presented_rect()?;
+        // WIT video-rect is u32; the internal rect is i32 (an off-screen rect can
+        // be negative). Clamp at the boundary — a placed rect the guest can act on
+        // is on-screen by construction.
+        Some(wit::types::VideoRect {
+            x: r.x.max(0) as u32,
+            y: r.y.max(0) as u32,
+            width: r.w.max(0) as u32,
+            height: r.h.max(0) as u32,
+        })
+    }
+
     fn set_rect(&mut self, self_: Resource<DecoderState>, rect: wit::types::VideoRect) {
         if let Ok(st) = self.table.get_mut(&self_) {
             st.0.set_rect(rect2b(rect));
