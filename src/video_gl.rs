@@ -87,6 +87,19 @@ const DRM_FORMAT_GR88: u32 = u32::from_le_bytes(*b"GR88");
 const DRM_FORMAT_NV12: u32 = u32::from_le_bytes(*b"NV12");
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
+/// The plane's dma-buf as an EGL attribute (a raw fd). Unix-only: dma-buf import
+/// is a Linux concept, and on Windows `import_nv12` returns `Err` at its EGL
+/// guard before this is ever reached (there is no dma-buf import extension), so
+/// the non-unix arm is genuinely unreachable — it exists only to compile.
+#[cfg(unix)]
+fn plane_raw_fd(f: &std::fs::File) -> i32 {
+    std::os::unix::io::AsRawFd::as_raw_fd(f)
+}
+#[cfg(not(unix))]
+fn plane_raw_fd(_f: &std::fs::File) -> i32 {
+    unreachable!("dma-buf import is unix-only; import_nv12 returns Err before this on Windows")
+}
+
 struct Egl {
     display: EglDisplay,
     create_image: EglCreateImageKhr,
@@ -257,7 +270,7 @@ pub fn import_nv12(frame: GpuFrame) -> Result<TextureFrame, GpuFrame> {
             EGL_LINUX_DRM_FOURCC_EXT,
             fourcc as i32,
             EGL_DMA_BUF_PLANE0_FD_EXT,
-            std::os::fd::AsRawFd::as_raw_fd(&p.fd),
+            plane_raw_fd(&p.fd),
             EGL_DMA_BUF_PLANE0_OFFSET_EXT,
             p.offset as i32,
             EGL_DMA_BUF_PLANE0_PITCH_EXT,

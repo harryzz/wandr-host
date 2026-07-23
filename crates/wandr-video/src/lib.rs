@@ -421,7 +421,11 @@ impl GpuFrame {
 }
 
 pub struct DmabufPlane {
-    pub fd: std::os::fd::OwnedFd,
+    /// The dma-buf, owned so it is closed on drop (EGL keeps its own reference
+    /// after import). A `File` rather than `OwnedFd` ONLY so the type compiles on
+    /// Windows, which has no `std::os::fd`; dma-buf is a Linux concept and this is
+    /// never constructed off-Linux (the vaapi backend is the only producer).
+    pub fd: std::fs::File,
     pub offset: u32,
     pub pitch: u32,
 }

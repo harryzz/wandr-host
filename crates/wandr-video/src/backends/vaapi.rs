@@ -419,7 +419,9 @@ fn gpu_frame_from_prime(
         // All planes live in the same buffer object, so each gets its own dup of
         // the one fd — independently closed, no shared-ownership bookkeeping.
         planes.push(crate::DmabufPlane {
-            fd: obj.fd.try_clone().ok()?,
+            // OwnedFd -> File: File owns/closes the fd the same way; the crate's
+            // DmabufPlane uses File so it compiles on Windows (see its doc).
+            fd: std::fs::File::from(obj.fd.try_clone().ok()?),
             offset: offsets[i],
             pitch: pitches[i],
         });
