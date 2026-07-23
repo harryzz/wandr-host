@@ -116,6 +116,17 @@ fn compile_and_add_libde265_static_lib(root: &Path, libname: &str, encoder: bool
         cc_build.define("HAVE_MALLOC_H", "true");
     }
 
+    // FIX 4 — memalign (macOS). `image.cc`'s ALLOC_ALIGNED macro selects
+    // `_aligned_malloc` on _WIN32, `posix_memalign` when HAVE_POSIX_MEMALIGN is
+    // set, else glibc `memalign` — which macOS does NOT have (undeclared). Define
+    // HAVE_POSIX_MEMALIGN on unix so Linux AND macOS take the portable POSIX
+    // branch; Windows takes _aligned_malloc and needs neither. This is what
+    // FIX 2 exposed: dropping malloc.h on macOS left the `memalign` else-branch.
+    let is_unix = env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default() == "unix";
+    if is_unix {
+        cc_build.define("HAVE_POSIX_MEMALIGN", None);
+    }
+
     // FIX 3 — MSVC dllimport. `de265.h` makes LIBDE265_API `__declspec(dllimport)`
     // under `_MSC_VER && !LIBDE265_STATIC_BUILD`, so compiling the DEFINITIONS in
     // de265.cc is C2491 ("definition of dllimport function not allowed"). Define

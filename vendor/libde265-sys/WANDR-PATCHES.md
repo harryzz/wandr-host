@@ -25,6 +25,14 @@ target triple `x86_64-...` and a substring match would drop every file.
 guarded, so `image.cc` is the only offender. Define `HAVE_MALLOC_H` where the
 header exists (Linux, MSVC), not on macOS.
 
+## FIX 4 — memalign / HAVE_POSIX_MEMALIGN (macOS blocker, exposed by FIX 2)
+`image.cc`'s `ALLOC_ALIGNED` macro chooses `_aligned_malloc` on `_WIN32`,
+`posix_memalign` when `HAVE_POSIX_MEMALIGN` is set, else glibc `memalign` —
+which macOS lacks (undeclared identifier). Dropping `<malloc.h>` on macOS (FIX 2)
+left it on the `memalign` branch and it failed. Define `HAVE_POSIX_MEMALIGN` on
+unix so Linux and macOS both take the portable POSIX branch; Windows is on
+`_aligned_malloc` and needs neither. Only `image.cc` uses this.
+
 ## FIX 3 — MSVC dllimport (Windows blocker)
 `de265.h`: `#if defined(_MSC_VER) && !defined(LIBDE265_STATIC_BUILD)` makes
 `LIBDE265_API` = `__declspec(dllimport)`. Compiling the function DEFINITIONS in
@@ -32,6 +40,6 @@ header exists (Linux, MSVC), not on macOS.
 `LIBDE265_STATIC_BUILD` so the macro is empty — the build is static, which is
 exactly the case the macro exists for.
 
-Upstreamable: all three match what libde265's CMake already does
+Upstreamable: all four match what libde265's CMake already does
 (`DISABLE_SSE`, malloc.h feature-detect, `LIBDE265_STATIC_BUILD`). Worth a PR to
 libde265-sys rather than carrying forever.
