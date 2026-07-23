@@ -196,6 +196,10 @@ rsbinder-aidl = { path = "crates/rsbinder/rsbinder-aidl" }
 # Inert unless the `vaapi` feature is on (Linux desktop only).
 [patch.crates-io]
 cros-codecs = { path = "vendor/cros-codecs" }
+# libde265-sys build.rs patched so the STATIC H.265 source build works on Windows
+# (MSVC dllimport) and macOS-arm64 (x86 SSE + malloc.h), not just Linux. src/ and
+# Cargo.toml are stock; see vendor/libde265-sys/WANDR-PATCHES.md.
+libde265-sys = { path = "vendor/libde265-sys" }
 
 [features]
 # wasi-canvas default-on since the dioxus-canvas migration (stage 1):

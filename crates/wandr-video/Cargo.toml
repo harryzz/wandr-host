@@ -117,3 +117,5 @@ mp4 = "0.14"
 # for what is patched and why.
 [patch.crates-io]
 cros-codecs = { path = "../../vendor/cros-codecs" }
+# Same libde265-sys build.rs patch as the host — standalone crate, own Cargo.lock.
+libde265-sys = { path = "../../vendor/libde265-sys" }

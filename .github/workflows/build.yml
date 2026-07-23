@@ -116,7 +116,10 @@ jobs:
         shell: pwsh
         run: |
           pip install meson
-          choco install ninja nasm -y
+          # pkgconfiglite: the runner's only pkg-config is Strawberry Perl's
+          # broken stub ("Found pkg-config: NO"), so dav1d-sys's system-deps
+          # cannot locate even its OWN internally-built dav1d. Install a real one.
+          choco install ninja nasm pkgconfiglite -y
           echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
           echo "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always" >> $env:GITHUB_ENV
 
