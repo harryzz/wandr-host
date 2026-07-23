@@ -37,6 +37,13 @@ dav1d = ["dep:dav1d"]
 # never do. A machine with the feature compiled in but no usable VA driver is
 # fine — the backend probes and declines, and software decodes as before.
 vaapi = ["dep:cros-codecs", "dep:libva"]
+# HARDWARE H.264 decode via DXVA2 / ID3D11VideoDecoder (Windows). The Windows peer
+# of `vaapi`: same "HW first, probe-and-decline, software fallback" contract. Links
+# only the `windows` crate (Microsoft-maintained bindings) — no external codec
+# library — and reuses cros-codecs' pure-Rust H.264 parser (default-features off,
+# so no gbm/drm/nix). The Windows build script turns it on; Linux/macOS/Android
+# never do. See backends/d3d11.rs.
+d3d11 = ["dep:windows", "dep:cros-codecs", "dep:anyhow"]
 
 [dependencies]
 # libvpx (BSD-3), built from vendor/libvpx and linked statically by wandr-vpx-sys.
@@ -73,6 +80,22 @@ log = "0.4"
 cros-codecs = { version = "0.0.6", features = ["vaapi"], optional = true }
 libva = { package = "cros-libva", version = "0.0.12", optional = true }
 
+# Windows HW decode (feature `d3d11`). cros-codecs supplies ONLY the H.264 parser
+# here (default-features off — no gbm/drm/nix, which is what lets it build on
+# Windows); the `windows` crate is Microsoft's maintained DXVA/D3D11 bindings.
+# anyhow is used by the backend's unsafe COM plumbing. Target-gated so non-Windows
+# builds never resolve them.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+cros-codecs = { version = "0.0.6", default-features = false, optional = true }
+anyhow = { version = "1", optional = true }
+
 # The round-trip tests need a real codec, so they are skipped by a bare
 # `cargo test` rather than failing it.
 [[test]]
@@ -92,6 +115,13 @@ required-features = ["libvpx", "openh264"]
 [[test]]
 name = "vaapi_hw"
 required-features = ["vaapi"]
+
+# DXVA2/D3D11 HW decode, end-to-end through the Decoder trait. Bit-exact vs the
+# ffmpeg framehash reference beside the cros-codecs test vector. SKIPS (passes)
+# on a runner with no video device — see the test header.
+[[test]]
+name = "d3d11_hw"
+required-features = ["d3d11"]
 
 # Answers "does the backend pair timestamps to the right frames?", which needs a
 # container (an elementary stream has no PTS) — hence the mp4 dev-dependency and

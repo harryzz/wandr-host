@@ -25,3 +25,9 @@ pub mod dav1d;
 // MediaCodec and never links a codec library.
 #[cfg(all(feature = "vaapi", target_os = "linux", not(target_os = "android")))]
 pub mod vaapi;
+
+// Windows HARDWARE H.264 decode via DXVA2 / ID3D11VideoDecoder — the Windows peer
+// of vaapi. Runs on the same D3D11 device our ANGLE renderer uses (Phase-2
+// zero-copy needs no cross-API bridge). Reuses cros-codecs' H.264 parser.
+#[cfg(all(feature = "d3d11", target_os = "windows"))]
+pub mod d3d11;

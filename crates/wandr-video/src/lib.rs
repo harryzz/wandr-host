@@ -418,6 +418,14 @@ impl GpuFrame {
     ) -> Self {
         Self { width, height, timestamp_us, fourcc, modifier, planes, color, owner }
     }
+
+    /// The Windows D3D11 texture handle for this frame, if it has one. The host's
+    /// ANGLE import calls this; a dma-buf frame (and every non-Windows build)
+    /// returns `None` and the caller uses `planes` / `read_i420` instead.
+    #[cfg(all(feature = "d3d11", target_os = "windows"))]
+    pub fn d3d11(&self) -> Option<D3d11View> {
+        self.owner.d3d11()
+    }
 }
 
 pub struct DmabufPlane {
@@ -439,6 +447,29 @@ pub struct DmabufPlane {
 /// on Ivybridge. A generic dma-buf mmap would reintroduce exactly that.
 pub trait GpuFrameOwner: Send {
     fn read_i420(&self, out: &mut Vec<u8>) -> Result<(), CodecError>;
+
+    /// The Windows zero-copy handle, when this GPU frame is a D3D11 NV12 texture
+    /// (DXVA2). `None` for a dma-buf frame. Gated to Windows so the DMA-buf lane
+    /// and lib.rs stay free of the `windows` crate everywhere else — the Linux
+    /// vaapi owner never implements it. The host imports the texture into ANGLE
+    /// (same D3D11 device) rather than reading it back.
+    #[cfg(all(feature = "d3d11", target_os = "windows"))]
+    fn d3d11(&self) -> Option<D3d11View> {
+        None
+    }
+}
+
+/// A borrowed view of a decoded NV12 picture as a D3D11 texture (Windows/DXVA2).
+/// The `owner` that hands this out keeps the texture (and its device) alive for
+/// as long as the `GpuFrame` lives, so these are safe to use un-refcounted.
+#[cfg(all(feature = "d3d11", target_os = "windows"))]
+pub struct D3d11View {
+    pub texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    /// The device the texture belongs to — the host shares it with ANGLE (or
+    /// opens a shared handle from it) so no cross-device copy is needed.
+    pub device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    /// Which array slice of `texture` holds this frame (0 for a per-frame texture).
+    pub array_slice: u32,
 }
 
 /// A borrowed, non-owning view of a decoded I420 frame.
@@ -662,6 +693,8 @@ pub fn default_registry() -> Registry {
     // cannot actually decode, so the software backends below stay the fallback.
     #[cfg(all(feature = "vaapi", target_os = "linux", not(target_os = "android")))]
     r.register(Box::new(backends::vaapi::VaapiBackend));
+    #[cfg(all(feature = "d3d11", target_os = "windows"))]
+    r.register(Box::new(backends::d3d11::D3d11Backend));
     #[cfg(feature = "libvpx")]
     r.register(Box::new(backends::libvpx::LibvpxBackend));
     #[cfg(feature = "openh264")]
