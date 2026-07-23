@@ -123,6 +123,14 @@ jobs:
           echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
           echo "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always" >> $env:GITHUB_ENV
 
+      # meson (dav1d) picks MinGW gcc over cl on windows-latest if both are on
+      # PATH, and gcc-compiled objects reference `___chkstk_ms`, which the MSVC
+      # linker (Rust's x86_64-pc-windows-msvc) cannot resolve. Activating the VS
+      # dev environment makes meson auto-detect MSVC as the native compiler.
+      - name: MSVC dev environment (so meson uses cl, not MinGW)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       # Match scripts/build-host-*.{sh,bat}: they all default to P3=1 (--features
       # p3-async). It is NOT in `default`, so a plain `cargo build` yields a host with no
       # WASI 0.3 surface — guests importing wasi:sockets@0.3.0 then fail to instantiate

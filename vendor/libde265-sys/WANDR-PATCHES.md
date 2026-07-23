@@ -40,6 +40,13 @@ unix so Linux and macOS both take the portable POSIX branch; Windows is on
 `LIBDE265_STATIC_BUILD` so the macro is empty — the build is static, which is
 exactly the case the macro exists for.
 
-Upstreamable: all four match what libde265's CMake already does
+## FIX 5 — Win32 threads (Windows blocker)
+libde265's Win32 condition-variable emulation (`win32_cond_*`, called from
+`threads.cc`) is defined in `extra/win32cond.c` — a C file OUTSIDE `libde265/`,
+so the `.cc` glob never compiles it and the symbols are unresolved at link
+(LNK2019). Compile it as C into its own static lib on Windows; `win32cond.h` has
+`extern "C"` so linkage matches, and it needs only `<windows.h>` (no config.h).
+
+Upstreamable: all five match what libde265's CMake already does
 (`DISABLE_SSE`, malloc.h feature-detect, `LIBDE265_STATIC_BUILD`). Worth a PR to
 libde265-sys rather than carrying forever.

@@ -143,6 +143,23 @@ fn compile_and_add_libde265_static_lib(root: &Path, libname: &str, encoder: bool
 
     cc_build.compile(libname);
 
+    // FIX 5 — Windows threads (Win32 cond-var emulation). libde265's
+    // `win32_cond_*` live in `extra/win32cond.c`, a C file OUTSIDE `libde265/`,
+    // so the `.cc` glob above never compiles it and `threads.cc`'s references go
+    // unresolved (LNK2019). Compile it as C into its own lib — `win32cond.h` has
+    // `extern "C"`, so the symbols match. `config.h` is `#ifdef HAVE_CONFIG_H`
+    // (undefined here), so it is not needed.
+    if target_os == "windows" {
+        let mut c = cc::Build::new();
+        c.include(&root)
+            .include(&libde265_src)
+            .include(root.join("extra"))
+            .warnings(false)
+            .pic(true)
+            .file(root.join("extra").join("win32cond.c"));
+        c.compile("de265_win32cond");
+    }
+
     println!("cargo:rustc-link-lib=static={libname}");
 }
 
