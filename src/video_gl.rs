@@ -129,10 +129,28 @@ pub fn register(display: &glutin::display::Display) {
     let _ = EGL.set(build(display));
 }
 
-fn build(display: &glutin::display::Display) -> Option<Egl> {
-    use glutin::display::{AsRawDisplay, GlDisplay, RawDisplay};
+/// The raw `EGLDisplay`, or `None` if this platform's glutin display is not EGL.
+/// ‼️ macOS glutin has NO `RawDisplay::Egl` variant (it is CGL), so matching it
+/// there is a COMPILE error — hence the cfg split: the macOS arm never names the
+/// variant. Windows has EGL via ANGLE (so it reaches the extension probe, which
+/// finds no dma-buf import and returns None); Linux is the real path.
+#[cfg(not(target_os = "macos"))]
+fn raw_egl_display(display: &glutin::display::Display) -> Option<EglDisplay> {
+    use glutin::display::{AsRawDisplay, RawDisplay};
+    match display.raw_display() {
+        RawDisplay::Egl(p) => Some(p),
+        _ => None,
+    }
+}
+#[cfg(target_os = "macos")]
+fn raw_egl_display(_display: &glutin::display::Display) -> Option<EglDisplay> {
+    None // macOS is CGL, not EGL — no dma-buf zero-copy here
+}
 
-    let RawDisplay::Egl(egl_display) = display.raw_display() else {
+fn build(display: &glutin::display::Display) -> Option<Egl> {
+    use glutin::display::GlDisplay;
+
+    let Some(egl_display) = raw_egl_display(display) else {
         log::info!("video_gl: not an EGL display — zero-copy import unavailable");
         return None;
     };
