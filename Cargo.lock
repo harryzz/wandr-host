@@ -5348,6 +5348,7 @@ dependencies = [
 name = "wandr-video"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cros-codecs",
  "cros-libva",
  "dav1d",
@@ -5356,6 +5357,7 @@ dependencies = [
  "log",
  "openh264",
  "wandr-vpx-sys",
+ "windows",
  "yuv",
 ]
 
