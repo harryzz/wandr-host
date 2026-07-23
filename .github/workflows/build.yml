@@ -48,11 +48,15 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # libgbm-dev: the `vaapi` feature pulls cros-codecs, which links gbm-sys
+          # unconditionally even though wandr uses VA-allocated surfaces (not GBM).
+          # So the vaapi build needs libgbm at link time — and the produced binary
+          # has a runtime dep on libgbm.so.1, which any Mesa/GPU system has.
           sudo apt-get install -y --no-install-recommends \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev \
             libasound2-dev libpulse-dev libfontconfig1-dev clang ninja-build \
-            pkg-config nasm meson libva-dev
+            pkg-config nasm meson libva-dev libgbm-dev
           # dav1d (AV1, BSD-2) builds from source via meson; tell dav1d-sys to do
           # so statically instead of looking for a system .so. (meson+ninja+nasm
           # above are its toolchain.)
