@@ -24,11 +24,16 @@
 //! common playback stream (what a player feeds) is covered.
 #![allow(non_snake_case, non_camel_case_types)]
 
+use std::cell::Cell;
 use std::collections::VecDeque;
+use std::ffi::c_void;
 use std::io::Cursor;
 use std::mem::{size_of, zeroed};
 
 use cros_codecs::codec::h264::parser::{Nalu, NaluType, Parser, Pps, SliceHeader, SliceType, Sps};
+use cros_codecs::codec::h264::parser::{MaxLongTermFrameIdx, Slice};
+use cros_codecs::codec::h264::picture::{Field, PictureData, Reference};
+use cros_codecs::codec::h264::dpb::Dpb;
 
 use windows::core::{Interface, GUID};
 use windows::Win32::Foundation::HMODULE;
@@ -47,8 +52,39 @@ use crate::{
 const H264_VLD_NOFGT: GUID = GUID::from_u128(0x1b81be68_a0c7_11d3_b984_00c04f2e73c5);
 const H264_VLD_FGT: GUID = GUID::from_u128(0x1b81be69_a0c7_11d3_b984_00c04f2e73c5);
 const INVALID_ENTRY: u8 = 0xFF;
-const POOL: u32 = 8; // decode surface pool (refs + in-flight)
+/// DXVA `DXVA_PicParams_H264::RefFrameList` is a fixed 16-entry array — the hard
+/// ABI ceiling on simultaneous H.264 references. The decode-surface pool itself is
+/// sized PER-STREAM from the SPS (`Dxva::new`), never a fixed count: a stream may
+/// use anywhere from 1 to 16 references, and a fixed pool silently starves mid-GOP
+/// once a GOP needs more surfaces than it has (this bit us with a 16-ref clip on an
+/// 8-slot pool — "pool exhausted" at the 9th reference).
+const DXVA_MAX_REFS: u32 = 16;
 const DRM_FORMAT_NV12: u32 = 0x3231_564e; // 'N''V''1''2', for parity with the vaapi frame
+
+// ── decode-on-ANGLE's-device handoff (Phase 2b zero-copy) ────────────────────
+// The host extracts ANGLE's ID3D11Device (eglQueryDeviceAttribEXT(EGL_D3D11_
+// DEVICE_ANGLE)) and sets it here, on the GL thread, before opening a decoder.
+// Then decode lands on ANGLE's device and the output NV12 texture imports into
+// ANGLE GL as a plain same-device alias — no shared handle, no keyed mutex.
+// (Thread-local: the decoder and the GL context share one thread. Unset => the
+// backend creates its own device, which is the CPU-readback lane.)
+thread_local! {
+    static ANGLE_D3D11_DEVICE: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Set (or clear, with null) the ID3D11Device the d3d11 decoder should decode on.
+/// Pass `ID3D11Device::as_raw()`; the backend takes its own reference. Call on the
+/// GL thread before opening a decoder. Safe to leave unset — CPU readback still works.
+pub fn set_angle_d3d11_device(device: *mut c_void) {
+    ANGLE_D3D11_DEVICE.with(|c| c.set(device));
+}
+
+fn angle_d3d11_device() -> Option<*mut c_void> {
+    ANGLE_D3D11_DEVICE.with(|c| {
+        let p = c.get();
+        (!p.is_null()).then_some(p)
+    })
+}
 
 // ── hand-defined DXVA structs (dxva.h is #pragma pack(1)) ─────────────────────
 
@@ -130,6 +166,7 @@ struct SpsBits {
     pic_order_cnt_type: u8,
     log2_max_pic_order_cnt_lsb_minus4: u8,
     delta_pic_order_always_zero_flag: bool,
+    level_idc: u8,
     reorder_window: usize,
 }
 impl SpsBits {
@@ -147,6 +184,7 @@ impl SpsBits {
             pic_order_cnt_type: s.pic_order_cnt_type,
             log2_max_pic_order_cnt_lsb_minus4: s.log2_max_pic_order_cnt_lsb_minus4,
             delta_pic_order_always_zero_flag: s.delta_pic_order_always_zero_flag,
+            level_idc: s.level_idc as u8,
             reorder_window: s.max_num_order_frames() as usize,
         }
     }
@@ -329,9 +367,7 @@ pub struct D3d11Decoder {
     sps: Option<SpsBits>,
     pps: Option<PpsBits>,
     core: Option<Dxva>,
-    reorder_window: usize,
-    reorder: Vec<Decoded>,   // decoded, awaiting display-order emit
-    ready: VecDeque<Decoded>, // emit order (display)
+    ready: VecDeque<Decoded>, // display-order output from the DPB, awaiting emit
     cur: Option<Vec<u8>>,     // CPU I420 currently borrowed by next_frame
     /// Emit `Frame::gpu` (D3D11 texture) instead of `Frame::cpu` (readback I420).
     /// Opt-in via `WANDR_VIDEO_D3D11_GPU=1` until the host's ANGLE import (Phase
@@ -347,30 +383,26 @@ impl D3d11Decoder {
             sps: None,
             pps: None,
             core: None,
-            reorder_window: 4,
-            reorder: Vec::new(),
             ready: VecDeque::new(),
             cur: None,
-            gpu: std::env::var("WANDR_VIDEO_D3D11_GPU").is_ok(),
+            // Emit GPU-texture frames (for the host's ANGLE zero-copy import)
+            // automatically whenever the host pointed us at ANGLE's device — then
+            // the output texture is a same-device alias the host can import. With
+            // no ANGLE device (headless) we stay on CPU readback. `=1` forces it.
+            gpu: std::env::var("WANDR_VIDEO_D3D11_GPU").is_ok() || angle_d3d11_device().is_some(),
         }
     }
 
-    /// Emit the lowest-POC buffered frame into `ready` (Annex-C bumping).
-    fn bump_one(&mut self) {
-        if let Some((i, _)) = self.reorder.iter().enumerate().min_by_key(|(_, d)| d.poc) {
-            let d = self.reorder.remove(i);
-            self.ready.push_back(d);
-        }
-    }
-
-    /// Emit everything buffered, lowest POC first (GOP boundary / end of stream).
-    fn drain(&mut self) {
-        self.reorder.sort_by_key(|d| d.poc);
-        for d in self.reorder.drain(..) {
-            self.ready.push_back(d);
-        }
-    }
 }
+
+// SAFETY: same reasoning as the vaapi backend. The cros-codecs reference `Dpb`
+// inside the `Dxva` core carries non-atomic `Rc<RefCell<PictureData>>` refcounts
+// and so is not `Send`/`Sync` by default, but the whole `D3d11Decoder` — pool,
+// DPB, and every `Rc` inside it — is one self-contained object the host owns in a
+// wasmtime `ResourceTable` and drives from a single store thread. Moving it
+// between threads is sound; sharing it is not, and `Sync` is deliberately NOT
+// claimed. No `Rc` clone escapes (outputs are standalone COM textures / I420).
+unsafe impl Send for D3d11Decoder {}
 
 impl Decoder for D3d11Decoder {
     fn decode(&mut self, chunk: Chunk<'_>) -> Result<(), CodecError> {
@@ -393,9 +425,8 @@ impl Decoder for D3d11Decoder {
         // One chunk = one access unit (the guest demuxes). Collect its slices.
         let mut cursor = Cursor::new(chunk.data);
         let mut slice_nals: Vec<Vec<u8>> = Vec::new();
-        let mut hdr0: Option<SliceHeader> = None;
+        let mut first_slice: Option<Slice> = None;
         let mut is_idr = false;
-        let mut ref_idc = 0u8;
 
         while let Ok(nalu) = Nalu::next(&mut cursor) {
             match nalu.header.type_ {
@@ -410,12 +441,16 @@ impl Decoder for D3d11Decoder {
                     self.pps = Some(PpsBits::from(p));
                 }
                 NaluType::SliceIdr | NaluType::Slice => {
-                    let bytes = nalu.data.to_vec();
-                    if hdr0.is_none() {
+                    // The raw NAL WITHOUT its start code (a fixed 3-byte code is
+                    // prepended in decode_picture, matching ffmpeg's DXVA layout).
+                    let bytes = nalu.as_ref().to_vec();
+                    if first_slice.is_none() {
                         is_idr = nalu.header.idr_pic_flag;
-                        ref_idc = nalu.header.ref_idc;
-                        let h = parser.parse_slice_header(nalu).map_err(|_| CodecError::BadFrame)?;
-                        hdr0 = Some(h.header);
+                        let s = parser.parse_slice_header(nalu).map_err(|e| {
+                            log::warn!("d3d11: slice-header parse failed: {e:?}");
+                            CodecError::BadFrame
+                        })?;
+                        first_slice = Some(s);
                     }
                     slice_nals.push(bytes);
                 }
@@ -426,51 +461,67 @@ impl Decoder for D3d11Decoder {
         if slice_nals.is_empty() {
             return Ok(()); // config-only AU (SPS/PPS), nothing to decode
         }
-        let sps = self.sps.clone().ok_or(CodecError::BadFrame)?;
-        let pps = self.pps.clone().ok_or(CodecError::BadFrame)?;
-        if sps.pic_order_cnt_type == 1 {
-            return Err(CodecError::Unsupported); // POC type 1 not implemented
-        }
-        let hdr = hdr0.ok_or(CodecError::BadFrame)?;
+        let slice = first_slice.ok_or(CodecError::BadFrame)?;
+        let hdr = &slice.header;
+        let sps_bits = self.sps.clone().ok_or(CodecError::BadFrame)?;
+        let pps_bits = self.pps.clone().ok_or(CodecError::BadFrame)?;
+
+        // The reference-DPB drive + POC need the full cros-codecs SPS/PPS (the
+        // SpsBits/PpsBits copies only carry the scalars the DXVA pic-params need).
+        let cpps = parser
+            .get_pps(hdr.pic_parameter_set_id)
+            .ok_or(CodecError::BadFrame)?
+            .clone();
+        let csps = parser
+            .get_sps(cpps.seq_parameter_set_id)
+            .ok_or(CodecError::BadFrame)?
+            .clone();
 
         if self.core.is_none() {
-            self.core = Some(Dxva::new(sps.width(), sps.height()).map_err(|_| CodecError::InitFailed)?);
-            self.reorder_window = sps.reorder_window.max(1);
+            // Pool = every DPB reference this stream can hold (SPS num_ref_frames,
+            // capped at the 16-entry DXVA RefFrameList) + the picture being decoded
+            // + one slack slot. Derived per-stream so a high-reference clip does not
+            // starve the pool mid-GOP.
+            let slots = (csps.max_num_ref_frames as u32).min(DXVA_MAX_REFS) + 2;
+            let mut core =
+                Dxva::new(csps.width(), csps.height(), slots).map_err(|_| CodecError::InitFailed)?;
+            core.set_dpb_limits(&csps);
+            self.core = Some(core);
         }
         let gpu = self.gpu;
+        let pts = chunk.timestamp_us;
+        let pic = PictureData::new_from_slice(&slice, &csps, pts as u64, None);
         let core = self.core.as_mut().unwrap();
-        let (payload, poc) = core
-            .decode_picture(&sps, &pps, &hdr, is_idr, ref_idc, &slice_nals, gpu)
-            .map_err(|_| CodecError::BadFrame)?;
-
-        // Display-order reorder: an IDR ends the previous GOP (POC resets to 0).
-        if is_idr {
-            self.drain();
-        }
-        self.reorder.push(Decoded {
-            poc,
-            pts: chunk.timestamp_us,
-            width: sps.width(),
-            height: sps.height(),
-            payload,
-        });
-        while self.reorder.len() > self.reorder_window {
-            self.bump_one();
-        }
+        let bumped = core
+            .decode_picture(pic, &csps, &sps_bits, &pps_bits, hdr, is_idr, pts, &slice_nals, gpu)
+            .map_err(|e| {
+                log::warn!(
+                    "d3d11: decode_picture failed: {e:#} (frame_num={} slice_type={:?} idr={} slices={} dpb={})",
+                    hdr.frame_num, hdr.slice_type, is_idr, slice_nals.len(), core.dpb.len(),
+                );
+                CodecError::BadFrame
+            })?;
+        // The DPB emits pictures in display order (POC); queue them for the host.
+        self.ready.extend(bumped);
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), CodecError> {
-        self.drain();
+        if let Some(core) = self.core.as_mut() {
+            let rest = core.drain_dpb();
+            self.ready.extend(rest);
+        }
         Ok(())
     }
 
     fn reset(&mut self) -> Result<(), CodecError> {
-        // Seek: drop pending output; the DPB self-clears on the next IDR (caller
-        // must feed a keyframe next, per the trait contract).
-        self.reorder.clear();
+        // Seek: drop pending output + DPB state; the caller must feed a keyframe
+        // next, per the trait contract.
         self.ready.clear();
         self.cur = None;
+        if let Some(core) = self.core.as_mut() {
+            core.reset_state();
+        }
         Ok(())
     }
 
@@ -526,12 +577,51 @@ impl Decoder for D3d11Decoder {
 
 // ── the DXVA core: device, decoder, surface pool, per-picture decode ─────────
 
-#[derive(Clone, Copy)]
-struct DpbRef {
-    slice: u8,
-    frame_num: u16,
-    top_poc: i32,
-    bottom_poc: i32,
+// Previous-picture POC state (spec 8.2.1), carried across pictures. Copied from
+// cros-codecs' stateless H.264 decoder so our POC derivation matches it exactly.
+struct PrevReferencePicInfo {
+    frame_num: u32,
+    has_mmco_5: bool,
+    top_field_order_cnt: i32,
+    pic_order_cnt_msb: i32,
+    pic_order_cnt_lsb: i32,
+    field: Field,
+}
+impl Default for PrevReferencePicInfo {
+    fn default() -> Self {
+        Self {
+            frame_num: 0,
+            has_mmco_5: false,
+            top_field_order_cnt: 0,
+            pic_order_cnt_msb: 0,
+            pic_order_cnt_lsb: 0,
+            field: Field::Frame,
+        }
+    }
+}
+impl PrevReferencePicInfo {
+    fn fill(&mut self, pic: &PictureData) {
+        self.has_mmco_5 = pic.has_mmco_5;
+        self.top_field_order_cnt = pic.top_field_order_cnt;
+        self.pic_order_cnt_msb = pic.pic_order_cnt_msb;
+        self.pic_order_cnt_lsb = pic.pic_order_cnt_lsb;
+        self.field = pic.field;
+        self.frame_num = pic.frame_num;
+    }
+}
+
+#[derive(Default)]
+struct PrevPicInfo {
+    frame_num: u32,
+    frame_num_offset: u32,
+    has_mmco_5: bool,
+}
+impl PrevPicInfo {
+    fn fill(&mut self, pic: &PictureData) {
+        self.frame_num = pic.frame_num;
+        self.has_mmco_5 = pic.has_mmco_5;
+        self.frame_num_offset = pic.frame_num_offset;
+    }
 }
 
 struct Dxva {
@@ -545,36 +635,61 @@ struct Dxva {
     views: Vec<ID3D11VideoDecoderOutputView>,
     pool: ID3D11Texture2D,
     staging: ID3D11Texture2D,
+    slots: u32, // decode-surface pool size, derived from the SPS (refs + current + slack)
     free: Vec<u8>,
-    dpb: Vec<DpbRef>,
-    prev_poc_msb: i32,
-    prev_poc_lsb: i32,
-    prev_frame_num: i32,
-    prev_frame_num_offset: i32,
+    // cros-codecs DPB (T = a per-picture id). Drives POC, MMCO / sliding-window
+    // marking, reference-list construction AND display-order bumping correctly (the
+    // hand-rolled sliding window it replaces broke on B-pyramid / MMCO streams).
+    dpb: Dpb<u64>,
+    prev_ref: PrevReferencePicInfo,
+    prev_pic: PrevPicInfo,
+    max_lt: MaxLongTermFrameIdx,
+    // Decoded pictures awaiting display, keyed by the DPB id (decoupled from the
+    // pool slot — a picture's pixels are copied out at decode, its slot is only
+    // held while it is a decode reference). `slot_of` maps a *reference* picture's
+    // id to the pool slot it occupies, so retired references free their slot.
+    pending: std::collections::HashMap<u64, Decoded>,
+    slot_of: std::collections::HashMap<u64, u8>,
+    next_id: u64,
     width: u32,
     height: u32,
     feedback: u32,
 }
 
 impl Dxva {
-    fn new(width: u32, height: u32) -> anyhow::Result<Self> {
+    fn new(width: u32, height: u32, slots: u32) -> anyhow::Result<Self> {
         unsafe {
-            let mut device = None;
-            let mut context = None;
-            let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-                Some(&levels),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )?;
-            let device: ID3D11Device = device.ok_or_else(|| anyhow::anyhow!("no device"))?;
-            let context: ID3D11DeviceContext = context.ok_or_else(|| anyhow::anyhow!("no context"))?;
+            // Decode on ANGLE's device when the host provided one (zero-copy path),
+            // else create our own (CPU-readback path).
+            let (device, context): (ID3D11Device, ID3D11DeviceContext) = match angle_d3d11_device() {
+                Some(ptr) => {
+                    let device = ID3D11Device::from_raw_borrowed(&ptr)
+                        .ok_or_else(|| anyhow::anyhow!("null ANGLE device"))?
+                        .clone();
+                    let context = device.GetImmediateContext()?;
+                    (device, context)
+                }
+                None => {
+                    let mut device = None;
+                    let mut context = None;
+                    let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+                    D3D11CreateDevice(
+                        None,
+                        D3D_DRIVER_TYPE_HARDWARE,
+                        HMODULE::default(),
+                        D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                        Some(&levels),
+                        D3D11_SDK_VERSION,
+                        Some(&mut device),
+                        None,
+                        Some(&mut context),
+                    )?;
+                    (
+                        device.ok_or_else(|| anyhow::anyhow!("no device"))?,
+                        context.ok_or_else(|| anyhow::anyhow!("no context"))?,
+                    )
+                }
+            };
             let vdevice: ID3D11VideoDevice = device.cast()?;
             let vcontext: ID3D11VideoContext = context.cast()?;
 
@@ -607,7 +722,7 @@ impl Dxva {
                 Width: width,
                 Height: height,
                 MipLevels: 1,
-                ArraySize: POOL,
+                ArraySize: slots,
                 Format: DXGI_FORMAT_NV12,
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 Usage: D3D11_USAGE_DEFAULT,
@@ -619,7 +734,7 @@ impl Dxva {
             device.CreateTexture2D(&tdesc, None, Some(&mut pool))?;
             let pool: ID3D11Texture2D = pool.ok_or_else(|| anyhow::anyhow!("no pool"))?;
             let mut views = Vec::new();
-            for s in 0..POOL {
+            for s in 0..slots {
                 let ovdesc = D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC {
                     DecodeProfile: H264_VLD_NOFGT,
                     ViewDimension: D3D11_VDOV_DIMENSION_TEXTURE2D,
@@ -649,12 +764,15 @@ impl Dxva {
                 views,
                 pool,
                 staging: staging.ok_or_else(|| anyhow::anyhow!("no staging"))?,
-                free: (0..POOL as u8).rev().collect(),
-                dpb: Vec::new(),
-                prev_poc_msb: 0,
-                prev_poc_lsb: 0,
-                prev_frame_num: 0,
-                prev_frame_num_offset: 0,
+                slots,
+                free: (0..slots as u8).rev().collect(),
+                dpb: Dpb::default(),
+                prev_ref: PrevReferencePicInfo::default(),
+                prev_pic: PrevPicInfo::default(),
+                max_lt: MaxLongTermFrameIdx::default(),
+                pending: std::collections::HashMap::new(),
+                slot_of: std::collections::HashMap::new(),
+                next_id: 0,
                 width,
                 height,
                 feedback: 0,
@@ -662,49 +780,222 @@ impl Dxva {
         }
     }
 
-    fn compute_poc(&mut self, sps: &SpsBits, hdr: &SliceHeader, is_idr: bool, is_ref: bool) -> i32 {
-        let fnum = hdr.frame_num as i32;
-        match sps.pic_order_cnt_type {
-            0 => {
-                let (prev_msb, prev_lsb) =
-                    if is_idr { (0, 0) } else { (self.prev_poc_msb, self.prev_poc_lsb) };
-                let max_lsb = 1i32 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
-                let lsb = hdr.pic_order_cnt_lsb as i32;
-                let msb = if lsb < prev_lsb && (prev_lsb - lsb) >= max_lsb / 2 {
-                    prev_msb + max_lsb
-                } else if lsb > prev_lsb && (lsb - prev_lsb) > max_lsb / 2 {
-                    prev_msb - max_lsb
-                } else {
-                    prev_msb
-                };
-                if is_ref {
-                    self.prev_poc_msb = msb;
-                    self.prev_poc_lsb = lsb;
+    fn set_dpb_limits(&mut self, sps: &Sps) {
+        // Same policy as cros-codecs' apply_sps: the DPB holds up to max_dpb_frames
+        // pictures; the reorder limit bounds output latency (bump earlier if it
+        // would exceed the DPB size).
+        let max_dpb = sps.max_dpb_frames();
+        let max_reorder = sps.max_num_order_frames() as usize;
+        let max_reorder = if max_reorder > max_dpb { 0 } else { max_reorder };
+        self.dpb.set_limits(max_dpb, max_reorder);
+    }
+
+    /// Output every buffered picture in display order and empty the DPB (IDR /
+    /// MMCO-5 / end-of-stream). Returns them lowest-POC first.
+    fn drain_dpb(&mut self) -> Vec<Decoded> {
+        let mut out = Vec::new();
+        for h in self.dpb.drain() {
+            if let Some(id) = h {
+                if let Some(d) = self.pending.remove(&id) {
+                    out.push(d);
                 }
-                msb + lsb
-            }
-            _ => {
-                // type 2 (8.2.1.3): POC derived from frame_num, frames only.
-                let max_fn = 1i32 << (sps.log2_max_frame_num_minus4 + 4);
-                let offset = if is_idr {
-                    0
-                } else if self.prev_frame_num > fnum {
-                    self.prev_frame_num_offset + max_fn
-                } else {
-                    self.prev_frame_num_offset
-                };
-                let temp = if is_idr {
-                    0
-                } else if !is_ref {
-                    2 * (offset + fnum) - 1
-                } else {
-                    2 * (offset + fnum)
-                };
-                self.prev_frame_num = fnum;
-                self.prev_frame_num_offset = offset;
-                temp
             }
         }
+        out
+    }
+
+    /// Seek/reset: drop all buffered state. The next access unit must be an IDR.
+    fn reset_state(&mut self) {
+        self.dpb.clear();
+        self.pending.clear();
+        self.slot_of.clear();
+        self.free = (0..self.slots as u8).rev().collect();
+        self.prev_ref = PrevReferencePicInfo::default();
+        self.prev_pic = PrevPicInfo::default();
+        self.max_lt = MaxLongTermFrameIdx::default();
+    }
+
+    /// POC derivation (spec 8.2.1), a faithful copy of cros-codecs'
+    /// `compute_pic_order_count` so short/long-term reference ordering matches the
+    /// reference decoder for POC types 0/1/2.
+    fn compute_pic_order_count(
+        &mut self,
+        pic: &mut PictureData,
+        sps: &Sps,
+        is_idr: bool,
+    ) -> anyhow::Result<()> {
+        match pic.pic_order_cnt_type {
+            0 => {
+                let prev_pic_order_cnt_msb;
+                let prev_pic_order_cnt_lsb;
+                if is_idr {
+                    prev_pic_order_cnt_lsb = 0;
+                    prev_pic_order_cnt_msb = 0;
+                } else if self.prev_ref.has_mmco_5 {
+                    if !matches!(self.prev_ref.field, Field::Bottom) {
+                        prev_pic_order_cnt_msb = 0;
+                        prev_pic_order_cnt_lsb = self.prev_ref.top_field_order_cnt;
+                    } else {
+                        prev_pic_order_cnt_msb = 0;
+                        prev_pic_order_cnt_lsb = 0;
+                    }
+                } else {
+                    prev_pic_order_cnt_msb = self.prev_ref.pic_order_cnt_msb;
+                    prev_pic_order_cnt_lsb = self.prev_ref.pic_order_cnt_lsb;
+                }
+
+                let max_pic_order_cnt_lsb = 1 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
+
+                pic.pic_order_cnt_msb = if (pic.pic_order_cnt_lsb < prev_pic_order_cnt_lsb)
+                    && (prev_pic_order_cnt_lsb - pic.pic_order_cnt_lsb >= max_pic_order_cnt_lsb / 2)
+                {
+                    prev_pic_order_cnt_msb + max_pic_order_cnt_lsb
+                } else if (pic.pic_order_cnt_lsb > prev_pic_order_cnt_lsb)
+                    && (pic.pic_order_cnt_lsb - prev_pic_order_cnt_lsb > max_pic_order_cnt_lsb / 2)
+                {
+                    prev_pic_order_cnt_msb - max_pic_order_cnt_lsb
+                } else {
+                    prev_pic_order_cnt_msb
+                };
+
+                if !matches!(pic.field, Field::Bottom) {
+                    pic.top_field_order_cnt = pic.pic_order_cnt_msb + pic.pic_order_cnt_lsb;
+                }
+                if !matches!(pic.field, Field::Top) {
+                    if matches!(pic.field, Field::Frame) {
+                        pic.bottom_field_order_cnt =
+                            pic.top_field_order_cnt + pic.delta_pic_order_cnt_bottom;
+                    } else {
+                        pic.bottom_field_order_cnt = pic.pic_order_cnt_msb + pic.pic_order_cnt_lsb;
+                    }
+                }
+            }
+            1 => {
+                if self.prev_pic.has_mmco_5 {
+                    self.prev_pic.frame_num_offset = 0;
+                }
+                if is_idr {
+                    pic.frame_num_offset = 0;
+                } else if self.prev_pic.frame_num > pic.frame_num {
+                    pic.frame_num_offset = self.prev_pic.frame_num_offset + sps.max_frame_num();
+                } else {
+                    pic.frame_num_offset = self.prev_pic.frame_num_offset;
+                }
+
+                let mut abs_frame_num = if sps.num_ref_frames_in_pic_order_cnt_cycle != 0 {
+                    pic.frame_num_offset + pic.frame_num
+                } else {
+                    0
+                };
+                if pic.nal_ref_idc == 0 && abs_frame_num > 0 {
+                    abs_frame_num -= 1;
+                }
+
+                let mut expected_pic_order_cnt = 0;
+                if abs_frame_num > 0 {
+                    if sps.num_ref_frames_in_pic_order_cnt_cycle == 0 {
+                        anyhow::bail!("invalid num_ref_frames_in_pic_order_cnt_cycle");
+                    }
+                    let pic_order_cnt_cycle_cnt =
+                        (abs_frame_num - 1) / sps.num_ref_frames_in_pic_order_cnt_cycle as u32;
+                    expected_pic_order_cnt =
+                        pic_order_cnt_cycle_cnt as i32 * sps.expected_delta_per_pic_order_cnt_cycle;
+                    for i in 0..sps.num_ref_frames_in_pic_order_cnt_cycle {
+                        expected_pic_order_cnt += sps.offset_for_ref_frame[i as usize];
+                    }
+                }
+                if pic.nal_ref_idc == 0 {
+                    expected_pic_order_cnt += sps.offset_for_non_ref_pic;
+                }
+
+                if matches!(pic.field, Field::Frame) {
+                    pic.top_field_order_cnt = expected_pic_order_cnt + pic.delta_pic_order_cnt0;
+                    pic.bottom_field_order_cnt = pic.top_field_order_cnt
+                        + sps.offset_for_top_to_bottom_field
+                        + pic.delta_pic_order_cnt1;
+                } else if !matches!(pic.field, Field::Bottom) {
+                    pic.top_field_order_cnt = expected_pic_order_cnt + pic.delta_pic_order_cnt0;
+                } else {
+                    pic.bottom_field_order_cnt = expected_pic_order_cnt
+                        + sps.offset_for_top_to_bottom_field
+                        + pic.delta_pic_order_cnt0;
+                }
+            }
+            2 => {
+                if self.prev_pic.has_mmco_5 {
+                    self.prev_pic.frame_num_offset = 0;
+                }
+                if is_idr {
+                    pic.frame_num_offset = 0;
+                } else if self.prev_pic.frame_num > pic.frame_num {
+                    pic.frame_num_offset = self.prev_pic.frame_num_offset + sps.max_frame_num();
+                } else {
+                    pic.frame_num_offset = self.prev_pic.frame_num_offset;
+                }
+
+                let pic_order_cnt = if is_idr {
+                    0
+                } else if pic.nal_ref_idc == 0 {
+                    2 * (pic.frame_num_offset + pic.frame_num) as i32 - 1
+                } else {
+                    2 * (pic.frame_num_offset + pic.frame_num) as i32
+                };
+                if matches!(pic.field, Field::Frame | Field::Top) {
+                    pic.top_field_order_cnt = pic_order_cnt;
+                }
+                if matches!(pic.field, Field::Frame | Field::Bottom) {
+                    pic.bottom_field_order_cnt = pic_order_cnt;
+                }
+            }
+            other => anyhow::bail!("invalid pic_order_cnt_type: {other}"),
+        }
+
+        pic.pic_order_cnt = match pic.field {
+            Field::Frame => std::cmp::min(pic.top_field_order_cnt, pic.bottom_field_order_cnt),
+            Field::Top => pic.top_field_order_cnt,
+            Field::Bottom => pic.bottom_field_order_cnt,
+        };
+        Ok(())
+    }
+
+    /// Reference-picture marking (spec 8.2.5) via cros-codecs' DPB: adaptive
+    /// (MMCO) when signalled, else the sliding window. IDR clears all references.
+    fn reference_pic_marking(
+        &mut self,
+        pic: &mut PictureData,
+        sps: &Sps,
+        is_idr: bool,
+    ) -> anyhow::Result<()> {
+        if is_idr {
+            self.dpb.mark_all_as_unused_for_ref();
+            if pic.ref_pic_marking.long_term_reference_flag {
+                pic.set_reference(Reference::LongTerm, false);
+                pic.long_term_frame_idx = 0;
+                self.max_lt = MaxLongTermFrameIdx::Idx(0);
+            } else {
+                pic.set_reference(Reference::ShortTerm, false);
+                self.max_lt = MaxLongTermFrameIdx::NoLongTermFrameIndices;
+            }
+            return Ok(());
+        }
+        if pic.ref_pic_marking.adaptive_ref_pic_marking_mode_flag {
+            let markings = pic.ref_pic_marking.clone();
+            for marking in &markings.inner {
+                match marking.memory_management_control_operation {
+                    0 => break,
+                    1 => self.dpb.mmco_op_1(pic, marking)?,
+                    2 => self.dpb.mmco_op_2(pic, marking)?,
+                    3 => self.dpb.mmco_op_3(pic, marking)?,
+                    4 => self.max_lt = self.dpb.mmco_op_4(marking),
+                    5 => self.max_lt = self.dpb.mmco_op_5(pic),
+                    6 => self.dpb.mmco_op_6(pic, marking),
+                    other => anyhow::bail!("unknown MMCO {other}"),
+                }
+            }
+        } else {
+            self.dpb.sliding_window_marking(pic, sps);
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -715,7 +1006,8 @@ impl Dxva {
         hdr: &SliceHeader,
         is_ref: bool,
         out_slice: u8,
-        top_poc: i32,
+        cur_top: i32,
+        cur_bottom: i32,
         feedback: u32,
     ) -> DXVA_PicParams_H264 {
         let mut pp: DXVA_PicParams_H264 = unsafe { zeroed() };
@@ -736,7 +1028,7 @@ impl Dxva {
         bf |= 1u16 << 11; // MbsConsecutiveFlag
         bf |= (sps.frame_mbs_only_flag as u16) << 12;
         bf |= (pps.transform_8x8_mode_flag as u16) << 13;
-        bf |= (sps.direct_8x8_inference_flag as u16) << 14;
+        bf |= ((sps.level_idc >= 31) as u16) << 14; // MinLumaBipredSize8x8Flag
         bf |= (is_intra as u16) << 15;
         pp.wBitFields = bf;
 
@@ -746,13 +1038,35 @@ impl Dxva {
         pp.StatusReportFeedbackNumber = feedback;
 
         pp.RefFrameList = [INVALID_ENTRY; 16];
-        pp.CurrFieldOrderCnt = [top_poc, top_poc];
+        pp.CurrFieldOrderCnt = [cur_top, cur_bottom];
+        // Reference frames come straight from the cros DPB. The driver builds
+        // RefPicList0/1 itself from these (surface slot + POC + FrameNum/LongTerm
+        // idx + used flags); the AssociatedFlag high bit marks long-term.
         let mut used: u32 = 0;
-        for (k, r) in self.dpb.iter().enumerate().take(16) {
-            pp.RefFrameList[k] = r.slice & 0x7F;
-            pp.FieldOrderCntList[k] = [r.top_poc, r.bottom_poc];
-            pp.FrameNumList[k] = r.frame_num;
+        let mut k = 0usize;
+        for e in self.dpb.entries().iter() {
+            if k >= 16 {
+                break;
+            }
+            let rp = e.pic.borrow();
+            let long_term = matches!(rp.reference(), Reference::LongTerm);
+            if !long_term && !matches!(rp.reference(), Reference::ShortTerm) {
+                continue; // non-reference (output-buffered) or retired
+            }
+            // Map the DPB id back to the pool slot the reference occupies.
+            let slot = match e.reference.and_then(|id| self.slot_of.get(&id)) {
+                Some(&s) => s,
+                None => continue,
+            };
+            pp.RefFrameList[k] = (slot & 0x7F) | if long_term { 0x80 } else { 0 };
+            pp.FieldOrderCntList[k] = [rp.top_field_order_cnt, rp.bottom_field_order_cnt];
+            pp.FrameNumList[k] = if long_term {
+                rp.long_term_frame_idx as u16
+            } else {
+                rp.frame_num as u16
+            };
             used |= 3u32 << (2 * k);
+            k += 1;
         }
         pp.UsedForReferenceFlags = used;
 
@@ -777,31 +1091,43 @@ impl Dxva {
         pp
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_picture(
         &mut self,
-        sps: &SpsBits,
+        mut pic: PictureData,
+        sps: &Sps,
+        sps_bits: &SpsBits,
         pps: &PpsBits,
         hdr: &SliceHeader,
         is_idr: bool,
-        ref_idc: u8,
+        pts: i64,
         slice_nals: &[Vec<u8>],
         gpu: bool,
-    ) -> anyhow::Result<(Payload, i32)> {
+    ) -> anyhow::Result<Vec<Decoded>> {
         unsafe {
-            if is_idr {
-                self.dpb.clear();
-                self.free = (0..POOL as u8).rev().collect();
-                self.prev_poc_msb = 0;
-                self.prev_poc_lsb = 0;
-                self.prev_frame_num = 0;
-                self.prev_frame_num_offset = 0;
-            }
-            let is_ref = ref_idc != 0;
-            let out_slice = self.free.pop().ok_or_else(|| anyhow::anyhow!("pool exhausted"))?;
-            let top_poc = self.compute_poc(sps, hdr, is_idr, is_ref);
-            self.feedback = self.feedback.wrapping_add(1).max(1);
+            let mut out: Vec<Decoded> = Vec::new();
+            // POC first (needs prev-picture state, before it is overwritten below).
+            self.compute_pic_order_count(&mut pic, sps, is_idr)?;
 
-            let pic = self.build_pic_params(sps, pps, hdr, is_ref, out_slice, top_poc, self.feedback);
+            if is_idr {
+                // C.4.4 / init_current_pic: flush prior output, then reset all state.
+                out.extend(self.drain_dpb());
+                self.reset_state();
+            }
+
+            // PicNum/FrameNumWrap for the driver's reference-list construction.
+            self.dpb
+                .update_pic_nums(u32::from(hdr.frame_num), sps.max_frame_num(), &pic);
+
+            let is_ref = pic.nal_ref_idc != 0;
+            let out_slice = self.free.pop().ok_or_else(|| anyhow::anyhow!("pool exhausted"))?;
+            self.feedback = self.feedback.wrapping_add(1).max(1);
+            let (cur_top, cur_bottom) = (pic.top_field_order_cnt, pic.bottom_field_order_cnt);
+            let poc = pic.pic_order_cnt;
+
+            let pp = self.build_pic_params(
+                sps_bits, pps, hdr, is_ref, out_slice, cur_top, cur_bottom, self.feedback,
+            );
             let qm = DXVA_Qmatrix_H264 {
                 bScalingLists4x4: [[16u8; 16]; 6],
                 bScalingLists8x8: [[16u8; 64]; 2],
@@ -810,15 +1136,24 @@ impl Dxva {
             // All slices of the picture -> one bitstream buffer + a packed
             // (10-byte-stride) SliceControl array; buffer order PP, IQ, BS, SC.
             let n_mbs = (self.width / 16) * (self.height / 16);
+            // Annex-B bitstream: a FIXED 3-byte start code before each slice NAL,
+            // with BSNALunitDataLocation pointing at the start code and
+            // SliceBytesInBuffer covering start-code + NAL (ffmpeg dxva2_h264
+            // commit_bitstream_and_slice_buffer). `slice_nals` hold the raw NAL
+            // WITHOUT any start code, so the length is exact — a variable-length
+            // (3- vs 4-byte) start code left CABAC slices misaligned.
+            const START_CODE: [u8; 3] = [0, 0, 1];
             let mut bitstream: Vec<u8> = Vec::new();
             let mut slice_ctl: Vec<DXVA_Slice_H264_Short> = Vec::new();
             for nal in slice_nals {
+                let loc = bitstream.len() as u32;
+                bitstream.extend_from_slice(&START_CODE);
+                bitstream.extend_from_slice(nal);
                 slice_ctl.push(DXVA_Slice_H264_Short {
-                    BSNALunitDataLocation: bitstream.len() as u32,
-                    SliceBytesInBuffer: nal.len() as u32,
+                    BSNALunitDataLocation: loc,
+                    SliceBytesInBuffer: (START_CODE.len() + nal.len()) as u32,
                     wBadSliceChopping: 0,
                 });
-                bitstream.extend_from_slice(nal);
             }
             let padding = (128 - (bitstream.len() & 127)) & 127;
             if let Some(last) = slice_ctl.last_mut() {
@@ -832,7 +1167,7 @@ impl Dxva {
             );
 
             self.vcontext.DecoderBeginFrame(&self.decoder, &self.views[out_slice as usize], 0, None)?;
-            self.put(D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, as_bytes(&pic))?;
+            self.put(D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, as_bytes(&pp))?;
             self.put(D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX, as_bytes(&qm))?;
             let bs_padded = self.put_bitstream(&bitstream)?;
             self.put(D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, sc_bytes)?;
@@ -845,40 +1180,80 @@ impl Dxva {
             self.vcontext.SubmitDecoderBuffers(&self.decoder, &descs)?;
             self.vcontext.DecoderEndFrame(&self.decoder)?;
 
-            // Take the decoded picture out of the pool slice: either read it back
-            // to I420 (CPU), or copy it (GPU-side) to a per-frame texture. Either
-            // way the pool slice is then free for the DPB logic below to reuse.
+            // Copy the decoded picture out of the pool slice — read back to I420
+            // (CPU) or GPU-copy to its own NV12 texture — so the frame's display
+            // lifetime is decoupled from the pool. A reference picture's slice
+            // still stays resident in the pool (it is a decode reference) until the
+            // DPB retires it below.
             let payload = if gpu {
                 Payload::Gpu(self.export_texture(out_slice)?)
             } else {
                 Payload::Cpu(self.readback_i420(out_slice)?)
             };
 
-            // Sliding-window DPB (short-term only). Reference pics stay resident.
+            // Buffer the decoded picture for display, keyed by a DPB id — its pixels
+            // are now independent of the pool slot it was decoded into.
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            self.pending.insert(
+                id,
+                Decoded { poc, pts, width: self.width, height: self.height, payload },
+            );
+
+            // Reference marking (8.2.5): MMCO or sliding window retires references.
             if is_ref {
-                if self.dpb.len() >= sps.max_num_ref_frames.max(1) as usize {
-                    if let Some((idx, evicted)) = self
-                        .dpb
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, r)| r.frame_num)
-                        .map(|(i, r)| (i, *r))
-                    {
-                        self.free.push(evicted.slice);
-                        self.dpb.remove(idx);
+                self.reference_pic_marking(&mut pic, sps, is_idr)?;
+                self.prev_ref.fill(&pic);
+            }
+            self.prev_pic.fill(&pic);
+            if pic.has_mmco_5 {
+                out.extend(self.drain_dpb());
+            }
+
+            // Bump ready pictures out in display order (C.4.5.3). This is ALSO the
+            // only path that removes retired references from the DPB.
+            for h in self.dpb.bump_as_needed(&pic) {
+                if let Some(bid) = h {
+                    if let Some(d) = self.pending.remove(&bid) {
+                        out.push(d);
                     }
                 }
-                self.dpb.push(DpbRef { slice: out_slice, frame_num: hdr.frame_num, top_poc, bottom_poc: top_poc });
-            } else {
-                self.free.push(out_slice);
             }
-            Ok((payload, top_poc))
+
+            // Keep the picture in the DPB if it is a reference (which also pins its
+            // pool slot) or if there is still room for display reordering; else emit
+            // it now (non-reference, no buffer).
+            if is_ref {
+                self.slot_of.insert(id, out_slice);
+                self.dpb
+                    .store_picture(pic.into_rc(), Some(id))
+                    .map_err(|e| anyhow::anyhow!("dpb store: {e}"))?;
+            } else if self.dpb.has_empty_frame_buffer() {
+                self.dpb
+                    .store_picture(pic.into_rc(), Some(id))
+                    .map_err(|e| anyhow::anyhow!("dpb store: {e}"))?;
+            } else if let Some(d) = self.pending.remove(&id) {
+                out.push(d);
+            }
+
+            // Reconcile the pool: a slot is live iff a still-referenced DPB entry
+            // holds it (via `slot_of`, which only tracks reference pictures). Retired
+            // references and output-buffered non-reference pictures free their slot.
+            let live_ids: std::collections::HashSet<u64> =
+                self.dpb.entries().iter().filter_map(|e| e.reference).collect();
+            self.slot_of.retain(|id, _| live_ids.contains(id));
+            let live_slots: std::collections::HashSet<u8> = self.slot_of.values().copied().collect();
+            self.free = (0..self.slots as u8).filter(|s| !live_slots.contains(s)).collect();
+
+            Ok(out)
         }
     }
 
     /// GPU-side copy of one decode surface into its own NV12 texture (Phase-2
     /// output). Stays on the GPU — no CPU roundtrip — and decouples the frame's
-    /// lifetime from the pool/DPB. `BIND_SHADER_RESOURCE` so ANGLE can sample it.
+    /// lifetime from the pool/DPB. `SHADER_RESOURCE | RENDER_TARGET`: ANGLE's
+    /// EGL_ANGLE_image_d3d11_texture import needs the per-plane R8/RG8 views to be
+    /// render-targetable (verified in repros/d3d11-angle-import-spike).
     unsafe fn export_texture(&self, slice: u8) -> anyhow::Result<GpuTex> {
         let tdesc = D3D11_TEXTURE2D_DESC {
             Width: self.width,
@@ -888,7 +1263,7 @@ impl Dxva {
             Format: DXGI_FORMAT_NV12,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };

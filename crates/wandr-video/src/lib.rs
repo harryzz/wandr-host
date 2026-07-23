@@ -29,6 +29,11 @@ pub mod convert;
 
 pub use convert::{i420_to_rgba, i420_to_rgba_with, Rgb24Frame};
 
+/// Windows/DXVA2 only: tell the d3d11 decoder which `ID3D11Device` to decode on
+/// (ANGLE's, for zero-copy import). Call on the GL thread before opening a decoder.
+#[cfg(all(feature = "d3d11", target_os = "windows"))]
+pub use backends::d3d11::set_angle_d3d11_device;
+
 // ── codec vocabulary ─────────────────────────────────────────────────────────
 // Only what a codec actually needs. The host's WIT-shaped types (VideoRect,
 // ZLayer, EncoderConfig, DecoderConfig, EncodedFrame) stay in `video.rs`; the
@@ -470,6 +475,17 @@ pub struct D3d11View {
     pub device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
     /// Which array slice of `texture` holds this frame (0 for a per-frame texture).
     pub array_slice: u32,
+}
+
+#[cfg(all(feature = "d3d11", target_os = "windows"))]
+impl D3d11View {
+    /// The raw `ID3D11Texture2D*` to pass as ANGLE's `EGL_D3D11_TEXTURE_ANGLE`
+    /// client buffer. Keeps the `windows` crate dependency inside this crate — the
+    /// host's `video_gl` import takes an opaque pointer.
+    pub fn texture_ptr(&self) -> *mut std::ffi::c_void {
+        use windows::core::Interface;
+        self.texture.as_raw()
+    }
 }
 
 /// A borrowed, non-owning view of a decoded I420 frame.

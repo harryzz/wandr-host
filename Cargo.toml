@@ -235,6 +235,11 @@ p3-async = ["wasmtime/component-model-async", "wasmtime-wasi/p3", "wasmtime-wasi
 # usable VA driver at runtime, the backend probes, declines, and software decodes
 # exactly as before — so enabling it can slow nothing down and break nothing.
 vaapi = ["wandr-video/vaapi"]
+# Windows HW H.264 decode via DXVA2/D3D11 (crates/wandr-video, feature `d3d11`) +
+# the ANGLE zero-copy import in src/video_gl.rs. Enabled on the Windows build;
+# inert (and unbuilt) elsewhere. Off by default until the Windows host bring-up
+# provisions ANGLE and runs it — see reference_media_codec_strategy.md (Phase 2b).
+d3d11 = ["wandr-video/d3d11"]
 
 [package.metadata.android]
 package = "com.example.wasmruntime"

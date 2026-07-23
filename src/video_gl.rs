@@ -87,6 +87,21 @@ const DRM_FORMAT_GR88: u32 = u32::from_le_bytes(*b"GR88");
 const DRM_FORMAT_NV12: u32 = u32::from_le_bytes(*b"NV12");
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
+// EGL_ANGLE_image_d3d11_texture — import a D3D11 NV12 texture into GL on Windows
+// (ANGLE), the analog of dma-buf import. Per plane: create an EGLImage over the
+// texture with a plane index + GL internal format, then bind it to a GL texture.
+// Verified in repros/d3d11-angle-import-spike.
+#[allow(dead_code)]
+const EGL_D3D11_TEXTURE_ANGLE: u32 = 0x3484;
+#[allow(dead_code)]
+const EGL_D3D11_TEXTURE_PLANE_ANGLE: i32 = 0x3492;
+#[allow(dead_code)]
+const EGL_TEXTURE_INTERNAL_FORMAT_ANGLE: i32 = 0x345D;
+#[allow(dead_code)]
+const GL_R8: i32 = 0x8229; // Y plane
+#[allow(dead_code)]
+const GL_RG8: i32 = 0x822B; // interleaved UV plane
+
 /// The plane's dma-buf as an EGL attribute (a raw fd). Unix-only: dma-buf import
 /// is a Linux concept, and on Windows `import_nv12` returns `Err` at its EGL
 /// guard before this is ever reached (there is no dma-buf import extension), so
@@ -112,6 +127,8 @@ struct Egl {
     /// `EGL_EXT_image_dma_buf_import_modifiers`. Without it we cannot DESCRIBE a
     /// modifier, which on tiled hardware means we must not claim one.
     modifiers: bool,
+    /// `EGL_ANGLE_image_d3d11_texture` — the Windows/ANGLE zero-copy import path.
+    d3d11_image: bool,
 }
 
 // SAFETY: these are process-wide function pointers and one EGLDisplay handle,
@@ -127,6 +144,49 @@ static EGL: OnceLock<Option<Egl>> = OnceLock::new();
 /// display and the only thread where the context is ever current.
 pub fn register(display: &glutin::display::Display) {
     let _ = EGL.set(build(display));
+    // Windows: point the d3d11 decoder at ANGLE's D3D11 device, so its output
+    // texture imports here as a same-device alias (zero-copy). Harmless if the
+    // query fails — the decoder then uses its own device and we read back.
+    #[cfg(all(feature = "d3d11", target_os = "windows"))]
+    register_angle_d3d11_device(display);
+}
+
+/// Extract ANGLE's `ID3D11Device` from the EGL display and hand it to wandr-video
+/// (`set_angle_d3d11_device`), so decode lands on the same device this GL context
+/// samples from. On x86_64 Windows `extern "C"` == the platform ABI, matching the
+/// rest of this module's EGL entry points.
+#[cfg(all(feature = "d3d11", target_os = "windows"))]
+fn register_angle_d3d11_device(display: &glutin::display::Display) {
+    use glutin::display::GlDisplay;
+    const EGL_DEVICE_EXT: i32 = 0x322C;
+    const EGL_D3D11_DEVICE_ANGLE: i32 = 0x33A1;
+    type QueryDisplayAttrib = unsafe extern "C" fn(EglDisplay, i32, *mut isize) -> u32;
+    type QueryDeviceAttrib = unsafe extern "C" fn(*const c_void, i32, *mut isize) -> u32;
+
+    let Some(egl_display) = raw_egl_display(display) else { return };
+    let sym = |name: &str| -> *const c_void {
+        CString::new(name).ok().map(|c| display.get_proc_address(c.as_c_str())).unwrap_or(std::ptr::null())
+    };
+    let (qd, qdev) = (sym("eglQueryDisplayAttribEXT"), sym("eglQueryDeviceAttribEXT"));
+    if qd.is_null() || qdev.is_null() {
+        log::info!("video_gl: eglQueryD*AttribEXT missing — d3d11 decode stays own-device (readback)");
+        return;
+    }
+    // SAFETY: non-null pointers for these exact names; queries write one isize each.
+    unsafe {
+        let query_display: QueryDisplayAttrib = std::mem::transmute(qd);
+        let query_device: QueryDeviceAttrib = std::mem::transmute(qdev);
+        let mut dev: isize = 0;
+        if query_display(egl_display, EGL_DEVICE_EXT, &mut dev) != 1 {
+            return;
+        }
+        let mut d3d: isize = 0;
+        if query_device(dev as *const c_void, EGL_D3D11_DEVICE_ANGLE, &mut d3d) != 1 || d3d == 0 {
+            return;
+        }
+        wandr_video::set_angle_d3d11_device(d3d as *mut c_void);
+        log::info!("video_gl: d3d11 decode will use ANGLE's device (zero-copy import path)");
+    }
 }
 
 /// The raw `EGLDisplay`, or `None` if this platform's glutin display is not EGL.
@@ -186,8 +246,13 @@ fn build(display: &glutin::display::Display) -> Option<Egl> {
             unsafe { std::ffi::CStr::from_ptr(s) }.to_string_lossy().into_owned()
         }
     };
-    if !exts.contains("EGL_EXT_image_dma_buf_import") {
-        log::info!("video_gl: EGL_EXT_image_dma_buf_import missing — zero-copy import off");
+    // Two import capabilities: dma-buf (Linux VA-API) and D3D11 texture (Windows
+    // ANGLE). Either is enough to be useful; both share eglCreateImageKHR +
+    // glEGLImageTargetTexture2DOES, differing only in the image source.
+    let dma_buf = exts.contains("EGL_EXT_image_dma_buf_import");
+    let d3d11_image = exts.contains("EGL_ANGLE_image_d3d11_texture");
+    if !dma_buf && !d3d11_image {
+        log::info!("video_gl: no dma-buf or D3D11-texture import — zero-copy import off");
         return None;
     }
     let modifiers = exts.contains("EGL_EXT_image_dma_buf_import_modifiers");
@@ -202,9 +267,11 @@ fn build(display: &glutin::display::Display) -> Option<Egl> {
         bind_texture: load!("glBindTexture", GlBindTexture),
         tex_parameteri: load!("glTexParameteri", GlTexParameteri),
         modifiers,
+        d3d11_image,
     };
     log::info!(
-        "video_gl: zero-copy import AVAILABLE (dma_buf_import, modifiers {})",
+        "video_gl: zero-copy import AVAILABLE (dma_buf {}, d3d11_image {}, modifiers {})",
+        dma_buf, d3d11_image,
         if modifiers { "yes" } else { "NO — tiled buffers will be refused" }
     );
     Some(egl)
@@ -250,6 +317,16 @@ impl Drop for TextureFrame {
 /// Returning the frame is what lets the caller read back instead.
 pub fn import_nv12(frame: GpuFrame) -> Result<TextureFrame, GpuFrame> {
     let Some(Some(egl)) = EGL.get() else { return Err(frame) };
+
+    // Windows/ANGLE: a GPU frame is a D3D11 texture, imported per-plane via
+    // EGL_ANGLE_image_d3d11_texture. On Err the frame comes back and the dma-buf
+    // path below reads it back (which is also what happens for a non-D3D11 frame).
+    #[cfg(all(feature = "d3d11", target_os = "windows"))]
+    let frame = match import_d3d11(egl, frame) {
+        Ok(tf) => return Ok(tf),
+        Err(f) => f,
+    };
+
     if frame.fourcc != DRM_FORMAT_NV12 || frame.planes.len() < 2 {
         log::warn!("video_gl: not 2-plane NV12 (fourcc {:#x}) — reading back", frame.fourcc);
         return Err(frame);
@@ -337,5 +414,64 @@ pub fn import_nv12(frame: GpuFrame) -> Result<TextureFrame, GpuFrame> {
         }
     }
 
+    Ok(TextureFrame { y_tex: texes[0], uv_tex: texes[1], width: w, height: h, _frame: frame })
+}
+
+/// Import a decoded NV12 frame that lives in a D3D11 texture (Windows/DXVA2) as
+/// two GL textures, via ANGLE's `EGL_ANGLE_image_d3d11_texture`. Same two-texture
+/// (R8 luma + GR88 chroma) shape as the dma-buf path — Skia applies the matrix.
+///
+/// The texture is on ANGLE's own D3D11 device (the decoder was pointed at it via
+/// `wandr_video::set_angle_d3d11_device`), so this is a same-device alias — no
+/// shared handle, no copy. Hands the frame back on any failure, like `import_nv12`.
+#[cfg(all(feature = "d3d11", target_os = "windows"))]
+fn import_d3d11(egl: &Egl, frame: GpuFrame) -> Result<TextureFrame, GpuFrame> {
+    let Some(view) = frame.d3d11() else { return Err(frame) };
+    if !egl.d3d11_image {
+        log::warn!("video_gl: D3D11 frame but no EGL_ANGLE_image_d3d11_texture — reading back");
+        return Err(frame);
+    }
+    let (w, h) = (frame.width, frame.height);
+    let tex_ptr = view.texture_ptr();
+
+    let mut texes = [0u32; 2];
+    // SAFETY: our own names; the context is current on this thread.
+    unsafe { (egl.gen_textures)(2, texes.as_mut_ptr()) };
+
+    // Plane 0 = luma (R8), plane 1 = interleaved chroma (RG8).
+    for (i, (plane, internal_fmt)) in [(0i32, GL_R8), (1i32, GL_RG8)].into_iter().enumerate() {
+        let attrs: [i32; 5] = [
+            EGL_D3D11_TEXTURE_PLANE_ANGLE, plane,
+            EGL_TEXTURE_INTERNAL_FORMAT_ANGLE, internal_fmt,
+            EGL_NONE,
+        ];
+        // SAFETY: attrs is EGL_NONE-terminated; the texture outlives this call
+        // because `frame` (which owns it) is held to the end of the function.
+        let image = unsafe {
+            (egl.create_image)(
+                egl.display,
+                std::ptr::null(), // EGL_NO_CONTEXT
+                EGL_D3D11_TEXTURE_ANGLE,
+                tex_ptr,
+                attrs.as_ptr(),
+            )
+        };
+        if image == EGL_NO_IMAGE {
+            log::warn!("video_gl: eglCreateImageKHR(D3D11) failed for plane {i} — reading back");
+            unsafe { (egl.delete_textures)(2, texes.as_ptr()) };
+            return Err(frame);
+        }
+        // SAFETY: valid image; texture name we just generated.
+        unsafe {
+            (egl.bind_texture)(GL_TEXTURE_2D, texes[i]);
+            (egl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            (egl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            (egl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            (egl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            (egl.image_target_texture)(GL_TEXTURE_2D, image);
+            (egl.destroy_image)(egl.display, image);
+            (egl.bind_texture)(GL_TEXTURE_2D, 0);
+        }
+    }
     Ok(TextureFrame { y_tex: texes[0], uv_tex: texes[1], width: w, height: h, _frame: frame })
 }
