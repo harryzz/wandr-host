@@ -31,7 +31,7 @@ use nokhwa::Camera;
 
 use wandr_video::{CodecError, DecoderParams, EncoderParams, Rgb24Frame};
 
-use crate::video::{Codec, DecoderConfig, EncodedFrame, EncoderConfig, VideoError, VideoRect};
+use crate::video::{Codec, DecoderConfig, EncodedFrame, EncoderConfig, VideoError, VideoRect, ZLayer};
 
 /// The codec crate's errors are narrower than the WIT surface (a codec cannot
 /// fail with `surface-unavailable`), so widen at the boundary.
@@ -78,6 +78,10 @@ struct VideoSurface {
     /// Degrees CW to rotate for upright display (the decoder's peer-CVO rotation;
     /// 0 for the self-view preview).
     rotation: u32,
+    /// Whether the video sits BELOW the guest's UI (`behind-ui`) or above it
+    /// (`above-ui`). Below is the norm for a player — the guest draws controls,
+    /// title and SUBTITLES over the picture. See `composite_video_surfaces`.
+    layer: ZLayer,
 }
 
 thread_local! {
@@ -208,6 +212,18 @@ pub fn composite_video_surfaces(canvas: &skia_safe::Canvas) {
             );
             let mut paint = skia_safe::Paint::default();
             paint.set_anti_alias(true);
+            // ‼️ behind-ui: draw the video UNDER what the guest already painted.
+            // `composite_video_surfaces` runs inside the guest's `present`, i.e.
+            // AFTER the guest drew — so to land underneath we blend `dst-over`
+            // (r = d + (1-da)*s) instead of the default `src-over`, rather than
+            // reordering the whole compositor. This is the same identity Chromium
+            // and Firefox use to underlay a video plane; we own the pixels, so we
+            // get the simpler half of it. It requires the guest to leave the video
+            // rect TRANSPARENT — the desktop twin of clearing the layer's opaque
+            // flag on Android. above-ui keeps the default src-over (paints on top).
+            if s.layer == ZLayer::BehindUi {
+                paint.set_blend_mode(skia_safe::BlendMode::DstOver);
+            }
             canvas.save();
             canvas.reset_matrix();
             // Peer CVO rotation, about the rect centre (no-op for the preview).
@@ -228,7 +244,26 @@ pub fn composite_video_surfaces(canvas: &skia_safe::Canvas) {
     });
 }
 
-fn alloc_surface(rect: VideoRect, mirror: bool, rotation: u32) -> u32 {
+/// Is a `behind-ui` video surface currently visible? The canvas host asks this
+/// each frame to decide its clear colour: an opaque black clear would bury a
+/// behind-ui video (which is composited `dst-over`), so when one is live the
+/// frame is cleared TRANSPARENT and the guest is responsible for the video hole.
+/// With none, the clear stays opaque black exactly as before — so every app that
+/// does not use behind-ui video is completely unaffected.
+#[cfg(not(target_os = "android"))]
+pub fn has_behind_ui_video() -> bool {
+    SURFACES.with(|m| {
+        m.borrow().values().any(|s| {
+            s.visible
+                && s.layer == ZLayer::BehindUi
+                && s.content.is_some()
+                && s.rect.w > 0
+                && s.rect.h > 0
+        })
+    })
+}
+
+fn alloc_surface(rect: VideoRect, mirror: bool, rotation: u32, layer: ZLayer) -> u32 {
     let id = SURFACE_NEXT.with(|n| {
         let v = n.get();
         n.set(v.wrapping_add(1).max(1));
@@ -236,7 +271,7 @@ fn alloc_surface(rect: VideoRect, mirror: bool, rotation: u32) -> u32 {
     });
     SURFACES.with(|m| {
         m.borrow_mut().insert(id, VideoSurface {
-            content: None, w: 0, h: 0, rect, visible: true, mirror, rotation,
+            content: None, w: 0, h: 0, rect, visible: true, mirror, rotation, layer,
         });
     });
     id
@@ -382,7 +417,8 @@ impl VideoEncoder {
 
         // PiP self-view: register a slot the render loop composites (above-ui).
         // Self-view surface: mirrored, upright (rotation 0).
-        let preview_id = config.preview.map(|rect| alloc_surface(rect, true, 0));
+        let preview_id =
+            config.preview.map(|rect| alloc_surface(rect, true, 0, ZLayer::AboveUi));
 
         // Capture thread: owns the camera, blocks on frame() here (not on the
         // store thread), and publishes the newest RGB frame into `latest`.
@@ -812,7 +848,7 @@ impl VideoDecoder {
         let surface_id = config.rect.filter(|r| r.w > 0 && r.h > 0).map(|rect| {
             log::info!("video_desktop: decode-to-surface {}x{} @ ({},{}) rot={}°",
                 rect.w, rect.h, rect.x, rect.y, config.rotation);
-            alloc_surface(rect, false, config.rotation)
+            alloc_surface(rect, false, config.rotation, config.layer)
         });
         Ok(Self { dec, decoded: 0, surface_id, rgba: Vec::new(), gpu_scratch: Vec::new(),
                   pending: VecDeque::new(), dropped: 0,

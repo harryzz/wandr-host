@@ -1364,7 +1364,20 @@ impl wit_embedding::HostCanvasContext for HostState {
         let base = self.renderer.base_matrix;
         let c = self.renderer.canvas();
         c.reset_matrix();
-        c.clear(skia_safe::Color::BLACK);
+        // Opaque black by default — the frame's opaque backdrop. But a behind-ui
+        // video is composited UNDER the guest's paint (`dst-over`), so an opaque
+        // clear would bury it. When one is live, clear TRANSPARENT instead and let
+        // the video show through wherever the guest leaves the buffer clear. Apps
+        // with no behind-ui video are unchanged.
+        #[cfg(not(target_os = "android"))]
+        let behind_video = crate::video_desktop::has_behind_ui_video();
+        #[cfg(target_os = "android")]
+        let behind_video = false;
+        c.clear(if behind_video {
+            skia_safe::Color::TRANSPARENT
+        } else {
+            skia_safe::Color::BLACK
+        });
         c.concat(&base);
         Ok(self.table.push(CanvasRes::Main)?)
     }
