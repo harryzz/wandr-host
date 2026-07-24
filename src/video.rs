@@ -149,33 +149,24 @@ pub(crate) fn device_rotation_deg() -> u32 {
     DEVICE_ROTATION_DEG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// Playback scheduling (task 117 M2). `TakenFrame` + `schedule_present` are the
+// Android playback lane, defined in `mod android` alongside the decoder that
+// produces them. On Android there is no CPU-side scheduled queue (the desktop
+// `SCHEDULED` thread-local): `AMediaCodec_releaseOutputBufferAtTime` hands the
+// presentation timestamp straight to the HW compositor.
 #[cfg(target_os = "android")]
-pub use android::{ensure_binder_threadpool, VideoDecoder, VideoEncoder};
+pub use android::{
+    ensure_binder_threadpool, schedule_present, TakenFrame, VideoDecoder, VideoEncoder,
+};
 
-// Playback scheduling (task 117 M2 stage 1). Android has no CPU-side queue —
-// `AMediaCodec_releaseOutputBufferAtTime` gives the timestamp to the HW
-// compositor — so these are stubs until that path is written. See the
-// `submit_for_playback` comment in `mod android`.
-#[cfg(target_os = "android")]
-pub struct TakenFrame(());
-#[cfg(target_os = "android")]
-impl TakenFrame {
-    pub fn timestamp_us(&self) -> i64 {
-        0
-    }
-    pub fn present_now(self) {}
-}
+/// Monotonic host clock in nanoseconds — the timeline `present(at-ns)` speaks.
+/// Real CLOCK_MONOTONIC (shared with `wasi:clocks` and `on-frame`), which is
+/// exactly what `AMediaCodec_releaseOutputBufferAtTime` takes — so a deadline
+/// the guest computes needs no conversion on the way to the HW compositor.
 #[cfg(target_os = "android")]
 pub fn monotonic_now_ns() -> u64 {
-    // Real CLOCK_MONOTONIC, not the old `0` stub: this is the clock
-    // `AMediaCodec_releaseOutputBufferAtTime` takes, so when the Android
-    // playback lane is written it needs no conversion. Nothing consumes it yet
-    // (playback returns UnsupportedCodec here), so this is inert until then —
-    // and UNVERIFIED on device.
     crate::host_clock::now_ns()
 }
-#[cfg(target_os = "android")]
-pub fn schedule_present(_at_ns: u64, _frame: TakenFrame) {}
 
 // Desktop (Linux/WSLg/Win/mac) backend: nokhwa camera + software VP8/VP9 via the
 // wandr-video crate (statically-linked libvpx; task 117 replaced ffmpeg).
@@ -262,6 +253,7 @@ pub mod ndk {
     pub const CONFIGURE_FLAG_ENCODE: u32 = 1;
     pub const BUFFER_FLAG_KEY_FRAME: u32 = 1;
     pub const BUFFER_FLAG_CODEC_CONFIG: u32 = 2;
+    pub const BUFFER_FLAG_END_OF_STREAM: u32 = 4;
     pub const INFO_OUTPUT_FORMAT_CHANGED: isize = -2;
     pub const INFO_OUTPUT_BUFFERS_CHANGED: isize = -3;
     pub const AIMAGE_FORMAT_YUV_420_888: i32 = 0x23;
@@ -334,6 +326,14 @@ pub mod ndk {
         pub fn AMediaCodec_setParameters(c: *mut AMediaCodec, params: *const AMediaFormat) -> c_int;
         pub fn AMediaCodec_dequeueOutputBuffer(c: *mut AMediaCodec, info: *mut AMediaCodecBufferInfo, timeout_us: i64) -> isize;
         pub fn AMediaCodec_releaseOutputBuffer(c: *mut AMediaCodec, idx: usize, render: bool) -> c_int;
+        /// Schedule the decoded output buffer for HW-composited presentation at
+        /// `timestamp_ns` on the CLOCK_MONOTONIC timeline (task 117 M2 playback):
+        /// the pixels go straight to SurfaceFlinger, never reaching the CPU —
+        /// this IS `decoded-frame.present(at-ns)`. (API 21+.)
+        pub fn AMediaCodec_releaseOutputBufferAtTime(c: *mut AMediaCodec, idx: usize, timestamp_ns: i64) -> c_int;
+        /// Drop all in-flight input/output buffers (seek). Held output indices
+        /// become invalid afterwards. (API 21+.)
+        pub fn AMediaCodec_flush(c: *mut AMediaCodec) -> c_int;
         pub fn AMediaCodec_getOutputBuffer(c: *mut AMediaCodec, idx: usize, out_size: *mut usize) -> *mut u8;
         pub fn AMediaCodec_getInputBuffer(c: *mut AMediaCodec, idx: usize, out_size: *mut usize) -> *mut u8;
         pub fn AMediaCodec_dequeueInputBuffer(c: *mut AMediaCodec, timeout_us: i64) -> isize;
@@ -404,7 +404,7 @@ mod android {
     use std::os::raw::{c_int, c_void};
     use std::ptr;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::Relaxed};
-    use std::sync::Once;
+    use std::sync::{Arc, Once};
 
     /// Idempotent threadpool start. Deliberately LAZY (first encoder/decoder
     /// `open`), never at host init: app processes fork from the zygote and
@@ -623,6 +623,78 @@ mod android {
     }
     fn ts_90khz_to_us(ts: u32) -> u64 {
         (ts as u64).wrapping_mul(100) / 9
+    }
+
+    // ── playback: one decoded HW frame the guest holds (task 117 M2) ──────
+    //
+    // Unlike the desktop `TakenFrame` (which owns RGBA/GL pixels and is fully
+    // self-contained), the Android frame is just an INDEX into the decoder's
+    // MediaCodec output-buffer pool. The pixels stay in HW; presenting =
+    // `releaseOutputBufferAtTime(codec, idx, at_ns)`, which composites straight
+    // to the surface — the zero-copy path the whole contract was shaped for.
+    // HOLDING the index (not releasing it) is itself the back-pressure: the
+    // codec cannot reuse that output buffer, so decode stalls until the guest
+    // presents or discards, which is exactly the conversation the contract wants.
+
+    /// A decoded frame the guest holds while it decides when to show it.
+    pub struct TakenFrame {
+        /// Borrowed from the owning `VideoDecoder`; valid ONLY while `alive`.
+        codec: *mut AMediaCodec,
+        /// Output-buffer index; meaningful only against this exact codec instance.
+        idx: usize,
+        pts_us: i64,
+        /// Shared with the decoder. Set false in `VideoDecoder::drop` BEFORE the
+        /// codec is deleted, so a frame that outlives its decoder no-ops instead
+        /// of releasing a stale index into freed memory. Safe without a lock
+        /// because every access is serialized on the one wasmtime Store thread.
+        alive: Arc<AtomicBool>,
+        /// True once presented/scheduled, so `Drop` does not double-release.
+        consumed: bool,
+    }
+
+    // The raw pointer + index are only ever touched on the store thread (same
+    // justification as VideoDecoder); the pointer is what blocks the auto-impl.
+    unsafe impl Send for TakenFrame {}
+
+    impl TakenFrame {
+        pub fn timestamp_us(&self) -> i64 {
+            self.pts_us
+        }
+
+        /// Present as soon as possible (`present(at-ns)` with `at-ns == 0`).
+        pub fn present_now(mut self) {
+            if self.alive.load(Relaxed) {
+                unsafe { AMediaCodec_releaseOutputBuffer(self.codec, self.idx, true) };
+            }
+            self.consumed = true;
+        }
+    }
+
+    impl Drop for TakenFrame {
+        /// Dropping without present/discard == discard: return the buffer to the
+        /// codec WITHOUT rendering. Skipped if the decoder is already gone (the
+        /// index and codec died with it) or the frame was already consumed.
+        fn drop(&mut self) {
+            if !self.consumed && self.alive.load(Relaxed) {
+                unsafe { AMediaCodec_releaseOutputBuffer(self.codec, self.idx, false) };
+            }
+        }
+    }
+
+    /// Schedule `frame` for HW-composited presentation at `at_ns` (CLOCK_MONOTONIC
+    /// ns). `at_ns == 0` presents ASAP. Consumes the frame — the buffer index is
+    /// handed to the compositor, so there is nothing left to release on drop.
+    pub fn schedule_present(at_ns: u64, mut frame: TakenFrame) {
+        if frame.alive.load(Relaxed) {
+            unsafe {
+                if at_ns == 0 {
+                    AMediaCodec_releaseOutputBuffer(frame.codec, frame.idx, true);
+                } else {
+                    AMediaCodec_releaseOutputBufferAtTime(frame.codec, frame.idx, at_ns as i64);
+                }
+            }
+        }
+        frame.consumed = true;
     }
 
     // ── encoder: camera → input surface → HW VP8 ──────────────────────────
@@ -1048,6 +1120,15 @@ mod android {
         guest_rect: super::VideoRect,
         /// Device-rotation generation this surface's geometry was applied at.
         geom_gen: u32,
+        /// PLAYBACK mode (task 117 M2): set true on the first `submit_for_playback`.
+        /// The call lane (`submit` → `drain` auto-renders ASAP) and the playback
+        /// lane (frames pulled via `take_next_decoded`, presented by timestamp)
+        /// are mutually exclusive per the WIT note; this guards against a stray
+        /// `drain` stealing a frame the guest still owns.
+        playback: bool,
+        /// Shared with every outstanding `TakenFrame`. Flipped false at the top of
+        /// `drop`, before the codec is deleted, so held frames no-op on release.
+        codec_alive: Arc<AtomicBool>,
     }
 
     // Same justification as VideoEncoder: AMediaCodec is thread-safe and
@@ -1067,6 +1148,8 @@ mod android {
                 cvo: config.rotation % 360,
                 guest_rect: super::VideoRect { x: 0, y: 0, w: 0, h: 0 },
                 geom_gen: super::geom_gen(),
+                playback: false,
+                codec_alive: Arc::new(AtomicBool::new(true)),
             };
             // Decode-to-surface: allocate the compositing surface first (its
             // window is the codec's render target). Failure here is fatal —
@@ -1154,39 +1237,116 @@ mod android {
             self.decoded
         }
 
-        // ── PLAYBACK (task 117 M2 stage 1) — NOT YET IMPLEMENTED ON ANDROID ──
+        // ── PLAYBACK (task 117 M2) ────────────────────────────────────────
         //
-        // Playback was built desktop-first, so these are honest stubs rather
-        // than silent no-ops: a guest that tries file playback on Android gets
-        // a clear `unsupported-codec` instead of a decoder that accepts frames
-        // and never shows anything (the silent-failure mode this project has
-        // been bitten by before).
+        // NOT a port of the desktop path. Desktop holds decoded RGBA in a CPU
+        // queue because frames come back to the CPU; Android holds a MediaCodec
+        // output-buffer INDEX and presents via
+        // `AMediaCodec_releaseOutputBufferAtTime(codec, idx, at_ns)`, which hands
+        // the presentation time straight to the HW compositor — pixels never
+        // reach the CPU. That is `decoded-frame.present(at-ns)` exactly, and is
+        // why the contract was shaped this way. `at_ns` is already CLOCK_MONOTONIC
+        // (host_clock == wasi:clocks == what this NDK call takes), so no conversion.
         //
-        // The Android implementation is NOT a port of the desktop one. Desktop
-        // holds decoded RGBA in a CPU queue because it must; Android should use
-        // `AMediaCodec_releaseOutputBufferAtTime(codec, idx, at_ns)`, which
-        // hands the presentation timestamp straight to the HW compositor —
-        // frames never reach the CPU. That maps 1:1 onto `present(at-ns)` and
-        // is precisely why the contract was shaped this way.
+        // The guest alternates `submit_for_playback` (until QueueFull) with
+        // `take_next_decoded` (pull + present): holding output indices back-
+        // pressures the codec, which back-pressures input — the conversation the
+        // desktop `in_flight_cap` simulates and MediaCodec's pool provides for free.
 
-        /// Push a frame carrying a real presentation timestamp.
-        pub fn submit_for_playback(&mut self, _data: &[u8], _pts_us: i64) -> Result<(), VideoError> {
-            Err(VideoError::UnsupportedCodec)
+        /// Push a frame carrying a real presentation timestamp. Decode-to-surface
+        /// only: `releaseOutputBufferAtTime` needs a surface to composite into.
+        pub fn submit_for_playback(&mut self, data: &[u8], pts_us: i64) -> Result<(), VideoError> {
+            if data.is_empty() {
+                return Err(VideoError::BadFrame);
+            }
+            if self.slot.is_none() {
+                // No compositing surface → nowhere for a scheduled present to land.
+                return Err(VideoError::SurfaceUnavailable);
+            }
+            self.playback = true;
+            if self.geom_gen != super::geom_gen() {
+                self.apply_geometry();
+            }
+            unsafe {
+                let di = AMediaCodec_dequeueInputBuffer(self.codec, 0);
+                if di < 0 {
+                    // Input pool full because output is not draining fast enough:
+                    // BACK-PRESSURE, not loss. The guest pulls a frame and retries
+                    // THIS same AU (contract: `queue-full` on submit-timed).
+                    return Err(VideoError::QueueFull);
+                }
+                let mut isz: usize = 0;
+                let ibuf = AMediaCodec_getInputBuffer(self.codec, di as usize, &mut isz);
+                if ibuf.is_null() || data.len() > isz {
+                    log::warn!("video: playback input buffer null or AU too large ({} > {isz})", data.len());
+                    return Err(VideoError::BadFrame);
+                }
+                ptr::copy_nonoverlapping(data.as_ptr(), ibuf, data.len());
+                // pts_us as u64 round-trips: the same bits come back in
+                // BufferInfo.presentation_time_us (read as i64), so negative
+                // container PTS survives. Presentation time (`at_ns`) is separate.
+                AMediaCodec_queueInputBuffer(self.codec, di as usize, 0, data.len(), pts_us as u64, 0);
+            }
+            Ok(())
         }
 
-        /// End of stream — drain what the codec held back for reordering.
-        pub fn finish_playback(&mut self) -> Result<(), VideoError> {
-            Err(VideoError::UnsupportedCodec)
-        }
-
-        /// Seek — drop queued input and held references.
-        pub fn seek_reset(&mut self) -> Result<(), VideoError> {
-            Err(VideoError::UnsupportedCodec)
-        }
-
-        /// Take the next decoded frame in display order.
+        /// Take the next decoded frame in DISPLAY order (MediaCodec emits reorder-
+        /// resolved), if one is ready. Holds the output-buffer index — the guest
+        /// releases it via `present`/`discard`/drop. `None` = nothing ready yet.
         pub fn take_next_decoded(&mut self) -> Option<super::TakenFrame> {
+            let mut info = AMediaCodecBufferInfo { offset: 0, size: 0, presentation_time_us: 0, flags: 0 };
+            for _ in 0..16 {
+                let idx = unsafe { AMediaCodec_dequeueOutputBuffer(self.codec, &mut info, 0) };
+                if idx >= 0 {
+                    if info.flags & BUFFER_FLAG_END_OF_STREAM != 0 {
+                        // EOS sentinel (size 0) — recycle it, report nothing.
+                        unsafe { AMediaCodec_releaseOutputBuffer(self.codec, idx as usize, false) };
+                        return None;
+                    }
+                    self.decoded += 1;
+                    return Some(super::TakenFrame {
+                        codec: self.codec,
+                        idx: idx as usize,
+                        pts_us: info.presentation_time_us,
+                        alive: Arc::clone(&self.codec_alive),
+                        consumed: false,
+                    });
+                } else if idx == INFO_OUTPUT_FORMAT_CHANGED || idx == INFO_OUTPUT_BUFFERS_CHANGED {
+                    continue;
+                } else {
+                    return None; // try-again-later
+                }
+            }
             None
+        }
+
+        /// End of stream: queue an empty EOS input buffer so the codec flushes the
+        /// frames it holds back for reordering; the guest pulls them via
+        /// `take_next_decoded` until it drains. `QueueFull` if no input buffer is
+        /// free right now — the guest retries after pulling a frame.
+        pub fn finish_playback(&mut self) -> Result<(), VideoError> {
+            unsafe {
+                let di = AMediaCodec_dequeueInputBuffer(self.codec, 0);
+                if di < 0 {
+                    return Err(VideoError::QueueFull);
+                }
+                AMediaCodec_queueInputBuffer(self.codec, di as usize, 0, 0, 0, BUFFER_FLAG_END_OF_STREAM);
+            }
+            Ok(())
+        }
+
+        /// Seek: drop all in-flight input/output. Held `TakenFrame` indices become
+        /// invalid afterwards — but the contract states `reset` discards scheduled
+        /// presentations, so a conformant guest holds none across it (the desktop
+        /// path clears its `pending` queue for the same reason). A keyframe is
+        /// required to resume decoding.
+        pub fn seek_reset(&mut self) -> Result<(), VideoError> {
+            let st = unsafe { AMediaCodec_flush(self.codec) };
+            if st != AMEDIA_OK {
+                log::warn!("video: AMediaCodec_flush status={st}");
+                return Err(VideoError::CodecInitFailed);
+            }
+            Ok(())
         }
 
         /// Move/resize the video surface (no-op in decode-to-buffer mode).
@@ -1233,6 +1393,11 @@ mod android {
         }
 
         unsafe fn drain(&mut self) {
+            // Playback owns its output buffers (the guest holds them as
+            // `TakenFrame`s and presents by timestamp) — never auto-release them.
+            if self.playback {
+                return;
+            }
             // render=true sends the decoded buffer to the media surface
             // (decode-to-surface); with no surface it just recycles.
             let render = self.slot.is_some();
@@ -1253,6 +1418,11 @@ mod android {
 
     impl Drop for VideoDecoder {
         fn drop(&mut self) {
+            // FIRST: tell any outstanding `TakenFrame` the codec is gone, so its
+            // release path no-ops instead of touching a freed index. Everything
+            // here runs on the single store thread, so this ordering is a hard
+            // happens-before for any later frame present/discard/drop.
+            self.codec_alive.store(false, Relaxed);
             unsafe {
                 if !self.codec.is_null() {
                     if self.started { AMediaCodec_stop(self.codec); }

@@ -16,6 +16,7 @@ pub mod android {
     const EGL_WINDOW_BIT:       EGLint = 0x0004;
     const EGL_RENDERABLE_TYPE:  EGLint = 0x3040;
     const EGL_OPENGL_ES3_BIT:   EGLint = 0x0040;
+    const EGL_ALPHA_SIZE:       EGLint = 0x3021;
     const EGL_BLUE_SIZE:        EGLint = 0x3022;
     const EGL_GREEN_SIZE:       EGLint = 0x3023;
     const EGL_RED_SIZE:         EGLint = 0x3024;
@@ -76,6 +77,16 @@ pub mod android {
                     EGL_RED_SIZE,   8,
                     EGL_GREEN_SIZE, 8,
                     EGL_BLUE_SIZE,  8,
+                    // Request an alpha channel so a guest can render TRANSLUCENT
+                    // pixels (Skia clear to 0x00000000). Without this, eglChooseConfig
+                    // picks a no-alpha (RGBX) config and every transparent clear is
+                    // stored opaque — which makes the behind-ui video hole-punch
+                    // (decode-to-surface below a transparent app layer, task 117 M2
+                    // Android) composite as opaque black over the video. The app SF
+                    // layer is created eLayerOpaque by default, so an opaque-clearing
+                    // guest is unaffected — SF ignores the alpha until a guest opts in
+                    // via sf_set_opaque(false) (done when a behind-ui decoder opens).
+                    EGL_ALPHA_SIZE, 8,
                     EGL_DEPTH_SIZE, 0,
                     EGL_NONE,
                 ];
