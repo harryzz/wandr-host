@@ -252,25 +252,71 @@ impl CodecBackend for D3d11Backend {
     }
     fn supports_decode(&self, codec: Codec) -> bool {
         // Probe the actual driver: a build with the feature but no usable video
-        // device reports H.264 = unsupported and software stays the fallback.
-        codec == Codec::H264 && probe_h264().unwrap_or(false)
+        // device reports the codec = unsupported and software stays the fallback.
+        match codec {
+            Codec::H264 => probe_h264().unwrap_or(false),
+            Codec::H265 => {
+                let ok = probe_hevc().unwrap_or(false);
+                log::info!("d3d11: HEVC (DXVA HEVC_VLD_MAIN) decode supported by this GPU: {ok}");
+                ok
+            }
+            _ => false,
+        }
     }
     fn supports_encode(&self, _codec: Codec) -> bool {
         false
     }
     fn open_decoder(&self, params: &DecoderParams) -> Result<Box<dyn Decoder>, CodecError> {
-        if params.codec != Codec::H264 {
-            return Err(CodecError::Unsupported);
-        }
         // Fallback contract: fail here if HW can't decode, so the registry falls
         // back to software rather than us silently producing nothing.
-        if !probe_h264().unwrap_or(false) {
-            return Err(CodecError::InitFailed);
+        match params.codec {
+            Codec::H264 => {
+                if !probe_h264().unwrap_or(false) {
+                    return Err(CodecError::InitFailed);
+                }
+                Ok(Box::new(D3d11Decoder::new()))
+            }
+            Codec::H265 => {
+                if !probe_hevc().unwrap_or(false) {
+                    return Err(CodecError::InitFailed);
+                }
+                Ok(Box::new(super::hevc::HevcD3d11Decoder::new()))
+            }
+            _ => Err(CodecError::Unsupported),
         }
-        Ok(Box::new(D3d11Decoder::new()))
     }
     fn open_encoder(&self, _params: &EncoderParams) -> Result<Box<dyn Encoder>, CodecError> {
         Err(CodecError::Unsupported)
+    }
+}
+
+/// True if the default hardware adapter exposes an HEVC (Main / Main10) VLD
+/// decode profile — the increment-1 gate for Windows HW H.265 (task 117 M2).
+fn probe_hevc() -> anyhow::Result<bool> {
+    use super::hevc_dxva::{HEVC_VLD_MAIN, HEVC_VLD_MAIN10};
+    unsafe {
+        let mut device: Option<ID3D11Device> = None;
+        let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            Some(&levels),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )?;
+        let vdevice: ID3D11VideoDevice = device.ok_or_else(|| anyhow::anyhow!("no device"))?.cast()?;
+        let n = vdevice.GetVideoDecoderProfileCount();
+        for i in 0..n {
+            let g = vdevice.GetVideoDecoderProfile(i)?;
+            if g == HEVC_VLD_MAIN || g == HEVC_VLD_MAIN10 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
