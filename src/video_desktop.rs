@@ -126,6 +126,11 @@ fn image_for(
             // (GL_TEXTURE_EXTERNAL_OES) can only pass colour as an EGL *hint*
             // that drivers ignore, defaulting to BT.601 limited whatever the
             // content is.
+            // macOS imports the CVPixelBuffer's IOSurface, which CGL only exposes
+            // as GL_TEXTURE_RECTANGLE; the dma-buf/D3D11 lanes use GL_TEXTURE_2D.
+            #[cfg(target_os = "macos")]
+            const GL_TEXTURE_2D: u32 = 0x84F5; // GL_TEXTURE_RECTANGLE
+            #[cfg(not(target_os = "macos"))]
             const GL_TEXTURE_2D: u32 = 0x0DE1;
             const GL_R8: u32 = 0x8229;
             const GL_RG8: u32 = 0x822B;

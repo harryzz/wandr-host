@@ -300,11 +300,55 @@ pub struct TextureFrame {
 
 impl Drop for TextureFrame {
     fn drop(&mut self) {
-        let Some(Some(egl)) = EGL.get() else { return };
         let ids = [self.y_tex, self.uv_tex];
         // SAFETY: our own texture names, on the thread that created them.
-        unsafe { (egl.delete_textures)(2, ids.as_ptr()) };
+        #[cfg(target_os = "macos")]
+        unsafe {
+            gl_delete_textures(2, ids.as_ptr())
+        };
+        #[cfg(not(target_os = "macos"))]
+        {
+            let Some(Some(egl)) = EGL.get() else { return };
+            unsafe { (egl.delete_textures)(2, ids.as_ptr()) };
+        }
     }
+}
+
+// macOS CGL/IOSurface + GL entry points for the zero-copy import. The GL calls use
+// #[link_name] so they don't collide with the EGL-loaded pointers elsewhere; CGL
+// and the GL core live in the OpenGL framework, the surface accessors in their own.
+#[cfg(target_os = "macos")]
+#[link(name = "OpenGL", kind = "framework")]
+extern "C" {
+    fn CGLGetCurrentContext() -> *mut std::ffi::c_void;
+    fn CGLTexImageIOSurface2D(
+        ctx: *mut std::ffi::c_void,
+        target: u32,
+        internal_format: i32,
+        width: i32,
+        height: i32,
+        format: u32,
+        type_: u32,
+        io_surface: *mut std::ffi::c_void,
+        plane: u32,
+    ) -> i32;
+    #[link_name = "glGenTextures"]
+    fn gl_gen_textures(n: i32, textures: *mut u32);
+    #[link_name = "glBindTexture"]
+    fn gl_bind_texture(target: u32, texture: u32);
+    #[link_name = "glDeleteTextures"]
+    fn gl_delete_textures(n: i32, textures: *const u32);
+}
+#[cfg(target_os = "macos")]
+#[link(name = "CoreVideo", kind = "framework")]
+extern "C" {
+    fn CVPixelBufferGetIOSurface(pb: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+#[cfg(target_os = "macos")]
+#[link(name = "IOSurface", kind = "framework")]
+extern "C" {
+    fn IOSurfaceGetWidthOfPlane(surface: *mut std::ffi::c_void, plane: usize) -> usize;
+    fn IOSurfaceGetHeightOfPlane(surface: *mut std::ffi::c_void, plane: usize) -> usize;
 }
 
 /// Import a decoded NV12 frame as two GL textures.
@@ -316,6 +360,13 @@ impl Drop for TextureFrame {
 /// and still printed "ok", because its pass criterion never looks at pixels.
 /// Returning the frame is what lets the caller read back instead.
 pub fn import_nv12(frame: GpuFrame) -> Result<TextureFrame, GpuFrame> {
+    // macOS: no EGL — the VideoToolbox CVPixelBuffer's IOSurface maps straight to
+    // GL_TEXTURE_RECTANGLE planes via CGLTexImageIOSurface2D (mpv's hwdec_mac_gl).
+    #[cfg(target_os = "macos")]
+    return import_iosurface(frame);
+
+    #[cfg(not(target_os = "macos"))]
+    {
     let Some(Some(egl)) = EGL.get() else { return Err(frame) };
 
     // Windows/ANGLE: a GPU frame is a D3D11 texture, imported per-plane via
@@ -415,6 +466,58 @@ pub fn import_nv12(frame: GpuFrame) -> Result<TextureFrame, GpuFrame> {
     }
 
     Ok(TextureFrame { y_tex: texes[0], uv_tex: texes[1], width: w, height: h, _frame: frame })
+    }
+}
+
+/// macOS zero-copy: bind the CVPixelBuffer's IOSurface planes as GL_TEXTURE_RECTANGLE
+/// textures (R8 luma + RG8 chroma) with CGLTexImageIOSurface2D. No EGL, no copy —
+/// the exact mechanism mpv's hwdec_mac_gl.c uses. Hands the frame back on any failure
+/// so the caller reads it back (the headless raster path has no GL context).
+#[cfg(target_os = "macos")]
+fn import_iosurface(frame: GpuFrame) -> Result<TextureFrame, GpuFrame> {
+    const GL_TEXTURE_RECTANGLE: u32 = 0x84F5;
+    const GL_R8: i32 = 0x8229;
+    const GL_RG8: i32 = 0x822B;
+    const GL_RED: u32 = 0x1903;
+    const GL_RG: u32 = 0x8227;
+    const GL_UNSIGNED_BYTE: u32 = 0x1401;
+
+    let Some(view) = frame.iosurface() else { return Err(frame) };
+    let pb = view.pixel_buffer;
+    unsafe {
+        let ctx = CGLGetCurrentContext();
+        let surface = CVPixelBufferGetIOSurface(pb);
+        if ctx.is_null() || surface.is_null() {
+            log::warn!("video_gl: no CGL context / IOSurface — reading back");
+            return Err(frame);
+        }
+        let (w, h) = (frame.width, frame.height);
+        let mut texes = [0u32; 2];
+        gl_gen_textures(2, texes.as_mut_ptr());
+        // plane 0 = luma R8, plane 1 = interleaved chroma RG8.
+        let planes = [(0usize, GL_R8, GL_RED), (1usize, GL_RG8, GL_RG)];
+        for (i, (plane, internal, format)) in planes.into_iter().enumerate() {
+            gl_bind_texture(GL_TEXTURE_RECTANGLE, texes[i]);
+            let err = CGLTexImageIOSurface2D(
+                ctx,
+                GL_TEXTURE_RECTANGLE,
+                internal,
+                IOSurfaceGetWidthOfPlane(surface, plane) as i32,
+                IOSurfaceGetHeightOfPlane(surface, plane) as i32,
+                format,
+                GL_UNSIGNED_BYTE,
+                surface,
+                plane as u32,
+            );
+            gl_bind_texture(GL_TEXTURE_RECTANGLE, 0);
+            if err != 0 {
+                log::warn!("video_gl: CGLTexImageIOSurface2D plane {i} err {err} — reading back");
+                gl_delete_textures(2, texes.as_ptr());
+                return Err(frame);
+            }
+        }
+        Ok(TextureFrame { y_tex: texes[0], uv_tex: texes[1], width: w, height: h, _frame: frame })
+    }
 }
 
 /// Import a decoded NV12 frame that lives in a D3D11 texture (Windows/DXVA2) as

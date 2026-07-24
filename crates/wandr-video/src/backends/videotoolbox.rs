@@ -33,9 +33,13 @@ use core_foundation_sys::dictionary::CFDictionaryRef;
 use core_foundation_sys::string::CFStringRef;
 
 use crate::{
-    BackendKind, Codec, CodecBackend, CodecError, Decoder, DecoderParams, Encoder, EncoderParams,
-    Frame, I420Ref,
+    BackendKind, Codec, CodecBackend, CodecError, ColorInfo, Decoder, DecoderParams, Encoder,
+    EncoderParams, Frame, GpuFrame, GpuFrameOwner, IOSurfaceView,
 };
+
+// 'NV12' fourcc — parity with the vaapi/d3d11 GPU frames (the host's importer only
+// keys on the owner accessor, not this tag, on macOS).
+const DRM_FORMAT_NV12: u32 = 0x3231_564e;
 
 // ── FFI: opaque handles ──────────────────────────────────────────────────────
 type CMFormatDescriptionRef = *mut c_void;
@@ -152,6 +156,72 @@ extern "C" {
     fn CVPixelBufferGetHeight(pixel_buffer: CVImageBufferRef) -> usize;
     fn CVPixelBufferGetBaseAddressOfPlane(pixel_buffer: CVImageBufferRef, plane: usize) -> *mut c_void;
     fn CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer: CVImageBufferRef, plane: usize) -> usize;
+    fn CVPixelBufferRetain(pixel_buffer: CVImageBufferRef) -> CVImageBufferRef;
+    fn CVPixelBufferRelease(pixel_buffer: CVImageBufferRef);
+}
+
+/// Owns a retain on a `CVPixelBuffer` (VideoToolbox reuses the buffer once its
+/// refcount drops, so a held decoded frame must keep this). Released on drop.
+struct PixelBuffer(*mut c_void);
+impl Drop for PixelBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.0.is_null() {
+                CVPixelBufferRelease(self.0);
+            }
+        }
+    }
+}
+// SAFETY: CVPixelBuffer retain/release/read are thread-safe; the decoder is used
+// from one thread and this only ever moves between them (never shared).
+unsafe impl Send for PixelBuffer {}
+
+/// Read an NV12 `CVPixelBuffer` back to tightly-packed I420 (the CPU fallback lane
+/// — headless diagnostics, or a host with no GL context to import into).
+unsafe fn pixel_buffer_to_i420(image: *mut c_void, out: &mut Vec<u8>) -> Result<(), CodecError> {
+    if CVPixelBufferLockBaseAddress(image, CV_LOCK_READ_ONLY) != 0 {
+        return Err(CodecError::BadFrame);
+    }
+    let w = CVPixelBufferGetWidth(image);
+    let h = CVPixelBufferGetHeight(image);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let y_base = CVPixelBufferGetBaseAddressOfPlane(image, 0) as *const u8;
+    let y_stride = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
+    let uv_base = CVPixelBufferGetBaseAddressOfPlane(image, 1) as *const u8;
+    let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(image, 1);
+    out.clear();
+    out.reserve(w * h + 2 * cw * ch);
+    for row in 0..h {
+        out.extend_from_slice(std::slice::from_raw_parts(y_base.add(row * y_stride), w));
+    }
+    // NV12 CbCr plane -> planar U (Cb) then V (Cr).
+    let mut u = Vec::with_capacity(cw * ch);
+    let mut v = Vec::with_capacity(cw * ch);
+    for row in 0..ch {
+        let src = std::slice::from_raw_parts(uv_base.add(row * uv_stride), cw * 2);
+        for x in 0..cw {
+            u.push(src[2 * x]);
+            v.push(src[2 * x + 1]);
+        }
+    }
+    out.extend_from_slice(&u);
+    out.extend_from_slice(&v);
+    CVPixelBufferUnlockBaseAddress(image, CV_LOCK_READ_ONLY);
+    Ok(())
+}
+
+/// A decoded frame's `CVPixelBuffer` handed out for zero-copy import, with a CPU
+/// readback fallback (`read_i420`). Keeps the buffer retained for its lifetime.
+struct VtOwner {
+    pb: PixelBuffer,
+}
+impl GpuFrameOwner for VtOwner {
+    fn read_i420(&self, out: &mut Vec<u8>) -> Result<(), CodecError> {
+        unsafe { pixel_buffer_to_i420(self.pb.0, out) }
+    }
+    fn iosurface(&self) -> Option<IOSurfaceView> {
+        Some(IOSurfaceView { pixel_buffer: self.pb.0 })
+    }
 }
 
 #[link(name = "VideoToolbox", kind = "framework")]
@@ -221,7 +291,7 @@ impl CodecBackend for VideoToolboxBackend {
 
 // ── decoder ──────────────────────────────────────────────────────────────────
 struct DecodedFrame {
-    buf: Vec<u8>, // tightly-packed I420
+    pb: PixelBuffer, // the retained CVPixelBuffer (imported zero-copy, or read back)
     w: u32,
     h: u32,
     pts_us: i64,
@@ -243,7 +313,6 @@ pub struct VtDecoder {
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
     sink: Box<FrameSink>,
-    current: Option<DecodedFrame>,
     /// End-of-stream: `flush` sets this so `next_frame` drains the reorder buffer
     /// instead of holding a window back.
     draining: bool,
@@ -274,42 +343,18 @@ extern "C" fn output_callback(
     }
     let sink = unsafe { &mut *(refcon as *mut FrameSink) };
     unsafe {
-        if CVPixelBufferLockBaseAddress(image, CV_LOCK_READ_ONLY) != 0 {
-            return;
-        }
-        let w = CVPixelBufferGetWidth(image);
-        let h = CVPixelBufferGetHeight(image);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        let y_base = CVPixelBufferGetBaseAddressOfPlane(image, 0) as *const u8;
-        let y_stride = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
-        let uv_base = CVPixelBufferGetBaseAddressOfPlane(image, 1) as *const u8;
-        let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(image, 1);
-
-        let mut buf = Vec::with_capacity(w * h + 2 * cw * ch);
-        for row in 0..h {
-            let src = std::slice::from_raw_parts(y_base.add(row * y_stride), w);
-            buf.extend_from_slice(src);
-        }
-        // NV12 CbCr plane -> planar U (Cb) then V (Cr).
-        let mut u = Vec::with_capacity(cw * ch);
-        let mut v = Vec::with_capacity(cw * ch);
-        for row in 0..ch {
-            let src = std::slice::from_raw_parts(uv_base.add(row * uv_stride), cw * 2);
-            for x in 0..cw {
-                u.push(src[2 * x]);
-                v.push(src[2 * x + 1]);
-            }
-        }
-        buf.extend_from_slice(&u);
-        buf.extend_from_slice(&v);
-        CVPixelBufferUnlockBaseAddress(image, CV_LOCK_READ_ONLY);
-
+        // ZERO-COPY: keep the decoded CVPixelBuffer (retained) rather than reading
+        // it back — the host maps its IOSurface straight into GL textures. The CPU
+        // readback happens only on demand, in VtOwner::read_i420.
+        let w = CVPixelBufferGetWidth(image) as u32;
+        let h = CVPixelBufferGetHeight(image) as u32;
         let pts_us = if pts.timescale != 0 {
             pts.value * 1_000_000 / pts.timescale as i64
         } else {
             0
         };
-        sink.frames.lock().unwrap().push_back(DecodedFrame { buf, w: w as u32, h: h as u32, pts_us });
+        let pb = PixelBuffer(CVPixelBufferRetain(image));
+        sink.frames.lock().unwrap().push_back(DecodedFrame { pb, w, h, pts_us });
     }
 }
 
@@ -323,7 +368,6 @@ impl VtDecoder {
             sps: None,
             pps: None,
             sink: Box::new(FrameSink { frames: std::sync::Mutex::new(VecDeque::new()) }),
-            current: None,
             draining: false,
         }
     }
@@ -573,7 +617,6 @@ impl Decoder for VtDecoder {
         self.sps = None;
         self.pps = None;
         self.sink.frames.lock().unwrap().clear();
-        self.current = None;
         Ok(())
     }
 
@@ -581,31 +624,29 @@ impl Decoder for VtDecoder {
         // Reorder DECODE-order output to DISPLAY order by PTS. Hold a window back so
         // a late-arriving lower-PTS frame (a B-frame decoded after the P it precedes
         // in display) is emitted first; drain fully at EOS.
-        self.current = {
+        let df = {
             let mut q = self.sink.frames.lock().unwrap();
             if q.is_empty() || (!self.draining && q.len() <= REORDER_WINDOW) {
                 None
             } else {
-                let (idx, _) =
-                    q.iter().enumerate().min_by_key(|(_, f)| f.pts_us).unwrap();
+                let (idx, _) = q.iter().enumerate().min_by_key(|(_, f)| f.pts_us).unwrap();
                 q.remove(idx)
             }
-        };
-        let f = self.current.as_ref()?;
-        let (w, h) = (f.w, f.h);
-        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        let yl = (w * h) as usize;
-        let cl = (cw * ch) as usize;
-        Some(Frame::cpu(I420Ref {
-            y: &f.buf[..yl],
-            y_stride: w,
-            u: &f.buf[yl..yl + cl],
-            u_stride: cw,
-            v: &f.buf[yl + cl..yl + 2 * cl],
-            v_stride: cw,
-            width: w,
-            height: h,
-            timestamp_us: f.pts_us,
-        }))
+        }?;
+        // Hand out a GPU frame carrying the CVPixelBuffer: the host imports its
+        // IOSurface zero-copy, or falls back to read_i420 (headless). Colour from
+        // the resolution heuristic, matching the vaapi/d3d11 owners.
+        let DecodedFrame { pb, w, h, pts_us } = df;
+        let gf = GpuFrame::new(
+            w,
+            h,
+            pts_us,
+            DRM_FORMAT_NV12,
+            0,
+            Vec::new(),
+            ColorInfo::for_resolution(w, h),
+            Box::new(VtOwner { pb }),
+        );
+        Some(Frame::gpu(gf))
     }
 }

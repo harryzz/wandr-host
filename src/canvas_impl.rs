@@ -696,10 +696,16 @@ impl SkiaRenderer {
             SurfaceAttributesBuilder::<WindowSurface>::new().build(raw_window, nw, nh);
         let gl_surface = unsafe { gl_display.create_window_surface(&config, &surf_attrs)? };
         let gl_context = not_current.make_current(&gl_surface)?;
-        // Present is paced by the guest's frame-pacing; don't double-block on vsync.
+        // Vsync ON: sync the buffer swap to the display refresh so a frame's swap
+        // lands at a scanout boundary instead of mid-scan (tearing). Frame-pacing
+        // (`next_render_at`) decides WHEN to render; vsync decides when the rendered
+        // frame reaches the glass — complementary, not a double-block. Was DontWait,
+        // which tore during video playback: most visible for the first ~1-2 s as the
+        // present rate ramps from the idle UI rate up to the video frame rate, then
+        // the tear line stabilises and looks (but isn't) smooth.
         let _ = gl_surface.set_swap_interval(
             &gl_context,
-            glutin::surface::SwapInterval::DontWait,
+            glutin::surface::SwapInterval::Wait(std::num::NonZeroU32::new(1).unwrap()),
         );
 
         // Hand the EGL display to the zero-copy video import BEFORE skia takes

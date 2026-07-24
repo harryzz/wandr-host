@@ -431,6 +431,13 @@ impl GpuFrame {
     pub fn d3d11(&self) -> Option<D3d11View> {
         self.owner.d3d11()
     }
+
+    /// The macOS CVPixelBuffer handle for this frame, if it has one (the
+    /// VideoToolbox owner). `None` otherwise; the caller uses `read_i420` instead.
+    #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+    pub fn iosurface(&self) -> Option<IOSurfaceView> {
+        self.owner.iosurface()
+    }
 }
 
 pub struct DmabufPlane {
@@ -462,6 +469,26 @@ pub trait GpuFrameOwner: Send {
     fn d3d11(&self) -> Option<D3d11View> {
         None
     }
+
+    /// The macOS zero-copy handle, when this GPU frame is a VideoToolbox
+    /// `CVPixelBuffer` (IOSurface-backed). The host maps the IOSurface into
+    /// `GL_TEXTURE_RECTANGLE` planes via `CGLTexImageIOSurface2D` (mpv's shape)
+    /// rather than reading it back. `None` on every other owner.
+    #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+    fn iosurface(&self) -> Option<IOSurfaceView> {
+        None
+    }
+}
+
+/// A borrowed view of a decoded NV12 picture as a macOS `CVPixelBuffer`. The owner
+/// keeps a retain on the buffer for as long as the `GpuFrame` lives, so the host
+/// can map its IOSurface into textures without its own refcount.
+#[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+pub struct IOSurfaceView {
+    /// The raw `CVPixelBufferRef`. The host calls `CVPixelBufferGetIOSurface` on
+    /// it and binds each plane with `CGLTexImageIOSurface2D`. Keeps the CoreVideo
+    /// types inside this crate — the host import takes an opaque pointer.
+    pub pixel_buffer: *mut std::ffi::c_void,
 }
 
 /// A borrowed view of a decoded NV12 picture as a D3D11 texture (Windows/DXVA2).
