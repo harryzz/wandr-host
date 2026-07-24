@@ -167,6 +167,13 @@ mp4 = "0.14"
 [target.'cfg(target_os = "linux")'.dependencies]
 cpal = { version = "0.18", features = ["pulseaudio"] }
 
+# macOS-only: VideoToolbox HW decode (H.264 + HEVC). A system framework, so there
+# is no system library to probe — always on for macOS, unlike `vaapi` (needs
+# libva) and `d3d11` (opt-in via a host feature). cargo unions this with the
+# desktop codec features on the wandr-video dep above.
+[target.'cfg(target_os = "macos")'.dependencies]
+wandr-video = { path = "crates/wandr-video", features = ["videotoolbox"] }
+
 [build-dependencies]
 cc = "1"
 

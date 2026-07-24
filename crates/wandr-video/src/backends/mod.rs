@@ -31,3 +31,8 @@ pub mod vaapi;
 // zero-copy needs no cross-API bridge). Reuses cros-codecs' H.264 parser.
 #[cfg(all(feature = "d3d11", target_os = "windows"))]
 pub mod d3d11;
+
+// macOS HW decode via VideoToolbox (system framework, no vendored lib). Registers
+// HW-first alongside vaapi/d3d11; VideoToolbox owns the DPB so no cros-codecs.
+#[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+pub mod videotoolbox;

@@ -5349,6 +5349,8 @@ name = "wandr-video"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core-foundation 0.10.1",
+ "core-foundation-sys 0.8.7",
  "cros-codecs",
  "cros-libva",
  "dav1d",

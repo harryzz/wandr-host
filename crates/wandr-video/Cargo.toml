@@ -45,6 +45,11 @@ vaapi = ["dep:cros-codecs", "dep:libva"]
 # never do. See backends/d3d11.rs.
 d3d11 = ["dep:windows", "dep:cros-codecs", "dep:anyhow"]
 
+# macOS HW decode (feature `videotoolbox`). VideoToolbox/CoreMedia/CoreVideo are
+# system frameworks (linked from the backend), so there is no vendored/system
+# codec library to build — only core-foundation for the attribute dictionaries.
+videotoolbox = ["dep:core-foundation", "dep:core-foundation-sys"]
+
 [dependencies]
 # libvpx (BSD-3), built from vendor/libvpx and linked statically by wandr-vpx-sys.
 # That crate replaced env-libvpx-sys (MPL-2.0, and structurally unable to BUILD
@@ -96,6 +101,10 @@ windows = { version = "0.62", optional = true, features = [
 cros-codecs = { version = "0.0.6", default-features = false, optional = true }
 anyhow = { version = "1", optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { version = "0.10", optional = true }
+core-foundation-sys = { version = "0.8", optional = true }
+
 # The round-trip tests need a real codec, so they are skipped by a bare
 # `cargo test` rather than failing it.
 [[test]]
@@ -122,6 +131,13 @@ required-features = ["vaapi"]
 [[test]]
 name = "d3d11_hw"
 required-features = ["d3d11"]
+
+# VideoToolbox HW decode, end-to-end through the Decoder trait. Bit-exact vs the
+# same ffmpeg framehash reference the d3d11 test uses. SKIPS (passes) where VT has
+# no HW decoder for the codec — see the test header.
+[[test]]
+name = "videotoolbox_hw"
+required-features = ["videotoolbox"]
 
 # Answers "does the backend pair timestamps to the right frames?", which needs a
 # container (an elementary stream has no PTS) — hence the mp4 dev-dependency and

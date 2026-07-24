@@ -711,6 +711,8 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(backends::vaapi::VaapiBackend));
     #[cfg(all(feature = "d3d11", target_os = "windows"))]
     r.register(Box::new(backends::d3d11::D3d11Backend));
+    #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+    r.register(Box::new(backends::videotoolbox::VideoToolboxBackend));
     #[cfg(feature = "libvpx")]
     r.register(Box::new(backends::libvpx::LibvpxBackend));
     #[cfg(feature = "openh264")]
