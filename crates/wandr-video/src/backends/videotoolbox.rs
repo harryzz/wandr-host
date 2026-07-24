@@ -244,7 +244,15 @@ pub struct VtDecoder {
     pps: Option<Vec<u8>>,
     sink: Box<FrameSink>,
     current: Option<DecodedFrame>,
+    /// End-of-stream: `flush` sets this so `next_frame` drains the reorder buffer
+    /// instead of holding a window back.
+    draining: bool,
 }
+
+/// VideoToolbox emits in DECODE order; we reorder to display order by PTS. A frame
+/// can be at most this many positions from its display slot (H.264/HEVC max DPB is
+/// 16), so once the buffer holds this many we can safely emit the lowest PTS.
+const REORDER_WINDOW: usize = 16;
 
 // SAFETY: single-threaded use, like every other backend. The raw VT/CM handles
 // and the `Box<FrameSink>` are owned by one `VtDecoder`; the host drives it from
@@ -316,6 +324,7 @@ impl VtDecoder {
             pps: None,
             sink: Box::new(FrameSink { frames: std::sync::Mutex::new(VecDeque::new()) }),
             current: None,
+            draining: false,
         }
     }
 
@@ -483,6 +492,7 @@ fn split_nals(data: &[u8]) -> Vec<&[u8]> {
 
 impl Decoder for VtDecoder {
     fn decode(&mut self, chunk: crate::Chunk<'_>) -> Result<(), CodecError> {
+        self.draining = false; // more frames coming — hold the reorder window
         let hevc = self.codec == Codec::H265;
         let mut avcc: Vec<u8> = Vec::new();
         for nal in split_nals(chunk.data) {
@@ -552,11 +562,13 @@ impl Decoder for VtDecoder {
                 VTDecompressionSessionWaitForAsynchronousFrames(self.session);
             }
         }
+        self.draining = true; // EOS: let next_frame drain the reorder buffer
         Ok(())
     }
 
     fn reset(&mut self) -> Result<(), CodecError> {
         unsafe { self.teardown() };
+        self.draining = false;
         self.vps = None;
         self.sps = None;
         self.pps = None;
@@ -566,8 +578,19 @@ impl Decoder for VtDecoder {
     }
 
     fn next_frame(&mut self) -> Option<Frame<'_>> {
-        // VT emits in display order (temporal processing), so FIFO is display order.
-        self.current = self.sink.frames.lock().unwrap().pop_front();
+        // Reorder DECODE-order output to DISPLAY order by PTS. Hold a window back so
+        // a late-arriving lower-PTS frame (a B-frame decoded after the P it precedes
+        // in display) is emitted first; drain fully at EOS.
+        self.current = {
+            let mut q = self.sink.frames.lock().unwrap();
+            if q.is_empty() || (!self.draining && q.len() <= REORDER_WINDOW) {
+                None
+            } else {
+                let (idx, _) =
+                    q.iter().enumerate().min_by_key(|(_, f)| f.pts_us).unwrap();
+                q.remove(idx)
+            }
+        };
         let f = self.current.as_ref()?;
         let (w, h) = (f.w, f.h);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));

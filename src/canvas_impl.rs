@@ -676,9 +676,19 @@ impl SkiaRenderer {
             })
             .ok_or_else(|| anyhow::anyhow!("no GL config"))?;
 
-        // Prefer a GLES2 context (matches the skia GLES backend used on device).
+        // GLES on Linux/Windows (EGL/ANGLE expose it, matching the on-device skia
+        // GLES backend). macOS/CGL has NO GLES — requesting it fails ("gles is not
+        // supported with CGL") and drops the whole desktop to the softbuffer CPU
+        // fallback, so ask for desktop OpenGL there. A 3.3 request yields a CORE
+        // profile on macOS (it has no compatibility profile above 2.1), which is
+        // what skia's GL backend needs.
+        #[cfg(not(target_os = "macos"))]
         let ctx_attrs = ContextAttributesBuilder::new()
             .with_context_api(ContextApi::Gles(None))
+            .build(Some(raw_window));
+        #[cfg(target_os = "macos")]
+        let ctx_attrs = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::OpenGl(Some(glutin::context::Version::new(3, 3))))
             .build(Some(raw_window));
         let not_current = unsafe { gl_display.create_context(&config, &ctx_attrs)? };
 
