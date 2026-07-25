@@ -59,7 +59,7 @@ const INVALID_ENTRY: u8 = 0xFF;
 /// once a GOP needs more surfaces than it has (this bit us with a 16-ref clip on an
 /// 8-slot pool — "pool exhausted" at the 9th reference).
 const DXVA_MAX_REFS: u32 = 16;
-const DRM_FORMAT_NV12: u32 = 0x3231_564e; // 'N''V''1''2', for parity with the vaapi frame
+pub(crate) const DRM_FORMAT_NV12: u32 = 0x3231_564e; // 'N''V''1''2', for parity with the vaapi frame
 
 // ── decode-on-ANGLE's-device handoff (Phase 2b zero-copy) ────────────────────
 // The host extracts ANGLE's ID3D11Device (eglQueryDeviceAttribEXT(EGL_D3D11_
@@ -79,7 +79,7 @@ pub fn set_angle_d3d11_device(device: *mut c_void) {
     ANGLE_D3D11_DEVICE.with(|c| c.set(device));
 }
 
-fn angle_d3d11_device() -> Option<*mut c_void> {
+pub(crate) fn angle_d3d11_device() -> Option<*mut c_void> {
     ANGLE_D3D11_DEVICE.with(|c| {
         let p = c.get();
         (!p.is_null()).then_some(p)
@@ -252,25 +252,71 @@ impl CodecBackend for D3d11Backend {
     }
     fn supports_decode(&self, codec: Codec) -> bool {
         // Probe the actual driver: a build with the feature but no usable video
-        // device reports H.264 = unsupported and software stays the fallback.
-        codec == Codec::H264 && probe_h264().unwrap_or(false)
+        // device reports the codec = unsupported and software stays the fallback.
+        match codec {
+            Codec::H264 => probe_h264().unwrap_or(false),
+            Codec::H265 => {
+                let ok = probe_hevc().unwrap_or(false);
+                log::info!("d3d11: HEVC (DXVA HEVC_VLD_MAIN) decode supported by this GPU: {ok}");
+                ok
+            }
+            _ => false,
+        }
     }
     fn supports_encode(&self, _codec: Codec) -> bool {
         false
     }
     fn open_decoder(&self, params: &DecoderParams) -> Result<Box<dyn Decoder>, CodecError> {
-        if params.codec != Codec::H264 {
-            return Err(CodecError::Unsupported);
-        }
         // Fallback contract: fail here if HW can't decode, so the registry falls
         // back to software rather than us silently producing nothing.
-        if !probe_h264().unwrap_or(false) {
-            return Err(CodecError::InitFailed);
+        match params.codec {
+            Codec::H264 => {
+                if !probe_h264().unwrap_or(false) {
+                    return Err(CodecError::InitFailed);
+                }
+                Ok(Box::new(D3d11Decoder::new()))
+            }
+            Codec::H265 => {
+                if !probe_hevc().unwrap_or(false) {
+                    return Err(CodecError::InitFailed);
+                }
+                Ok(Box::new(super::hevc::HevcD3d11Decoder::new()))
+            }
+            _ => Err(CodecError::Unsupported),
         }
-        Ok(Box::new(D3d11Decoder::new()))
     }
     fn open_encoder(&self, _params: &EncoderParams) -> Result<Box<dyn Encoder>, CodecError> {
         Err(CodecError::Unsupported)
+    }
+}
+
+/// True if the default hardware adapter exposes an HEVC (Main / Main10) VLD
+/// decode profile — the increment-1 gate for Windows HW H.265 (task 117 M2).
+fn probe_hevc() -> anyhow::Result<bool> {
+    use super::hevc_dxva::{HEVC_VLD_MAIN, HEVC_VLD_MAIN10};
+    unsafe {
+        let mut device: Option<ID3D11Device> = None;
+        let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            Some(&levels),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )?;
+        let vdevice: ID3D11VideoDevice = device.ok_or_else(|| anyhow::anyhow!("no device"))?.cast()?;
+        let n = vdevice.GetVideoDecoderProfileCount();
+        for i in 0..n {
+            let g = vdevice.GetVideoDecoderProfile(i)?;
+            if g == HEVC_VLD_MAIN || g == HEVC_VLD_MAIN10 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -322,20 +368,20 @@ enum Payload {
 /// A per-frame NV12 texture (a copy OUT of the decode pool, so the pool slice is
 /// free to be reused immediately and the frame's lifetime is decoupled from the
 /// DPB). Copying stays on the GPU — no CPU roundtrip — which is the point.
-struct GpuTex {
-    texture: ID3D11Texture2D,
-    device: ID3D11Device,
-    context: ID3D11DeviceContext,
+pub(crate) struct GpuTex {
+    pub(crate) texture: ID3D11Texture2D,
+    pub(crate) device: ID3D11Device,
+    pub(crate) context: ID3D11DeviceContext,
 }
 // COM D3D11 resources are free-threaded (agile); the windows crate marks them
 // Send+Sync, so GpuTex is Send.
 
 /// Owns a per-frame NV12 texture for a `GpuFrame`: hands the host a D3D11 view for
 /// zero-copy import, or reads it back to I420 on demand (the fallback lane).
-struct D3d11Owner {
-    tex: GpuTex,
-    width: u32,
-    height: u32,
+pub(crate) struct D3d11Owner {
+    pub(crate) tex: GpuTex,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 impl GpuFrameOwner for D3d11Owner {
@@ -1317,7 +1363,7 @@ impl Dxva {
 /// Read a standalone NV12 texture (a per-frame GPU output) back to tight I420 —
 /// the fallback for a `GpuFrame` when the host can't import it. Allocates a
 /// one-shot staging texture, so it's for the fallback lane, not steady state.
-unsafe fn readback_nv12_texture(
+pub(crate) unsafe fn readback_nv12_texture(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     tex: &ID3D11Texture2D,

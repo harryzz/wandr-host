@@ -154,7 +154,7 @@ nokhwa = { version = "0.10", features = ["input-native"] }
 # and decodes in hardware via MediaCodec and links no codec library, which is why
 # this sits in the same target table ffmpeg-next did.
 # Build the static lib first: scripts/build-libvpx.sh (sets VPX_LIB_DIR et al).
-wandr-video = { path = "crates/wandr-video", features = ["libvpx", "openh264", "libde265", "dav1d"] }
+wandr-video = { path = "crates/wandr-video", features = ["libde265", "oxideav-h265"] }  # WANDR-LOCAL (Windows): SW H.265 (libde265 + oxideav, both cc/pure-Rust); d3d11 + gstreamer via host features. NO libvpx/dav1d/openh264 — GStreamer now covers H.264/VP8/VP9/AV1 (SW+HW), so no vcpkg/nasm/meson toolchain needed.
 # Pure-Rust MP4 demuxer — ONLY for the `--video-decode-file` diagnostic (task 117
 # M2), which plays a real .mp4 through the host decoder to prove H.264 + the
 # reorder buffer on real content. In production, demux is guest-side (see
@@ -247,6 +247,11 @@ vaapi = ["wandr-video/vaapi"]
 # inert (and unbuilt) elsewhere. Off by default until the Windows host bring-up
 # provisions ANGLE and runs it — see reference_media_codec_strategy.md (Phase 2b).
 d3d11 = ["wandr-video/d3d11"]
+# One-library desktop HW+SW decode via GStreamer (crates/wandr-video, feature
+# `gstreamer` → backends `gstreamer-hw`/`gstreamer-sw`). Links a SYSTEM library
+# (libgstreamer-1.0 + plugins). On Windows the d3d11 plugin gives HW decode; the
+# GPU zero-copy (D3D11 texture) lane is the Windows peer of the Linux dma-buf lane.
+gstreamer = ["wandr-video/gstreamer"]
 
 [package.metadata.android]
 package = "com.example.wasmruntime"

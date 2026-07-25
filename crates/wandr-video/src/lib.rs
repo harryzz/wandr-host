@@ -652,7 +652,15 @@ impl Registry {
         self.backends.iter().map(|b| b.as_ref()).filter(move |b| {
             !(prefs.no_hardware && b.kind() == BackendKind::Hardware)
                 && !(prefs.require_hardware && b.kind() == BackendKind::Software)
-                && prefs.backend.is_none_or(|want| b.name() == want)
+                // Backend match is either EXACT (`gstreamer-hw`) or by FAMILY
+                // (`gstreamer` matches `gstreamer-hw`/`gstreamer-sw`), so a caller can
+                // pin a family and still let hw/sw be chosen by the accel preference +
+                // priority. `strip_prefix` + a `-` guard keeps it allocation-free and
+                // won't match a substring (`vp8` never matches `vp8dec`-style names).
+                && prefs.backend.is_none_or(|want| {
+                    b.name() == want
+                        || b.name().strip_prefix(want).is_some_and(|r| r.starts_with('-'))
+                })
         })
     }
 
@@ -750,6 +758,15 @@ pub fn default_registry() -> Registry {
     r.register(Box::new(backends::libde265::Libde265Backend));
     #[cfg(feature = "dav1d")]
     r.register(Box::new(backends::dav1d::Dav1dBackend));
+    // GStreamer — two lanes sharing one impl: HW (prio 15, just below native
+    // d3d11/vaapi) and SW (prio 95, last-resort universal fallback). Each probes
+    // its decoder elements in `supports_decode`, so on a box with no HW plugin the
+    // HW lane simply reports nothing. Desktop only.
+    #[cfg(all(feature = "gstreamer", not(target_os = "android")))]
+    {
+        r.register(Box::new(backends::gstreamer::GStreamerBackend { hardware: true }));
+        r.register(Box::new(backends::gstreamer::GStreamerBackend { hardware: false }));
+    }
     // Future HW backends (VideoToolbox / MediaFoundation) register alongside
     // vaapi at priority < 100, and oxideav slots in as just another software
     // backend once it is ready.

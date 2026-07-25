@@ -32,7 +32,21 @@ pub mod vaapi;
 #[cfg(all(feature = "d3d11", target_os = "windows"))]
 pub mod d3d11;
 
+// DXVA HEVC/H.265 decode structures (task 117 M2) — used by d3d11.rs to extend the
+// Windows HW path from H.264 to H.265.
+#[cfg(all(feature = "d3d11", target_os = "windows"))]
+pub mod hevc_dxva;
+
+// DXVA HEVC/H.265 hardware decoder (task 117 M2) — the H.265 peer of d3d11.rs.
+#[cfg(all(feature = "d3d11", target_os = "windows"))]
+pub mod hevc;
+
 // macOS HW decode via VideoToolbox (system framework, no vendored lib). Registers
 // HW-first alongside vaapi/d3d11; VideoToolbox owns the DPB so no cros-codecs.
 #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
 pub mod videotoolbox;
+
+// GStreamer decode backend — one library covering every DESKTOP OS's HW+SW decoders.
+// Never on Android (GStreamer HW = JNI MediaCodec, unusable under `--no-art`).
+#[cfg(all(feature = "gstreamer", not(target_os = "android")))]
+pub mod gstreamer;

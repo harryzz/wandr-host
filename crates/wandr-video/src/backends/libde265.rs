@@ -86,9 +86,34 @@ impl H265Decoder {
             CodecError::InitFailed
         })?;
         let mut dec = De265Decoder::new(session.clone());
-        // A modest thread pool: real-time even single-threaded, and this keeps
-        // headroom for the store thread. 0 threads = synchronous decode.
-        let n = std::thread::available_parallelism().map(|n| (n.get() as u32).min(4)).unwrap_or(1);
+        // Worker-thread count. On Windows this is pinned to exactly 1 — NOT 0,
+        // NOT the multi-thread default — and both bounds matter:
+        //
+        //  • 0 workers CORRUPTS output. libde265 finishes a frame's chroma /
+        //    deblocking ON the worker pool; with no pool those stages never run
+        //    and it emits partial garbage (green, striped). So ≥1 is mandatory
+        //    for correct pixels.
+        //  • ≥2 workers CRASHES intermittently (0xC0000005). On Windows libde265
+        //    synchronizes the pool through a hand-rolled Win32 condition-variable
+        //    EMULATION (libde265 `extra/win32cond.c`, the Schmidt
+        //    `SignalObjectAndWait` pattern over a HANDLE mutex — NOT the native
+        //    `CONDITION_VARIABLE`). Its fault is the MULTI-waiter broadcast
+        //    handshake (`waiters_done_` with ≥2 threads parked on one cond),
+        //    which races and faults under contention (seen in the player, where
+        //    the pool contends with the GL/audio threads).
+        //
+        // 1 worker threads decode ASYNC (correct pixels, verified bit-identical
+        // to the 4-thread output) while making the race STRUCTURALLY impossible:
+        // per libde265 `threads.cc`, workers park only on `pool->cond_var` and
+        // the main thread only on a separate `cond`, so with a single worker
+        // every cond has ≤1 waiter and the multi-waiter handshake is never
+        // entered. pthread platforms (Linux/macOS) use real pthread conds and
+        // keep the multi-threaded pool.
+        let n: u32 = if cfg!(target_os = "windows") {
+            1
+        } else {
+            std::thread::available_parallelism().map(|n| (n.get() as u32).min(4)).unwrap_or(1)
+        };
         let _ = dec.start_worker_threads(n);
         Ok(Self { session, dec, out: VecDeque::new(), current: None })
     }
