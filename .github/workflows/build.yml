@@ -141,16 +141,30 @@ jobs:
       # than a configuration nobody runs. Runners have no GPU, so this is a
       # COMPILE check: at runtime the backend probes, finds no VA driver, and
       # declines to software — which is itself the fallback path working.
-      - name: Build
-        if: runner.os != 'Linux'
+      # `d3d11` (Windows HW H.264 + H.265 decode via DXVA2) is the Windows peer of
+      # `vaapi`: pure-Rust (the `windows` crate + cros-codecs parser, both already
+      # in Cargo.lock; ANGLE is runtime-only), so like vaapi it's a COMPILE check
+      # here — the runner has no GPU, and at runtime the backend probes, finds no
+      # DXVA profile, and declines to software. Windows-only (`dep:windows` is
+      # target-gated), so it must NOT go on the macOS leg.
+      - name: Build (Windows, +d3d11)
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked --features p3-async,d3d11
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
         run: cargo build --release --locked --features p3-async
 
       - name: Build (Linux, +vaapi)
         if: runner.os == 'Linux'
         run: cargo build --release --locked --features p3-async,vaapi
 
-      - name: Test
-        if: runner.os != 'Linux'
+      - name: Test (Windows, +d3d11)
+        if: runner.os == 'Windows'
+        run: cargo test --release --locked --features p3-async,d3d11 --no-run
+
+      - name: Test (macOS)
+        if: runner.os == 'macOS'
         run: cargo test --release --locked --features p3-async --no-run
 
       - name: Test (Linux, +vaapi)
