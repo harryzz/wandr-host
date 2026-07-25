@@ -47,6 +47,20 @@ export SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always
 FEATURES=()
 [[ "${P3:-1}" == "1" ]] && FEATURES=(--features p3-async)
 
+# GStreamer decode backend (gstreamer-hw via vtdec / gstreamer-sw via avdec_*) — the
+# sole decode path now that VideoToolbox/openh264/libde265/dav1d are retired. PROBED
+# (brew install gstreamer); GST=0 forces off, GST=1 forces on.
+case "${GST:-auto}" in
+  0) echo "GStreamer decode: disabled (GST=0)" ;;
+  1) FEATURES+=(--features gstreamer); echo "GStreamer decode: forced ON (GST=1)" ;;
+  *) if pkg-config --exists gstreamer-1.0 gstreamer-app-1.0 2>/dev/null; then
+       FEATURES+=(--features gstreamer)
+       echo "GStreamer decode: ENABLED (gstreamer $(pkg-config --modversion gstreamer-1.0) found)"
+     else
+       echo "GStreamer decode: skipped (no gstreamer-1.0 — brew install gstreamer to enable)"
+     fi ;;
+esac
+
 # Minimum macOS this binary claims to support. Applies to OUR code (rustc + the cc-rs C++
 # shims); it does NOT change what the dependencies were built against. In particular a
 # Homebrew ffmpeg is a per-OS bottle: one installed on macOS 13 carries `minos 13.0`, so a

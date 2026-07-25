@@ -17,36 +17,14 @@ FEATURES=()
 
 cd "$REPO_ROOT"
 
-# Task 117: video codecs are statically linked, not ffmpeg. All three build from
-# source on the first build, so there is nothing to install here — only the
-# toolchains on PATH:
-#   • libvpx  (BSD-3, VP8/VP9)  — wandr-vpx-sys compiles vendor/libvpx  → needs nasm
-#   • libde265 (LGPL, H.265)    — libde265-sys `static` compiles with cc → needs a C compiler
-#   • dav1d   (BSD-2, AV1)      — dav1d-sys builds it with meson/ninja   → needs meson, ninja, nasm
-# SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always tells dav1d-sys to build the vendored
-# dav1d statically instead of looking for a system .so via pkg-config.
-export SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always
+# The one remaining codec toolchain: libvpx (BSD-3, VP8/VP9 ENCODE — Signal video
+# calls) is compiled from vendor/libvpx by wandr-vpx-sys → needs nasm on PATH. All
+# DECODE now goes through GStreamer (below); the hand-written decoders
+# (openh264/libde265/dav1d/vaapi) are retired and no longer built.
 
-# Task 117 M2 stage 3: HW H.264 decode via VA-API. Unlike the codecs above this
-# one links the SYSTEM libva, so it is enabled only when libva is actually
-# installed — PROBED, never assumed, so a box without it still gets a working
-# (software-decoding) host instead of a build failure. VAAPI=0 forces it off;
-# VAAPI=1 forces it on and lets the build fail loudly if libva is missing.
-case "${VAAPI:-auto}" in
-  0) echo "VA-API HW decode: disabled (VAAPI=0)" ;;
-  1) FEATURES+=(--features vaapi); echo "VA-API HW decode: forced ON (VAAPI=1)" ;;
-  *) if pkg-config --exists libva libva-drm 2>/dev/null; then
-       FEATURES+=(--features vaapi)
-       echo "VA-API HW decode: ENABLED (libva $(pkg-config --modversion libva) found)"
-     else
-       echo "VA-API HW decode: skipped (no libva — install libva-dev to enable)"
-     fi ;;
-esac
-
-# GStreamer decode backend (gstreamer-hw / gstreamer-sw). Like VA-API it links a
-# SYSTEM library, so PROBE for it — a box without GStreamer still builds a working
-# software-decoding host. GST=0 forces off; GST=1 forces on (build fails loudly if
-# the dev packages are missing).
+# GStreamer decode backend (gstreamer-hw / gstreamer-sw) — the sole decode path. It
+# links a SYSTEM library, so PROBE for it. GST=0 forces off; GST=1 forces on (build
+# fails loudly if the dev packages are missing).
 case "${GST:-auto}" in
   0) echo "GStreamer decode: disabled (GST=0)" ;;
   1) FEATURES+=(--features gstreamer); echo "GStreamer decode: forced ON (GST=1)" ;;
