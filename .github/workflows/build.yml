@@ -23,8 +23,7 @@ jobs:
       matrix:
         include:
           - { name: linux-x86_64,   os: ubuntu-latest }
-          # macOS temporarily skipped — GStreamer (vtdec/IOSurface) leg is enabled once
-          # Linux + Windows are green, then the hand-written codecs are retired for good.
+          - { name: macos-aarch64,  os: macos-latest }
           - { name: windows-x86_64, os: windows-latest }
     steps:
       - uses: actions/checkout@v4
@@ -127,16 +126,28 @@ jobs:
       # It is NOT in `default`, so a plain `cargo build` yields a host with no WASI 0.3
       # surface — guests importing wasi:sockets@0.3.0 fail with "resource implementation
       # is missing".
-      # `gstreamer` is the ONE codec backend now (SW via avdec_*, HW via va/d3d11 plugins).
-      # The hand-written decoders (openh264/libde265/dav1d/vaapi/d3d11/videotoolbox) are
-      # retired and no longer built; libvpx stays (VP8/VP9 ENCODE) via the always-on
-      # wandr-video dep. Same feature set on every desktop OS — GStreamer abstracts the
-      # per-OS decoder, so there is no per-platform codec flag anymore.
-      - name: Build (desktop, +gstreamer)
+      # `gstreamer` is the ONE decode backend now (SW via avdec_*, HW via va/d3d11/vtdec
+      # plugins). The hand-written SW decoders (openh264/libde265/dav1d) are retired and no
+      # longer built; libvpx stays (VP8/VP9 ENCODE) via the always-on wandr-video dep.
+      - name: Build (Linux/Windows, +gstreamer)
+        if: runner.os != 'macOS'
         run: cargo build --release --locked --features p3-async,gstreamer
 
-      - name: Test (desktop, +gstreamer)
+      # macOS also builds +videotoolbox: the GStreamer IOSurface zero-copy lane reuses its
+      # plumbing (IOSurfaceView + video_gl.rs::import_iosurface). vtdec/avdec come from
+      # brew's gst-plugins-bad + gst-libav. This also compiles the retired VideoToolbox
+      # decoder — the only way to compile-check the zero-copy lane until it's decoupled.
+      - name: Build (macOS, +gstreamer,videotoolbox)
+        if: runner.os == 'macOS'
+        run: cargo build --release --locked --features p3-async,gstreamer,videotoolbox
+
+      - name: Test (Linux/Windows, +gstreamer)
+        if: runner.os != 'macOS'
         run: cargo test --release --locked --features p3-async,gstreamer --no-run
+
+      - name: Test (macOS, +gstreamer,videotoolbox)
+        if: runner.os == 'macOS'
+        run: cargo test --release --locked --features p3-async,gstreamer,videotoolbox --no-run
 
       - uses: actions/upload-artifact@v4
         with:

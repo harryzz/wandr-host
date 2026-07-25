@@ -178,7 +178,7 @@ unsafe impl Send for PixelBuffer {}
 
 /// Read an NV12 `CVPixelBuffer` back to tightly-packed I420 (the CPU fallback lane
 /// — headless diagnostics, or a host with no GL context to import into).
-unsafe fn pixel_buffer_to_i420(image: *mut c_void, out: &mut Vec<u8>) -> Result<(), CodecError> {
+pub(crate) unsafe fn pixel_buffer_to_i420(image: *mut c_void, out: &mut Vec<u8>) -> Result<(), CodecError> {
     if CVPixelBufferLockBaseAddress(image, CV_LOCK_READ_ONLY) != 0 {
         return Err(CodecError::BadFrame);
     }

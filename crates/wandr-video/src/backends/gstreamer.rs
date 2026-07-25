@@ -132,7 +132,19 @@ fn gpu_lane_available(element: &str) -> bool {
         let _ = element;
         d3d11_gpu::win_gpu_available()
     }
-    #[cfg(not(any(target_os = "linux", all(target_os = "windows", feature = "d3d11"))))]
+    // macOS: the VideoToolbox decoder (`vtdec*`) wraps every frame's CVPixelBuffer in a
+    // GstCoreVideoMeta, which we extract into the host's IOSurface importer. Only the HW
+    // decoder produces it; `avdec_*` (software) has no meta and falls to readback — but the
+    // `hardware` gate below already means this is only asked for the vtdec lane.
+    #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+    {
+        element.starts_with("vtdec")
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        all(target_os = "windows", feature = "d3d11"),
+        all(target_os = "macos", feature = "videotoolbox")
+    )))]
     {
         let _ = element;
         false
@@ -358,6 +370,10 @@ impl GstDecoder {
              appsink name=sink sync=false max-buffers=16 drop=false"
         } else if cfg!(target_os = "windows") {
             "appsink name=sink caps=\"video/x-raw(memory:D3D11Memory),format=NV12\" sync=false max-buffers=16 drop=false"
+        } else if cfg!(target_os = "macos") {
+            // vtdec's native NV12 output (no videoconvert) — the CVPixelBuffer + its
+            // GstCoreVideoMeta ride through, and we extract the IOSurface from the meta.
+            "appsink name=sink caps=\"video/x-raw,format=NV12\" sync=false max-buffers=16 drop=false"
         } else {
             "appsink name=sink caps=\"video/x-raw(memory:DMABuf),format=DMA_DRM\" sync=false max-buffers=16 drop=false"
         };
@@ -513,6 +529,14 @@ impl Decoder for GstDecoder {
         #[cfg(all(target_os = "windows", feature = "d3d11"))]
         if self.gpu {
             return unsafe { d3d11_gpu::build_gpu_frame_d3d11(&sample, self.d3d11_dev) }.map(Frame::gpu);
+        }
+
+        // macOS GPU lane: extract vtdec's CVPixelBuffer from the GstCoreVideoMeta and hand
+        // it to the host's IOSurface importer (no copy). IOSurface is a shareable GPU
+        // resource, so unlike D3D11 there is no device/context to synchronise.
+        #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+        if self.gpu {
+            return unsafe { iosurface_gpu::build_gpu_frame_iosurface(&sample) }.map(Frame::gpu);
         }
 
         // CPU lane: repack to tight I420 held in `current` so the borrow stays valid.
@@ -723,6 +747,110 @@ mod d3d11_gpu {
             Vec::new(), // no dma-buf planes — the host uses d3d11() instead
             ColorInfo::for_resolution(w, h),
             Box::new(owner),
+        ))
+    }
+}
+
+// ── macOS zero-copy GPU output (IOSurface / CVPixelBuffer) ───────────────────
+// VideoToolbox's `vtdec` wraps every decoded frame's CVPixelBuffer in a
+// GstCoreVideoMeta (gst_core_video_buffer_new, applemedia/corevideobuffer.c). We
+// pull the CVPixelBuffer out of that meta and hand it to the host's existing
+// `import_iosurface` (CGLTexImageIOSurface2D) — the SAME importer the hand-written
+// videotoolbox backend uses, so NO host changes. Unlike D3D11 this is race-free:
+// IOSurface/CVPixelBuffer is a shareable GPU resource with no device/context to sync.
+//
+// The applemedia meta lives in the plugin (no linkable public API), so we look the
+// meta API up by its registered name and read the struct — the macOS peer of the
+// d3d11 raw-FFI extraction. CoreVideo retain/release keeps the buffer alive.
+#[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+mod iosurface_gpu {
+    use std::ffi::c_void;
+
+    use ::gstreamer as gst;
+
+    use crate::{ColorInfo, GpuFrame, GpuFrameOwner};
+
+    // DRM fourcc 'NV12', for parity with the dma-buf/D3D11 frames (unused by the
+    // IOSurface importer, which reads planes off the CVPixelBuffer directly).
+    const NV12_FOURCC: u32 = 0x3231_564e;
+
+    #[link(name = "CoreVideo", kind = "framework")]
+    extern "C" {
+        fn CVPixelBufferRetain(pb: *mut c_void) -> *mut c_void;
+        fn CVPixelBufferRelease(pb: *mut c_void);
+        fn CVPixelBufferGetWidth(pb: *mut c_void) -> usize;
+        fn CVPixelBufferGetHeight(pb: *mut c_void) -> usize;
+    }
+
+    // Matches applemedia/corevideobuffer.h `GstCoreVideoMeta` — GstMeta base (flags +
+    // info ptr = 16 bytes on LP64) then the two CoreVideo pointers. We only read pixbuf.
+    #[repr(C)]
+    struct GstMetaHdr {
+        flags: u32,
+        info: *const c_void,
+    }
+    #[repr(C)]
+    struct GstCoreVideoMeta {
+        meta: GstMetaHdr,
+        cvbuf: *mut c_void,
+        pixbuf: *mut c_void,
+    }
+
+    /// Owns a retain on the CVPixelBuffer; hands the host an IOSurface view for
+    /// zero-copy import, or reads it back to I420 (the fallback) via the videotoolbox
+    /// backend's CVPixelBuffer readback.
+    struct GstIOSurfaceOwner {
+        pixel_buffer: *mut c_void,
+    }
+    // SAFETY: driven only from the single store thread; CVPixelBuffer refcounting is
+    // thread-safe regardless.
+    unsafe impl Send for GstIOSurfaceOwner {}
+    impl Drop for GstIOSurfaceOwner {
+        fn drop(&mut self) {
+            unsafe { CVPixelBufferRelease(self.pixel_buffer) };
+        }
+    }
+    impl GpuFrameOwner for GstIOSurfaceOwner {
+        fn read_i420(&self, out: &mut Vec<u8>) -> Result<(), crate::CodecError> {
+            unsafe { crate::backends::videotoolbox::pixel_buffer_to_i420(self.pixel_buffer, out) }
+        }
+        fn iosurface(&self) -> Option<crate::IOSurfaceView> {
+            Some(crate::IOSurfaceView { pixel_buffer: self.pixel_buffer })
+        }
+    }
+
+    /// Pull the CVPixelBuffer out of the sample's GstCoreVideoMeta and wrap it as a
+    /// `GpuFrame` the host imports zero-copy. `None` if the meta is absent (non-vtdec).
+    pub(super) unsafe fn build_gpu_frame_iosurface(sample: &gst::Sample) -> Option<GpuFrame> {
+        let buffer = sample.buffer()?;
+        let buf_ptr = buffer.as_ptr() as *mut gst::ffi::GstBuffer;
+        // The applemedia plugin is loaded (vtdec is running), so its meta API is
+        // registered under this name.
+        let api = gst::glib::gobject_ffi::g_type_from_name(c"GstCoreVideoMetaAPI".as_ptr());
+        if api == 0 {
+            return None;
+        }
+        let meta = gst::ffi::gst_buffer_get_meta(buf_ptr, api);
+        if meta.is_null() {
+            return None;
+        }
+        let pixbuf = (*(meta as *const GstCoreVideoMeta)).pixbuf;
+        if pixbuf.is_null() {
+            return None;
+        }
+        // Retain — vtdec recycles the CVPixelBuffer once the GstBuffer is released.
+        CVPixelBufferRetain(pixbuf);
+        let (w, h) = (CVPixelBufferGetWidth(pixbuf) as u32, CVPixelBufferGetHeight(pixbuf) as u32);
+        let pts_us = buffer.pts().map(|t| (t.nseconds() / 1000) as i64).unwrap_or(0);
+        Some(GpuFrame::new(
+            w,
+            h,
+            pts_us,
+            NV12_FOURCC,
+            0, // no DRM modifier
+            Vec::new(), // no dma-buf planes — the host uses iosurface() instead
+            ColorInfo::for_resolution(w, h),
+            Box::new(GstIOSurfaceOwner { pixel_buffer: pixbuf }),
         ))
     }
 }

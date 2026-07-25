@@ -249,6 +249,11 @@ vaapi = ["wandr-video/vaapi"]
 # inert (and unbuilt) elsewhere. Off by default until the Windows host bring-up
 # provisions ANGLE and runs it — see reference_media_codec_strategy.md (Phase 2b).
 d3d11 = ["wandr-video/d3d11"]
+# macOS VideoToolbox. Kept as an opt-in host feature (not the retired always-on
+# decoder) because the GStreamer macOS zero-copy lane reuses its IOSurface plumbing:
+# IOSurfaceView + video_gl.rs::import_iosurface + the CVPixelBuffer readback. Build
+# `--features gstreamer,videotoolbox` for GStreamer HW zero-copy (vtdec → IOSurface).
+videotoolbox = ["wandr-video/videotoolbox"]
 # One-library desktop HW+SW decode via GStreamer (crates/wandr-video, feature
 # `gstreamer` → backends `gstreamer-hw`/`gstreamer-sw`). Links a SYSTEM library
 # (libgstreamer-1.0 + plugins): `scripts/build-host-linux.sh` PROBES for it. Linux
