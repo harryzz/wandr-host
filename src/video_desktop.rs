@@ -1061,6 +1061,7 @@ impl VideoDecoder {
     /// which is what a real player needs in order to slave video to the audio
     /// master clock.
     pub fn take_next_decoded(&mut self) -> Option<TakenFrame> {
+        self.queue_decoded(); // async-drain take_next: async decoders (GStreamer) produce after submit
         let f = self.pending.pop_front()?;
         Some(TakenFrame {
             pts_us: f.pts_us,
@@ -1081,6 +1082,7 @@ impl VideoDecoder {
     /// showing the past. That is a player POLICY choice, which is exactly why it
     /// lives here on the host adapter and not inside the codec.
     pub fn present_due(&mut self, clock_us: i64) -> Option<i64> {
+        self.queue_decoded(); // async-drain present_due: async decoders (GStreamer) produce after submit
         let mut chosen: Option<PendingFrame> = None;
         while self.pending.front().is_some_and(|f| f.pts_us <= clock_us) {
             if chosen.is_some() {

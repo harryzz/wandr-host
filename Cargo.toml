@@ -247,6 +247,15 @@ vaapi = ["wandr-video/vaapi"]
 # inert (and unbuilt) elsewhere. Off by default until the Windows host bring-up
 # provisions ANGLE and runs it — see reference_media_codec_strategy.md (Phase 2b).
 d3d11 = ["wandr-video/d3d11"]
+# One-library desktop HW+SW decode via GStreamer (crates/wandr-video, feature
+# `gstreamer` → backends `gstreamer-hw`/`gstreamer-sw`). Like `vaapi`, it links a
+# SYSTEM library (libgstreamer-1.0 + plugins), so `scripts/build-host-linux.sh`
+# PROBES for it (pkg-config gstreamer-1.0) and enables this only when present —
+# a box without GStreamer still builds a working software-decoding host. This is
+# also the gating seam for the planned migration: to DROP the hand-written codec
+# backends and run GStreamer-only, build with just this feature and clear the
+# `libvpx/openh264/libde265/dav1d` list above (and `VAAPI=0`).
+gstreamer = ["wandr-video/gstreamer"]
 
 [package.metadata.android]
 package = "com.example.wasmruntime"

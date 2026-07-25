@@ -45,3 +45,8 @@ pub mod hevc;
 // HW-first alongside vaapi/d3d11; VideoToolbox owns the DPB so no cros-codecs.
 #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
 pub mod videotoolbox;
+
+// GStreamer decode backend — one library covering every DESKTOP OS's HW+SW decoders.
+// Never on Android (GStreamer HW = JNI MediaCodec, unusable under `--no-art`).
+#[cfg(all(feature = "gstreamer", not(target_os = "android")))]
+pub mod gstreamer;

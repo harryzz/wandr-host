@@ -50,6 +50,14 @@ d3d11 = ["dep:windows", "dep:cros-codecs", "dep:anyhow"]
 # codec library to build — only core-foundation for the attribute dictionaries.
 videotoolbox = ["dep:core-foundation", "dep:core-foundation-sys"]
 
+# GStreamer decode backend (backends/gstreamer.rs) — one library, every desktop OS's
+# HW+SW decoders via appsrc->parser->decoder->appsink. Links the system GStreamer
+# (libgstreamer-1.0 + plugins), so it's opt-in like the codec libs. DESKTOP only:
+# never registered on Android (its HW path is JNI MediaCodec). Codec-level, NOT
+# playbin — demux/transport/subtitles stay guest-side. See the spike in
+# repros/gstreamer-spike + reference_gstreamer_desktop_backend_spike memory.
+gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:gstreamer-allocators"]
+
 [dependencies]
 # libvpx (BSD-3), built from vendor/libvpx and linked statically by wandr-vpx-sys.
 # That crate replaced env-libvpx-sys (MPL-2.0, and structurally unable to BUILD
@@ -69,6 +77,11 @@ libde265 = { version = "0.2", default-features = false, features = ["static"], o
 # build scripts set it); no runtime .so. Pinned to the version the AV1 bench
 # verified (355 fps on a real AV1 stream, repros/av1-bench).
 dav1d = { version = "0.11", optional = true }
+# GStreamer Rust bindings (LGPL, link system libgstreamer). Codec-level use only
+# (appsrc/appsink + decodebin elements); no gstreamer-play / playbin.
+gstreamer = { version = "0.23", optional = true }
+gstreamer-app = { version = "0.23", optional = true }
+gstreamer-video = { version = "0.23", optional = true }
 # Pure-Rust SIMD colorspace + resize — the libswscale replacement. These are pure
 # Rust (no system library, cross-compiles anywhere), so they are NOT gated: the
 # shared types and conversion helpers stay available on every target.
@@ -84,6 +97,12 @@ log = "0.4"
 [target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
 cros-codecs = { version = "0.0.6", features = ["vaapi"], optional = true }
 libva = { package = "cros-libva", version = "0.0.12", optional = true }
+# dma-buf memory (fd extraction) for the GStreamer zero-copy GPU lane. Linux-only:
+# the crate uses `std::os::unix` (fd), so it does not compile on Windows/macOS. The
+# `gstreamer` feature references `dep:gstreamer-allocators`, but that edge only
+# activates on Linux (target-gated dep); the dma-buf code in backends/gstreamer.rs is
+# itself `cfg(target_os = "linux")`. Windows/macOS use the D3D11/IOSurface GPU lanes.
+gstreamer-allocators = { version = "0.23", optional = true }
 
 # Windows HW decode (feature `d3d11`). cros-codecs supplies ONLY the H.264 parser
 # here (default-features off — no gbm/drm/nix, which is what lets it build on

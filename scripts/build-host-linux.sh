@@ -43,6 +43,21 @@ case "${VAAPI:-auto}" in
      fi ;;
 esac
 
+# GStreamer decode backend (gstreamer-hw / gstreamer-sw). Like VA-API it links a
+# SYSTEM library, so PROBE for it — a box without GStreamer still builds a working
+# software-decoding host. GST=0 forces off; GST=1 forces on (build fails loudly if
+# the dev packages are missing).
+case "${GST:-auto}" in
+  0) echo "GStreamer decode: disabled (GST=0)" ;;
+  1) FEATURES+=(--features gstreamer); echo "GStreamer decode: forced ON (GST=1)" ;;
+  *) if pkg-config --exists gstreamer-1.0 gstreamer-app-1.0 2>/dev/null; then
+       FEATURES+=(--features gstreamer)
+       echo "GStreamer decode: ENABLED (gstreamer $(pkg-config --modversion gstreamer-1.0) found)"
+     else
+       echo "GStreamer decode: skipped (no gstreamer-1.0 — install libgstreamer1.0-dev + libgstreamer-plugins-base1.0-dev to enable)"
+     fi ;;
+esac
+
 echo "Building wandr-host for $TARGET (release${P3:+, p3-async=$P3}) …"
 cargo build --release --target "$TARGET" "${FEATURES[@]}"
 
