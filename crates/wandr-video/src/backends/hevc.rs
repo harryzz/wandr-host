@@ -29,18 +29,25 @@ use windows::Win32::Graphics::Direct3D::{
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 
+use super::d3d11::{angle_d3d11_device, D3d11Owner, GpuTex, DRM_FORMAT_NV12};
 use super::hevc_dxva::*;
-use crate::{Chunk, CodecError, Decoder, Frame, I420Ref};
+use crate::{Chunk, CodecError, ColorInfo, Decoder, Frame, GpuFrame, I420Ref};
 
 const START_CODE: [u8; 3] = [0, 0, 1];
 
-/// One decoded picture in display-buffering order (CPU I420 readback).
+/// One decoded picture in display-buffering order — either read back to CPU I420
+/// (the verified lane) or kept as its own D3D11 NV12 texture (zero-copy: the host
+/// imports it into ANGLE GL with no CPU roundtrip). Same shape as the H.264 backend.
+enum Payload {
+    Cpu(Vec<u8>),
+    Gpu(GpuTex),
+}
 struct Decoded {
     poc: i32,
     pts: i64,
     width: u32,
     height: u32,
-    i420: Vec<u8>,
+    payload: Payload,
 }
 
 pub struct HevcD3d11Decoder {
@@ -212,22 +219,43 @@ impl Decoder for HevcD3d11Decoder {
     fn next_frame(&mut self) -> Option<Frame<'_>> {
         let d = self.ready.pop_front()?;
         let (w, h, pts) = (d.width, d.height, d.pts);
-        self.cur = Some(d.i420);
-        let buf = self.cur.as_ref().unwrap();
-        let (cw, ch) = ((w as usize).div_ceil(2), (h as usize).div_ceil(2));
-        let yl = (w * h) as usize;
-        let cl = cw * ch;
-        Some(Frame::cpu(I420Ref {
-            y: &buf[..yl],
-            y_stride: w,
-            u: &buf[yl..yl + cl],
-            u_stride: cw as u32,
-            v: &buf[yl + cl..yl + 2 * cl],
-            v_stride: cw as u32,
-            width: w,
-            height: h,
-            timestamp_us: pts,
-        }))
+        match d.payload {
+            // GPU: hand out an owned frame carrying the D3D11 texture (zero-copy);
+            // the host imports it into ANGLE GL. No borrow of `self` needed.
+            Payload::Gpu(tex) => {
+                let owner = D3d11Owner { tex, width: w, height: h };
+                let gf = GpuFrame::new(
+                    w,
+                    h,
+                    pts,
+                    DRM_FORMAT_NV12,
+                    0,
+                    Vec::new(),
+                    ColorInfo::for_resolution(w, h),
+                    Box::new(owner),
+                );
+                Some(Frame::gpu(gf))
+            }
+            // CPU: park the I420 in `self.cur` so the returned borrow stays valid.
+            Payload::Cpu(data) => {
+                self.cur = Some(data);
+                let buf = self.cur.as_ref().unwrap();
+                let (cw, ch) = ((w as usize).div_ceil(2), (h as usize).div_ceil(2));
+                let yl = (w * h) as usize;
+                let cl = cw * ch;
+                Some(Frame::cpu(I420Ref {
+                    y: &buf[..yl],
+                    y_stride: w,
+                    u: &buf[yl..yl + cl],
+                    u_stride: cw as u32,
+                    v: &buf[yl + cl..yl + 2 * cl],
+                    v_stride: cw as u32,
+                    width: w,
+                    height: h,
+                    timestamp_us: pts,
+                }))
+            }
+        }
     }
 }
 
@@ -273,27 +301,47 @@ struct HevcDxva {
     irap_no_rasl_output_flag: bool,
     max_pic_order_cnt_lsb: i32,
     rps: RpsRefs,
+    /// Emit `Frame::gpu` (a D3D11 NV12 texture the host imports into ANGLE GL,
+    /// zero-copy) instead of `Frame::cpu` (readback I420). On automatically when
+    /// the host pointed us at ANGLE's device; `WANDR_VIDEO_D3D11_GPU=1` forces it.
+    gpu: bool,
 }
 
 impl HevcDxva {
     fn new(width: u32, height: u32, slots: u32, max_dpb: usize) -> anyhow::Result<Self> {
         unsafe {
-            let mut device = None;
-            let mut context = None;
-            let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-                Some(&levels),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )?;
-            let device = device.ok_or_else(|| anyhow::anyhow!("no device"))?;
-            let context = context.ok_or_else(|| anyhow::anyhow!("no context"))?;
+            // Decode on ANGLE's D3D11 device when the host provided one (the
+            // zero-copy path — the output NV12 texture is then a same-device alias
+            // the host imports into GL); else create our own (CPU-readback lane).
+            let (device, context): (ID3D11Device, ID3D11DeviceContext) = match angle_d3d11_device() {
+                Some(ptr) => {
+                    let device = ID3D11Device::from_raw_borrowed(&ptr)
+                        .ok_or_else(|| anyhow::anyhow!("null ANGLE device"))?
+                        .clone();
+                    let context = device.GetImmediateContext()?;
+                    (device, context)
+                }
+                None => {
+                    let mut device = None;
+                    let mut context = None;
+                    let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+                    D3D11CreateDevice(
+                        None,
+                        D3D_DRIVER_TYPE_HARDWARE,
+                        HMODULE::default(),
+                        D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                        Some(&levels),
+                        D3D11_SDK_VERSION,
+                        Some(&mut device),
+                        None,
+                        Some(&mut context),
+                    )?;
+                    (
+                        device.ok_or_else(|| anyhow::anyhow!("no device"))?,
+                        context.ok_or_else(|| anyhow::anyhow!("no context"))?,
+                    )
+                }
+            };
             let vdevice: ID3D11VideoDevice = device.cast()?;
             let vcontext: ID3D11VideoContext = context.cast()?;
 
@@ -388,6 +436,7 @@ impl HevcDxva {
                 irap_no_rasl_output_flag: false,
                 max_pic_order_cnt_lsb: 0,
                 rps: RpsRefs::default(),
+                gpu: std::env::var("WANDR_VIDEO_D3D11_GPU").is_ok() || angle_d3d11_device().is_some(),
             })
         }
     }
@@ -781,12 +830,19 @@ impl HevcDxva {
             self.vcontext.SubmitDecoderBuffers(&self.decoder, &descs)?;
             self.vcontext.DecoderEndFrame(&self.decoder)?;
 
-            let i420 = self.readback_i420(out_slice)?;
+            // GPU-copy the decoded slice to its own NV12 texture (zero-copy output,
+            // stays on the GPU) or read it back to I420 (the CPU lane). Either way
+            // the frame's lifetime is decoupled from the pool slot.
+            let payload = if self.gpu {
+                Payload::Gpu(self.export_texture(out_slice)?)
+            } else {
+                Payload::Cpu(self.readback_i420(out_slice)?)
+            };
             let id = self.next_id;
             self.next_id = self.next_id.wrapping_add(1);
             self.pending.insert(
                 id,
-                Decoded { poc, pts, width: self.width, height: self.height, i420 },
+                Decoded { poc, pts, width: self.width, height: self.height, payload },
             );
 
             // This picture is a reference until the RPS retires it. HEVC marks the
@@ -852,6 +908,35 @@ impl HevcDxva {
         self.vcontext
             .ReleaseDecoderBuffer(&self.decoder, D3D11_VIDEO_DECODER_BUFFER_BITSTREAM)?;
         Ok(padded)
+    }
+
+    /// GPU-side copy of one decode surface into its own NV12 texture (the zero-copy
+    /// output). `SHADER_RESOURCE | RENDER_TARGET` so ANGLE's per-plane R8/RG8
+    /// EGL_ANGLE_image_d3d11_texture import works. Stays on the GPU — no readback —
+    /// and decouples the frame's lifetime from the pool/DPB.
+    unsafe fn export_texture(&self, slice: u8) -> anyhow::Result<GpuTex> {
+        let tdesc = D3D11_TEXTURE2D_DESC {
+            Width: self.width,
+            Height: self.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex = None;
+        self.device.CreateTexture2D(&tdesc, None, Some(&mut tex))?;
+        let texture: ID3D11Texture2D = tex.ok_or_else(|| anyhow::anyhow!("no frame texture"))?;
+        self.context
+            .CopySubresourceRegion(&texture, 0, 0, 0, 0, &self.pool, slice as u32, None);
+        Ok(GpuTex {
+            texture,
+            device: self.device.clone(),
+            context: self.context.clone(),
+        })
     }
 
     unsafe fn readback_i420(&self, slice: u8) -> anyhow::Result<Vec<u8>> {
