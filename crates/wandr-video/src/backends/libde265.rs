@@ -86,9 +86,22 @@ impl H265Decoder {
             CodecError::InitFailed
         })?;
         let mut dec = De265Decoder::new(session.clone());
-        // A modest thread pool: real-time even single-threaded, and this keeps
-        // headroom for the store thread. 0 threads = synchronous decode.
-        let n = std::thread::available_parallelism().map(|n| (n.get() as u32).min(4)).unwrap_or(1);
+        // Worker-thread count. On Windows this is 0 (SYNCHRONOUS decode) on
+        // purpose: libde265's worker threads synchronize through a hand-rolled
+        // Win32 condition-variable EMULATION (libde265 `extra/win32cond.c`, the
+        // Schmidt `SignalObjectAndWait` pattern — libde265 uses HANDLE mutexes +
+        // this emulated cond, NOT the native `CONDITION_VARIABLE`). That
+        // emulation races under contention and intermittently faults with
+        // 0xC0000005 (STATUS_ACCESS_VIOLATION) inside the decode worker pool —
+        // reproduced in the player, where the pool contends with the GL/audio
+        // threads. 0 threads never spawns the pool, so the racy path is never
+        // exercised; libde265 single-threaded is still real-time for playback
+        // (~30 fps @1080p). pthread platforms (Linux/macOS) keep the pool.
+        let n = if cfg!(target_os = "windows") {
+            0
+        } else {
+            std::thread::available_parallelism().map(|n| (n.get() as u32).min(4)).unwrap_or(1)
+        };
         let _ = dec.start_worker_threads(n);
         Ok(Self { session, dec, out: VecDeque::new(), current: None })
     }
