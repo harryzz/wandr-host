@@ -35,14 +35,8 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-# Task 117: ffmpeg is gone. The video codecs are compiled from source and linked
-# statically — no Homebrew ffmpeg, no GPL exposure, no runtime .dylib:
-#   • libvpx  (BSD-3, VP8/VP9) via wandr-vpx-sys — x86_64 slice needs `brew install nasm`
-#   • libde265 (LGPL, H.265)   via libde265-sys `static` (cc)
-#   • dav1d   (BSD-2, AV1)     via dav1d-sys internal meson build — `brew install meson ninja`
-# SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always makes dav1d-sys build the vendored dav1d
-# statically instead of resolving a system .dylib through pkg-config.
-export SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always
+# The one remaining codec toolchain: libvpx (BSD-3, VP8/VP9 ENCODE) via wandr-vpx-sys —
+# the x86_64 slice needs `brew install nasm`. All DECODE is GStreamer (below).
 
 FEATURES=()
 [[ "${P3:-1}" == "1" ]] && FEATURES=(--features p3-async)

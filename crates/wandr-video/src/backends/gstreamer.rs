@@ -44,8 +44,6 @@ use crate::{
 };
 #[cfg(target_os = "linux")]
 use crate::{ColorInfo, DmabufPlane, GpuFrame, GpuFrameOwner};
-#[cfg(all(target_os = "windows", feature = "d3d11"))]
-use crate::{ColorInfo, GpuFrame, GpuFrameOwner};
 
 // ── backend descriptor (one struct, two registered instances) ─────────────────
 
@@ -127,7 +125,7 @@ fn gpu_lane_available(element: &str) -> bool {
     {
         decoder_exports_dmabuf(element)
     }
-    #[cfg(all(target_os = "windows", feature = "d3d11"))]
+    #[cfg(target_os = "windows")]
     {
         let _ = element;
         d3d11_gpu::win_gpu_available()
@@ -136,14 +134,14 @@ fn gpu_lane_available(element: &str) -> bool {
     // GstCoreVideoMeta, which we extract into the host's IOSurface importer. Only the HW
     // decoder produces it; `avdec_*` (software) has no meta and falls to readback — but the
     // `hardware` gate below already means this is only asked for the vtdec lane.
-    #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+    #[cfg(target_os = "macos")]
     {
         element.starts_with("vtdec")
     }
     #[cfg(not(any(
         target_os = "linux",
-        all(target_os = "windows", feature = "d3d11"),
-        all(target_os = "macos", feature = "videotoolbox")
+        target_os = "windows",
+        target_os = "macos"
     )))]
     {
         let _ = element;
@@ -199,7 +197,7 @@ pub struct GstDecoder {
     /// Wrapped GstD3D11Device (== ANGLE's device) for the Windows zero-copy lane —
     /// held so `build_gpu_frame_d3d11` can lock it and read its device/context, and
     /// unref'd in `Drop`. Null on the readback lane. (Windows/d3d11 only.)
-    #[cfg(all(target_os = "windows", feature = "d3d11"))]
+    #[cfg(target_os = "windows")]
     d3d11_dev: *mut std::ffi::c_void,
 }
 
@@ -442,7 +440,7 @@ impl GstDecoder {
         // d3d11.rs's set_angle_d3d11_device handoff). Held for build_gpu_frame_d3d11 +
         // unref'd in Drop. Injection failing after win_gpu_available() said yes is a hard
         // error (bad device) — let the registry fall back rather than decode into limbo.
-        #[cfg(all(target_os = "windows", feature = "d3d11"))]
+        #[cfg(target_os = "windows")]
         let d3d11_dev = {
             let dev = if gpu { unsafe { d3d11_gpu::inject_angle_device(&pipeline) } } else { None };
             if gpu && dev.is_none() {
@@ -465,7 +463,7 @@ impl GstDecoder {
             eos,
             current: None,
             gpu,
-            #[cfg(all(target_os = "windows", feature = "d3d11"))]
+            #[cfg(target_os = "windows")]
             d3d11_dev,
         })
     }
@@ -526,7 +524,7 @@ impl Decoder for GstDecoder {
         }
 
         // Windows GPU lane: copy the decoded D3D11 texture into an ANGLE-importable one.
-        #[cfg(all(target_os = "windows", feature = "d3d11"))]
+        #[cfg(target_os = "windows")]
         if self.gpu {
             return unsafe { d3d11_gpu::build_gpu_frame_d3d11(&sample, self.d3d11_dev) }.map(Frame::gpu);
         }
@@ -534,7 +532,7 @@ impl Decoder for GstDecoder {
         // macOS GPU lane: extract vtdec's CVPixelBuffer from the GstCoreVideoMeta and hand
         // it to the host's IOSurface importer (no copy). IOSurface is a shareable GPU
         // resource, so unlike D3D11 there is no device/context to synchronise.
-        #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+        #[cfg(target_os = "macos")]
         if self.gpu {
             return unsafe { iosurface_gpu::build_gpu_frame_iosurface(&sample) }.map(Frame::gpu);
         }
@@ -567,7 +565,7 @@ impl Drop for GstDecoder {
         let _ = self.pipeline.set_state(gst::State::Null);
         // Release our ref on the wrapped ANGLE GstD3D11Device (the pipeline/context held
         // its own, dropped when `pipeline` drops right after this).
-        #[cfg(all(target_os = "windows", feature = "d3d11"))]
+        #[cfg(target_os = "windows")]
         if !self.d3d11_dev.is_null() {
             unsafe { gst::ffi::gst_object_unref(self.d3d11_dev as *mut gst::ffi::GstObject) };
         }
@@ -586,7 +584,7 @@ impl Drop for GstDecoder {
 // GStreamer ships no Rust D3D11 binding, so the GstD3D11* calls are raw FFI against
 // gstd3d11-1.0 (public API lib, `gstreamer-d3d11-1.0.pc`). D3D11 itself is the
 // `windows` crate (already linked by the d3d11 feature).
-#[cfg(all(target_os = "windows", feature = "d3d11"))]
+#[cfg(target_os = "windows")]
 mod d3d11_gpu {
     use std::ffi::c_void;
 
@@ -622,7 +620,7 @@ mod d3d11_gpu {
 
     /// GPU zero-copy is available iff the host handed us ANGLE's D3D11 device.
     pub(super) fn win_gpu_available() -> bool {
-        crate::backends::d3d11::angle_d3d11_device().is_some()
+        crate::backends::gpu_interop::angle_d3d11_device().is_some()
     }
 
     /// Force the pipeline's d3d11 decoder onto ANGLE's device by publishing a
@@ -630,7 +628,7 @@ mod d3d11_gpu {
     /// our owned GstD3D11Device* (unref in Drop), or None if ANGLE's device isn't set /
     /// wrapping fails.
     pub(super) unsafe fn inject_angle_device(pipeline: &gst::Pipeline) -> Option<*mut c_void> {
-        let angle = crate::backends::d3d11::angle_d3d11_device()?; // *mut ID3D11Device
+        let angle = crate::backends::gpu_interop::angle_d3d11_device()?; // *mut ID3D11Device
         let gst_dev = gst_d3d11_device_new_wrapped(angle);
         if gst_dev.is_null() {
             return None;
@@ -661,9 +659,9 @@ mod d3d11_gpu {
     impl GpuFrameOwner for GstD3d11Owner {
         fn read_i420(&self, out: &mut Vec<u8>) -> Result<(), crate::CodecError> {
             let i420 = unsafe {
-                crate::backends::d3d11::readback_nv12_texture(&self.device, &self.context, &self.texture, self.width, self.height)
+                crate::backends::gpu_interop::readback_nv12_texture(&self.device, &self.context, &self.texture, self.width, self.height)
             }
-            .map_err(|_| crate::CodecError::BadFrame)?;
+            .ok_or(crate::CodecError::BadFrame)?;
             out.clear();
             out.extend_from_slice(&i420);
             Ok(())
@@ -762,7 +760,7 @@ mod d3d11_gpu {
 // The applemedia meta lives in the plugin (no linkable public API), so we look the
 // meta API up by its registered name and read the struct — the macOS peer of the
 // d3d11 raw-FFI extraction. CoreVideo retain/release keeps the buffer alive.
-#[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+#[cfg(target_os = "macos")]
 mod iosurface_gpu {
     use std::ffi::c_void;
 
@@ -812,7 +810,7 @@ mod iosurface_gpu {
     }
     impl GpuFrameOwner for GstIOSurfaceOwner {
         fn read_i420(&self, out: &mut Vec<u8>) -> Result<(), crate::CodecError> {
-            unsafe { crate::backends::videotoolbox::pixel_buffer_to_i420(self.pixel_buffer, out) }
+            unsafe { crate::backends::gpu_interop::pixel_buffer_to_i420(self.pixel_buffer, out) }
         }
         fn iosurface(&self) -> Option<crate::IOSurfaceView> {
             Some(crate::IOSurfaceView { pixel_buffer: self.pixel_buffer })

@@ -9,54 +9,20 @@ description = "Portable video codec backends for wandr:video — VP8/VP9 via lib
 # OFF by default so a plain `cargo build` (and the Android cross-build, which
 # uses MediaCodec) needs no media library at all. The desktop host turns it on.
 default = []
+# VP8/VP9 ENCODE (Signal video calls) via statically-linked libvpx (BSD-3). The one
+# hand-written codec kept — the decode-only GStreamer backend does not encode. Built
+# from source by wandr-vpx-sys, so no system library.
 libvpx = ["dep:wandr-vpx-sys"]
-# Software H.264 (Cisco OpenH264, BSD-2) — the DESKTOP software fallback for
-# H.264 decode/encode. Built from source by openh264-sys2 (cc), so no system
-# library. Android decodes H.264 in hardware via MediaCodec and never enables
-# this, which is why it is a separate opt-in feature like `libvpx`.
-openh264 = ["dep:openh264"]
-# Software H.265/HEVC (oxideav-h265, pure-Rust MIT) — the DESKTOP software
-# decoder. Fills the H.265 gap task 117 flagged, without LGPL libde265. Android
-# decodes HEVC in MediaCodec HW, so this is desktop-only like the others.
-oxideav-h265 = ["dep:oxideav-h265"]
-# Real-time software H.265/HEVC via libde265 (LGPL-2.1). Built from source and
-# linked STATICALLY (no runtime .so). ~60 fps @720p single-thread vs oxideav's
-# ~4 fps. LGPL is task 117's third-choice tier — allowed for a real need.
-libde265 = ["dep:libde265"]
-# Software AV1 via dav1d (VideoLAN, BSD-2). Built from source and linked
-# STATICALLY by dav1d-sys's internal meson path (see the note in the dep below).
-# ~355 fps @720p vs oxideav-av1 failing on standard matroska framing entirely.
-# BSD-2 = task 117's permissive-static tier (cleaner than HEVC's LGPL). Decode
-# only; Android decodes AV1 in MediaCodec HW so this stays desktop-only.
-dav1d = ["dep:dav1d"]
-# HARDWARE H.264 decode via VA-API (task 117 M2 stage 3) — the first HW backend.
-# OFF by default and deliberately so: unlike every other feature here, this one
-# links the SYSTEM libva (`libva.so`, via cros-libva), so enabling it makes the
-# host unbuildable without libva headers and unrunnable without the runtime .so.
-# The Linux build script turns it on; Android (MediaCodec) and Windows/macOS
-# never do. A machine with the feature compiled in but no usable VA driver is
-# fine — the backend probes and declines, and software decodes as before.
-vaapi = ["dep:cros-codecs", "dep:libva"]
-# HARDWARE H.264 decode via DXVA2 / ID3D11VideoDecoder (Windows). The Windows peer
-# of `vaapi`: same "HW first, probe-and-decline, software fallback" contract. Links
-# only the `windows` crate (Microsoft-maintained bindings) — no external codec
-# library — and reuses cros-codecs' pure-Rust H.264 parser (default-features off,
-# so no gbm/drm/nix). The Windows build script turns it on; Linux/macOS/Android
-# never do. See backends/d3d11.rs.
-d3d11 = ["dep:windows", "dep:cros-codecs", "dep:anyhow"]
 
-# macOS HW decode (feature `videotoolbox`). VideoToolbox/CoreMedia/CoreVideo are
-# system frameworks (linked from the backend), so there is no vendored/system
-# codec library to build — only core-foundation for the attribute dictionaries.
-videotoolbox = ["dep:core-foundation", "dep:core-foundation-sys"]
-
-# GStreamer decode backend (backends/gstreamer.rs) — one library, every desktop OS's
-# HW+SW decoders via appsrc->parser->decoder->appsink. Links the system GStreamer
-# (libgstreamer-1.0 + plugins), so it's opt-in like the codec libs. DESKTOP only:
-# never registered on Android (its HW path is JNI MediaCodec). Codec-level, NOT
-# playbin — demux/transport/subtitles stay guest-side. See the spike in
-# repros/gstreamer-spike + reference_gstreamer_desktop_backend_spike memory.
-gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:gstreamer-allocators"]
+# GStreamer — the DESKTOP DECODE backend (backends/gstreamer.rs): one library wrapping
+# every OS's HW+SW decoders (VA / DXVA / VideoToolbox + libav) via appsrc->parser->
+# decoder->appsink. Links the system GStreamer. On Windows it also pulls the `windows`
+# crate for the D3D11 zero-copy lane (backends/gpu_interop.rs); on Linux the dma-buf
+# lane needs gstreamer-allocators (both target-gated, so the edge only activates there).
+# DESKTOP only — never on Android (its HW path is JNI MediaCodec). Codec-level, NOT
+# playbin: demux/transport/subtitles stay guest-side. The hand-written per-OS decoders
+# (vaapi/d3d11/videotoolbox/openh264/libde265/oxideav/dav1d) were RETIRED 2026-07-26.
+gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:gstreamer-allocators", "dep:windows"]
 
 [dependencies]
 # libvpx (BSD-3), built from vendor/libvpx and linked statically by wandr-vpx-sys.
@@ -64,19 +30,6 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:g
 # libvpx — it could only consume a prebuilt one), so a plain `cargo build` now
 # needs no system media library and no pre-build step.
 wandr-vpx-sys = { path = "../wandr-vpx-sys", optional = true }
-openh264 = { version = "0.9", optional = true }
-# Pure-Rust HEVC decoder (MIT). We depend ONLY on the codec crate — oxideav's
-# registry and its unfinished HW backends are not used. Pinned to the version the
-# spike verified (300/300 on a real HEVC MP4).
-oxideav-h265 = { version = "=0.0.9", optional = true }
-# `static` builds libde265 from source with cc and links it statically; drop the
-# default `system` feature so there is no runtime .so dependency.
-libde265 = { version = "0.2", default-features = false, features = ["static"], optional = true }
-# dav1d-sys builds dav1d from source with meson and links it statically when
-# `SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always` is set in the build env (the wandr
-# build scripts set it); no runtime .so. Pinned to the version the AV1 bench
-# verified (355 fps on a real AV1 stream, repros/av1-bench).
-dav1d = { version = "0.11", optional = true }
 # GStreamer Rust bindings (LGPL, link system libgstreamer). Codec-level use only
 # (appsrc/appsink + decodebin elements); no gstreamer-play / playbin.
 gstreamer = { version = "0.23", optional = true }
@@ -89,14 +42,7 @@ yuv = "0.8"
 fast_image_resize = "6.0"
 log = "0.4"
 
-# VA-API HW decode (feature `vaapi`). cros-codecs supplies the H.264 parser +
-# DPB/reference management; cros-libva is the VA binding. Both are Linux-only, so
-# they sit in a target table — the Android cross-build and Windows/macOS do not
-# even resolve them. Pinned to the versions repros/vaapi-decode-probe verified on
-# real hardware (300/300, checked on pixels).
 [target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
-cros-codecs = { version = "0.0.6", features = ["vaapi"], optional = true }
-libva = { package = "cros-libva", version = "0.0.12", optional = true }
 # dma-buf memory (fd extraction) for the GStreamer zero-copy GPU lane. Linux-only:
 # the crate uses `std::os::unix` (fd), so it does not compile on Windows/macOS. The
 # `gstreamer` feature references `dep:gstreamer-allocators`, but that edge only
@@ -104,11 +50,9 @@ libva = { package = "cros-libva", version = "0.0.12", optional = true }
 # itself `cfg(target_os = "linux")`. Windows/macOS use the D3D11/IOSurface GPU lanes.
 gstreamer-allocators = { version = "0.23", optional = true }
 
-# Windows HW decode (feature `d3d11`). cros-codecs supplies ONLY the H.264 parser
-# here (default-features off — no gbm/drm/nix, which is what lets it build on
-# Windows); the `windows` crate is Microsoft's maintained DXVA/D3D11 bindings.
-# anyhow is used by the backend's unsafe COM plumbing. Target-gated so non-Windows
-# builds never resolve them.
+# The `windows` crate (Microsoft DXVA/D3D11 bindings) for the GStreamer D3D11 zero-copy
+# lane — backends/gpu_interop.rs (ANGLE device + readback) + the D3d11View handle. Pulled
+# by the `gstreamer` feature on Windows; target-gated so non-Windows never resolves it.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", optional = true, features = [
     "Win32_Foundation",
@@ -117,12 +61,6 @@ windows = { version = "0.62", optional = true, features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
 ] }
-cros-codecs = { version = "0.0.6", default-features = false, optional = true }
-anyhow = { version = "1", optional = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = { version = "0.10", optional = true }
-core-foundation-sys = { version = "0.8", optional = true }
 
 # The round-trip tests need a real codec, so they are skipped by a bare
 # `cargo test` rather than failing it.
@@ -134,53 +72,13 @@ required-features = ["libvpx"]
 name = "playback"
 required-features = ["libvpx"]
 
+# GStreamer decode through the CodecBackend seam (SW avdec + HW va/d3d11/vtdec).
+# Skips the HW-only assertions where no HW decoder exists — see its header.
 [[test]]
-name = "h264"
-required-features = ["libvpx", "openh264"]
-
-# Needs a GPU and a real Annex-B sample (WANDR_TEST_H264), so it SKIPS rather than
-# fails where either is missing — see the test's own header.
-[[test]]
-name = "vaapi_hw"
-required-features = ["vaapi"]
-
-# DXVA2/D3D11 HW decode, end-to-end through the Decoder trait. Bit-exact vs the
-# ffmpeg framehash reference beside the cros-codecs test vector. SKIPS (passes)
-# on a runner with no video device — see the test header.
-[[test]]
-name = "d3d11_hw"
-required-features = ["d3d11"]
-
-# VideoToolbox HW decode, end-to-end through the Decoder trait. Bit-exact vs the
-# same ffmpeg framehash reference the d3d11 test uses. SKIPS (passes) where VT has
-# no HW decoder for the codec — see the test header.
-[[test]]
-name = "videotoolbox_hw"
-required-features = ["videotoolbox"]
-
-# Answers "does the backend pair timestamps to the right frames?", which needs a
-# container (an elementary stream has no PTS) — hence the mp4 dev-dependency and
-# the WANDR_TEST_MP4 sample. Skips without one.
-[[test]]
-name = "h264_pts_pairing"
-required-features = ["openh264"]
-
-# Frame-exact colour-matrix check (601 vs 709 on ONE decoded frame). Needs a
-# container for a real frame; software decode, so no GPU. Skips without the MP4.
-[[test]]
-name = "color_matrix"
-required-features = ["openh264"]
+name = "gstreamer_decode"
+required-features = ["gstreamer"]
 
 [dev-dependencies]
-# Demux for the timestamp-pairing test ONLY. The crate itself never parses
-# containers — demux is guest-side by design (wasi-media-source/NOTES.md).
+# Demux for a timestamp-pairing test ONLY. The crate itself never parses containers —
+# demux is guest-side by design (wasi-media-source/NOTES.md).
 mp4 = "0.14"
-
-# This crate is standalone (its own Cargo.lock), so it needs its own patch entry:
-# a `[patch]` in the host's Cargo.toml only covers builds that go through the
-# host. Same tree, so the two cannot diverge. See vendor/cros-codecs/WANDR-PATCHES.md
-# for what is patched and why.
-[patch.crates-io]
-cros-codecs = { path = "../../vendor/cros-codecs" }
-# Same libde265-sys build.rs patch as the host — standalone crate, own Cargo.lock.
-libde265-sys = { path = "../../vendor/libde265-sys" }

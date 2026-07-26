@@ -126,28 +126,15 @@ jobs:
       # It is NOT in `default`, so a plain `cargo build` yields a host with no WASI 0.3
       # surface — guests importing wasi:sockets@0.3.0 fail with "resource implementation
       # is missing".
-      # `gstreamer` is the ONE decode backend now (SW via avdec_*, HW via va/d3d11/vtdec
-      # plugins). The hand-written SW decoders (openh264/libde265/dav1d) are retired and no
-      # longer built; libvpx stays (VP8/VP9 ENCODE) via the always-on wandr-video dep.
-      - name: Build (Linux/Windows, +gstreamer)
-        if: runner.os != 'macOS'
+      # `gstreamer` is the ONE decode backend — SW via avdec_*, HW via the va/d3d11/vtdec
+      # plugins, zero-copy per OS (dma-buf / D3D11 / IOSurface) through wandr-video's
+      # `gpu_interop`. Same feature set on every desktop OS now that the hand-written
+      # decoders are retired; libvpx stays (VP8/VP9 ENCODE) via the always-on wandr-video dep.
+      - name: Build (desktop, +gstreamer)
         run: cargo build --release --locked --features p3-async,gstreamer
 
-      # macOS also builds +videotoolbox: the GStreamer IOSurface zero-copy lane reuses its
-      # plumbing (IOSurfaceView + video_gl.rs::import_iosurface). vtdec/avdec come from
-      # brew's gst-plugins-bad + gst-libav. This also compiles the retired VideoToolbox
-      # decoder — the only way to compile-check the zero-copy lane until it's decoupled.
-      - name: Build (macOS, +gstreamer,videotoolbox)
-        if: runner.os == 'macOS'
-        run: cargo build --release --locked --features p3-async,gstreamer,videotoolbox
-
-      - name: Test (Linux/Windows, +gstreamer)
-        if: runner.os != 'macOS'
+      - name: Test (desktop, +gstreamer)
         run: cargo test --release --locked --features p3-async,gstreamer --no-run
-
-      - name: Test (macOS, +gstreamer,videotoolbox)
-        if: runner.os == 'macOS'
-        run: cargo test --release --locked --features p3-async,gstreamer,videotoolbox --no-run
 
       - uses: actions/upload-artifact@v4
         with:

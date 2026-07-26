@@ -29,10 +29,10 @@ pub mod convert;
 
 pub use convert::{i420_to_rgba, i420_to_rgba_with, Rgb24Frame};
 
-/// Windows/DXVA2 only: tell the d3d11 decoder which `ID3D11Device` to decode on
+/// Windows only: tell the GStreamer d3d11 decoder which `ID3D11Device` to decode on
 /// (ANGLE's, for zero-copy import). Call on the GL thread before opening a decoder.
-#[cfg(all(feature = "d3d11", target_os = "windows"))]
-pub use backends::d3d11::set_angle_d3d11_device;
+#[cfg(all(feature = "gstreamer", target_os = "windows"))]
+pub use backends::gpu_interop::set_angle_d3d11_device;
 
 // ── codec vocabulary ─────────────────────────────────────────────────────────
 // Only what a codec actually needs. The host's WIT-shaped types (VideoRect,
@@ -427,14 +427,14 @@ impl GpuFrame {
     /// The Windows D3D11 texture handle for this frame, if it has one. The host's
     /// ANGLE import calls this; a dma-buf frame (and every non-Windows build)
     /// returns `None` and the caller uses `planes` / `read_i420` instead.
-    #[cfg(all(feature = "d3d11", target_os = "windows"))]
+    #[cfg(all(feature = "gstreamer", target_os = "windows"))]
     pub fn d3d11(&self) -> Option<D3d11View> {
         self.owner.d3d11()
     }
 
     /// The macOS CVPixelBuffer handle for this frame, if it has one (the
     /// VideoToolbox owner). `None` otherwise; the caller uses `read_i420` instead.
-    #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     pub fn iosurface(&self) -> Option<IOSurfaceView> {
         self.owner.iosurface()
     }
@@ -465,7 +465,7 @@ pub trait GpuFrameOwner: Send {
     /// and lib.rs stay free of the `windows` crate everywhere else — the Linux
     /// vaapi owner never implements it. The host imports the texture into ANGLE
     /// (same D3D11 device) rather than reading it back.
-    #[cfg(all(feature = "d3d11", target_os = "windows"))]
+    #[cfg(all(feature = "gstreamer", target_os = "windows"))]
     fn d3d11(&self) -> Option<D3d11View> {
         None
     }
@@ -474,7 +474,7 @@ pub trait GpuFrameOwner: Send {
     /// `CVPixelBuffer` (IOSurface-backed). The host maps the IOSurface into
     /// `GL_TEXTURE_RECTANGLE` planes via `CGLTexImageIOSurface2D` (mpv's shape)
     /// rather than reading it back. `None` on every other owner.
-    #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     fn iosurface(&self) -> Option<IOSurfaceView> {
         None
     }
@@ -483,7 +483,7 @@ pub trait GpuFrameOwner: Send {
 /// A borrowed view of a decoded NV12 picture as a macOS `CVPixelBuffer`. The owner
 /// keeps a retain on the buffer for as long as the `GpuFrame` lives, so the host
 /// can map its IOSurface into textures without its own refcount.
-#[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub struct IOSurfaceView {
     /// The raw `CVPixelBufferRef`. The host calls `CVPixelBufferGetIOSurface` on
     /// it and binds each plane with `CGLTexImageIOSurface2D`. Keeps the CoreVideo
@@ -494,7 +494,7 @@ pub struct IOSurfaceView {
 /// A borrowed view of a decoded NV12 picture as a D3D11 texture (Windows/DXVA2).
 /// The `owner` that hands this out keeps the texture (and its device) alive for
 /// as long as the `GpuFrame` lives, so these are safe to use un-refcounted.
-#[cfg(all(feature = "d3d11", target_os = "windows"))]
+#[cfg(all(feature = "gstreamer", target_os = "windows"))]
 pub struct D3d11View {
     pub texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     /// The device the texture belongs to — the host shares it with ANGLE (or
@@ -504,7 +504,7 @@ pub struct D3d11View {
     pub array_slice: u32,
 }
 
-#[cfg(all(feature = "d3d11", target_os = "windows"))]
+#[cfg(all(feature = "gstreamer", target_os = "windows"))]
 impl D3d11View {
     /// The raw `ID3D11Texture2D*` to pass as ANGLE's `EGL_D3D11_TEXTURE_ANGLE`
     /// client buffer. Keeps the `windows` crate dependency inside this crate — the
@@ -739,29 +739,16 @@ impl Default for Registry {
 /// it never enters the registry — the "load failure" fallback path.
 pub fn default_registry() -> Registry {
     let mut r = Registry::new();
-    // HARDWARE FIRST (priority 10) — but only registered, never assumed: the
-    // backend probes the driver in `supports_decode` and declines at `open` if it
-    // cannot actually decode, so the software backends below stay the fallback.
-    #[cfg(all(feature = "vaapi", target_os = "linux", not(target_os = "android")))]
-    r.register(Box::new(backends::vaapi::VaapiBackend));
-    #[cfg(all(feature = "d3d11", target_os = "windows"))]
-    r.register(Box::new(backends::d3d11::D3d11Backend));
-    #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
-    r.register(Box::new(backends::videotoolbox::VideoToolboxBackend));
+    // VP8/VP9 ENCODE (Signal video calls). Its VP8/VP9 DECODE also registers, but
+    // GStreamer outranks nothing here — libvpx is not a decode competitor for the
+    // codecs GStreamer handles (H.264/H.265/AV1).
     #[cfg(feature = "libvpx")]
     r.register(Box::new(backends::libvpx::LibvpxBackend));
-    #[cfg(feature = "openh264")]
-    r.register(Box::new(backends::openh264::OpenH264Backend));
-    #[cfg(feature = "oxideav-h265")]
-    r.register(Box::new(backends::oxideav_h265::OxideH265Backend));
-    #[cfg(feature = "libde265")]
-    r.register(Box::new(backends::libde265::Libde265Backend));
-    #[cfg(feature = "dav1d")]
-    r.register(Box::new(backends::dav1d::Dav1dBackend));
-    // GStreamer — two lanes sharing one impl: HW (prio 15, just below native
-    // d3d11/vaapi) and SW (prio 95, last-resort universal fallback). Each probes
-    // its decoder elements in `supports_decode`, so on a box with no HW plugin the
-    // HW lane simply reports nothing. Desktop only.
+    // GStreamer — the DECODE backend. Two lanes sharing one impl: HW (prio 15) and SW
+    // (prio 95). Each probes its decoder elements in `supports_decode`, so on a box with
+    // no HW plugin the HW lane simply reports nothing. Desktop only. The hand-written
+    // per-OS decoders (vaapi/d3d11/videotoolbox + openh264/libde265/oxideav/dav1d) were
+    // retired 2026-07-26 — GStreamer covers all of it.
     #[cfg(all(feature = "gstreamer", not(target_os = "android")))]
     {
         r.register(Box::new(backends::gstreamer::GStreamerBackend { hardware: true }));

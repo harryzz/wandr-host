@@ -147,7 +147,7 @@ pub fn register(display: &glutin::display::Display) {
     // Windows: point the d3d11 decoder at ANGLE's D3D11 device, so its output
     // texture imports here as a same-device alias (zero-copy). Harmless if the
     // query fails — the decoder then uses its own device and we read back.
-    #[cfg(all(feature = "d3d11", target_os = "windows"))]
+    #[cfg(all(feature = "gstreamer", target_os = "windows"))]
     register_angle_d3d11_device(display);
 }
 
@@ -155,7 +155,7 @@ pub fn register(display: &glutin::display::Display) {
 /// (`set_angle_d3d11_device`), so decode lands on the same device this GL context
 /// samples from. On x86_64 Windows `extern "C"` == the platform ABI, matching the
 /// rest of this module's EGL entry points.
-#[cfg(all(feature = "d3d11", target_os = "windows"))]
+#[cfg(all(feature = "gstreamer", target_os = "windows"))]
 fn register_angle_d3d11_device(display: &glutin::display::Display) {
     use glutin::display::GlDisplay;
     const EGL_DEVICE_EXT: i32 = 0x322C;
@@ -372,7 +372,7 @@ pub fn import_nv12(frame: GpuFrame) -> Result<TextureFrame, GpuFrame> {
     // Windows/ANGLE: a GPU frame is a D3D11 texture, imported per-plane via
     // EGL_ANGLE_image_d3d11_texture. On Err the frame comes back and the dma-buf
     // path below reads it back (which is also what happens for a non-D3D11 frame).
-    #[cfg(all(feature = "d3d11", target_os = "windows"))]
+    #[cfg(all(feature = "gstreamer", target_os = "windows"))]
     let frame = match import_d3d11(egl, frame) {
         Ok(tf) => return Ok(tf),
         Err(f) => f,
@@ -527,7 +527,7 @@ fn import_iosurface(frame: GpuFrame) -> Result<TextureFrame, GpuFrame> {
 /// The texture is on ANGLE's own D3D11 device (the decoder was pointed at it via
 /// `wandr_video::set_angle_d3d11_device`), so this is a same-device alias — no
 /// shared handle, no copy. Hands the frame back on any failure, like `import_nv12`.
-#[cfg(all(feature = "d3d11", target_os = "windows"))]
+#[cfg(all(feature = "gstreamer", target_os = "windows"))]
 fn import_d3d11(egl: &Egl, frame: GpuFrame) -> Result<TextureFrame, GpuFrame> {
     let Some(view) = frame.d3d11() else { return Err(frame) };
     if !egl.d3d11_image {
