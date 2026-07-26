@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build wandr-host for macOS desktop — Intel (x86_64) and/or Apple Silicon
-# (aarch64), release, p3-async. Run on a Mac (needs Xcode + `brew install ffmpeg
-# pkg-config`; skia-safe fetches its own prebuilts per target).
+# (aarch64), release, p3-async. Run on a Mac (needs Xcode + `brew install gstreamer
+# nasm pkg-config`; skia-safe fetches its own prebuilts per target).
 #
 # IMPORTANT — cross-building is not proof it works:
 #   From an Intel Mac you can build BOTH slices (the arm64 one is a cross-compile
@@ -57,8 +57,8 @@ esac
 
 # Minimum macOS this binary claims to support. Applies to OUR code (rustc + the cc-rs C++
 # shims); it does NOT change what the dependencies were built against. In particular a
-# Homebrew ffmpeg is a per-OS bottle: one installed on macOS 13 carries `minos 13.0`, so a
-# binary linked against it will not load on macOS 12 however this is set. That is why the
+# Homebrew gstreamer is a per-OS bottle: one installed on macOS 13 carries `minos 13.0`, so
+# a binary linked against it will not load on macOS 12 however this is set. That is why the
 # CI artifacts are a BUILD CHECK — to RUN on an older macOS, build ON that macOS, where
 # brew installs a matching bottle.
 export MACOSX_DEPLOYMENT_TARGET="${MACOS_MIN:-12.0}"
