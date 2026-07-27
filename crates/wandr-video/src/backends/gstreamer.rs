@@ -169,6 +169,41 @@ fn parser_prefix(codec: Codec) -> &'static str {
     }
 }
 
+/// Coded luma bit depth of the stream, read from the FIRST frame by running it
+/// through only the parser GStreamer already uses (no decode) and reading
+/// `bit-depth-luma` off the parsed caps — the same field `h265parse`/`av1parse`
+/// derive from the SPS/sequence-header. Returns 8 when unknown (the safe default:
+/// 8-bit content stays on its existing, possibly zero-copy, lane). This is how a
+/// browser learns bit depth too — from the bitstream, backend-side.
+fn probe_bit_depth(codec: Codec, data: &[u8]) -> u32 {
+    let parse = parser_prefix(codec);
+    if parse.is_empty() {
+        return 8; // vp8/vp9: no parser wired here — assume 8-bit
+    }
+    ensure_init();
+    let run = || -> Option<u32> {
+        let launch = format!(
+            "appsrc name=s caps=\"{caps}\" ! {parse}appsink name=o sync=false max-buffers=1 drop=false",
+            caps = encoded_caps(codec),
+        );
+        let pipeline = gst::parse::launch(&launch).ok()?.downcast::<gst::Pipeline>().ok()?;
+        let src = pipeline.by_name("s")?.downcast::<gst_app::AppSrc>().ok()?;
+        let sink = pipeline.by_name("o")?.downcast::<gst_app::AppSink>().ok()?;
+        pipeline.set_state(gst::State::Playing).ok()?;
+        let _ = src.push_buffer(gst::Buffer::from_mut_slice(data.to_vec()));
+        let _ = src.end_of_stream();
+        let depth = sink
+            .try_pull_sample(gst::ClockTime::from_mseconds(300))
+            .and_then(|s| {
+                s.caps()
+                    .and_then(|c| c.structure(0).and_then(|st| st.get::<u32>("bit-depth-luma").ok()))
+            });
+        let _ = pipeline.set_state(gst::State::Null);
+        depth
+    };
+    run().unwrap_or(8)
+}
+
 // ── decoder ──────────────────────────────────────────────────────────────────
 
 struct DecodedFrame {
@@ -194,6 +229,12 @@ pub struct GstDecoder {
     /// Emit a zero-copy `Frame::gpu` (dma-buf on Linux, D3D11 texture on Windows)
     /// instead of CPU I420. HW lanes only.
     gpu: bool,
+    /// Kept so the first frame can rebuild this decoder on the software lane if the
+    /// stream turns out to be >8-bit (see `decode`). `hardware` is the lane this
+    /// pipeline was built for; `probed` guards the one-time bit-depth check.
+    params: DecoderParams,
+    hardware: bool,
+    probed: bool,
     /// Wrapped GstD3D11Device (== ANGLE's device) for the Windows zero-copy lane —
     /// held so `build_gpu_frame_d3d11` can lock it and read its device/context, and
     /// unref'd in `Drop`. Null on the readback lane. (Windows/d3d11 only.)
@@ -463,6 +504,9 @@ impl GstDecoder {
             eos,
             current: None,
             gpu,
+            params: *p,
+            hardware,
+            probed: false,
             #[cfg(target_os = "windows")]
             d3d11_dev,
         })
@@ -471,6 +515,29 @@ impl GstDecoder {
 
 impl Decoder for GstDecoder {
     fn decode(&mut self, chunk: crate::Chunk<'_>) -> Result<(), CodecError> {
+        // Task 117 M3.1 — 10-bit fallback. A HW pipeline's output lane pins 8-bit
+        // (NV12 / DMA_DRM-NV12), so a >8-bit stream (P010 / I420_10LE) can't
+        // negotiate and playback freezes. On the FIRST frame, check the coded bit
+        // depth from the bitstream; if >8, rebuild once on the software decoder +
+        // `videoconvert ! I420` lane (down-converts to 8-bit, identical on every
+        // OS). 8-bit content is untouched — it keeps its exact current lane. The
+        // 10-bit-preserving path (P010 zero-copy + 10-bit surface) is task 117 M3b.
+        if !self.probed {
+            self.probed = true;
+            if self.hardware {
+                let depth = probe_bit_depth(self.params.codec, chunk.data);
+                if depth > 8 {
+                    log::warn!(
+                        "wandr-video: {:?} {}-bit down-converted to 8-bit (software decode) \
+                         — no 10-bit output path yet (task 117 M3b); quality reduced",
+                        self.params.codec, depth
+                    );
+                    let mut sw = GstDecoder::new(&self.params, false)?;
+                    sw.probed = true;
+                    *self = sw; // old HW pipeline drops here (Drop sets it to NULL)
+                }
+            }
+        }
         let mut buffer = gst::Buffer::from_mut_slice(chunk.data.to_vec());
         {
             let b = buffer.get_mut().unwrap();
@@ -850,5 +917,34 @@ mod iosurface_gpu {
             ColorInfo::for_resolution(w, h),
             Box::new(GstIOSurfaceOwner { pixel_buffer: pixbuf }),
         ))
+    }
+}
+
+#[cfg(test)]
+mod m3_1_tests {
+    use super::*;
+
+    /// A real HEVC Main 10 keyframe access unit (VPS/SPS/PPS + IDR), 642 bytes,
+    /// from a 10-bit clip — h265parse derives bit-depth-luma=10 from its SPS.
+    static HEVC_MAIN10_AU: &[u8] = include_bytes!("../../tests/data/hevc-main10-keyframe.h265");
+
+    /// The heart of M3.1: the bitstream is 10-bit, so `probe_bit_depth` returns 10
+    /// and `decode()` will reroute a HW pipeline to the software down-convert lane.
+    #[test]
+    fn probe_reads_10bit_from_hevc_main10() {
+        assert_eq!(probe_bit_depth(Codec::H265, HEVC_MAIN10_AU), 10);
+    }
+
+    /// Safety default: no/undecodable data must read as 8-bit, so a real 8-bit
+    /// stream is never mis-routed off its existing (possibly zero-copy) lane.
+    #[test]
+    fn probe_defaults_to_8_on_empty() {
+        assert_eq!(probe_bit_depth(Codec::H265, &[]), 8);
+    }
+
+    /// A parserless codec (vp8/vp9) short-circuits to 8 — no false 10-bit trigger.
+    #[test]
+    fn probe_returns_8_for_parserless_codec() {
+        assert_eq!(probe_bit_depth(Codec::Vp8, HEVC_MAIN10_AU), 8);
     }
 }
