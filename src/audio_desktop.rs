@@ -115,6 +115,16 @@ fn build_output_adapting(
             }
             let mut r = cb_ring.lock().unwrap_or_else(|e| e.into_inner());
             let avail_frames = r.len() / logical.max(1);
+            // UNDERRUN (empty ring): output silence and RESET the cursor. Otherwise
+            // `cursor` keeps advancing through the silent gap (e.g. an edit-list audio
+            // pre-roll of several seconds) and, once the ring refills, points far past
+            // the buffer — dropping real audio AS silence for many callbacks. That was
+            // the "audio decodes, pos advances, but nothing is heard" bug (task 119).
+            if avail_frames == 0 {
+                data.iter_mut().for_each(|s| *s = 0.0);
+                cursor = 0.0;
+                return;
+            }
             for frame in data.chunks_mut(dev_ch.max(1)) {
                 let idx = cursor as usize;
                 let mut lf = [0f32; 2];
@@ -136,10 +146,16 @@ fn build_output_adapting(
             }
             // Drop whole logical frames the cursor has fully passed, so the ring doesn't grow
             // unbounded and write_pcm_f32's backpressure cap stays meaningful.
-            let consumed = (cursor as usize).min(avail_frames);
+            let want = cursor as usize;
+            let consumed = want.min(avail_frames);
             if consumed > 0 {
                 r.drain(..consumed * logical);
-                cursor -= consumed as f64;
+            }
+            cursor -= consumed as f64;
+            // PARTIAL underrun: the cursor ran past the available audio this callback.
+            // Drop the excess (the silent tail) so it doesn't defer real audio next time.
+            if want > avail_frames {
+                cursor = cursor.fract();
             }
         },
         move |err| log::warn!("audio_desktop: output stream error: {err}"),
