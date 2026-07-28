@@ -39,11 +39,11 @@
 	url = https://github.com/harryzz/wandr-sensors-client.git
 [submodule "crates/audioclient-rs"]
 	path = crates/audioclient-rs
-	url = https://codeberg.org/harryzz/audioclient-rs.git
+	url = https://github.com/harryzz/audioclient-rs.git
 	shallow = true
 [submodule "crates/rsbinder"]
 	path = crates/rsbinder
-	url = https://codeberg.org/harryzz/rsbinder.git
+	url = https://github.com/harryzz/rsbinder.git
 	branch = wandr-recursive
 	shallow = true
 [submodule "vendor/libvpx"]
