@@ -1238,12 +1238,22 @@ int32_t sf_media_set_geometry(int32_t slot, int32_t x, int32_t y, int32_t w,
     if (w <= 0 || h <= 0) return -1;
     const uint32_t rot = rot_degrees % 360;
     const bool swap = (rot == 90 || rot == 270);
-    const int32_t bw = swap ? h : w;  // pre-rotation box (crop/BBQ dest)
+    // Pre-rotation box = the rect dims in the producer's (un-rotated) frame.
+    const int32_t bw = swap ? h : w;
     const int32_t bh = swap ? w : h;
-    // Box-corner mapping for a CW rotation of the (bw × bh) box into (w × h)
-    // at (x, y): setMatrix(dsdx, dtdx, dtdy, dsdy) with x' = dsdx·u + dtdy·v,
-    // y' = dtdx·u + dsdy·v, plus the translation that brings the rotated box
-    // back into the rect.
+    // The PRODUCER buffer is the video's CODED size (created that way, so MediaCodec's
+    // native_window_set_buffers_dimensions no longer fights us). We crop the FULL coded
+    // frame and scale it into the box via the matrix — instead of assuming buffer==box,
+    // which shrank every non-matching resolution by rect_w/coded_w. Fall back to the box
+    // if producer dims are unknown (legacy path).
+    const int32_t pw = g_media[slot].producer_w > 0 ? g_media[slot].producer_w : bw;
+    const int32_t ph = g_media[slot].producer_h > 0 ? g_media[slot].producer_h : bh;
+    const float sx0 = static_cast<float>(bw) / static_cast<float>(pw); // producer→box, u axis
+    const float sy0 = static_cast<float>(bh) / static_cast<float>(ph); //               v axis
+    // Box-corner mapping for a CW rotation of the box into (w × h) at (x, y):
+    // setMatrix(dsdx, dtdx, dtdy, dsdy) with x' = dsdx·u + dtdy·v, y' = dtdx·u + dsdy·v.
+    // The unit rotation matrix maps the box → rect; composing the producer→box scale
+    // (u-column ×sx0, v-column ×sy0) gives producer → rect in one matrix.
     float dsdx = 1.f, dtdx = 0.f, dtdy = 0.f, dsdy = 1.f;
     float px = static_cast<float>(x), py = static_cast<float>(y);
     switch (rot) {
@@ -1263,20 +1273,18 @@ int32_t sf_media_set_geometry(int32_t slot, int32_t x, int32_t y, int32_t w,
         default:
             break;
     }
+    // Compose producer→box scale into the rotation matrix (u-col ×sx0, v-col ×sy0).
+    dsdx *= sx0; dtdx *= sx0;
+    dtdy *= sy0; dsdy *= sy0;
     {
         SurfaceComposerClient::Transaction t;
-        t.setCrop(g_media[slot].child, Rect(0, 0, bw, bh));
+        t.setCrop(g_media[slot].child, Rect(0, 0, pw, ph)); // full coded frame
         t.setMatrix(g_media[slot].container, dsdx, dtdx, dtdy, dsdy);
         t.setPosition(g_media[slot].container, px, py);
         t.apply(/*synchronous=*/false);
     }
-    g_media[slot].bbq->update(g_media[slot].child,
-                              static_cast<uint32_t>(bw), static_cast<uint32_t>(bh),
-                              PIXEL_FORMAT_RGBA_8888);
-    g_media[slot].buf_w = bw;
-    g_media[slot].buf_h = bh;
-    LOGI("[media] slot %d geometry rect=(%d,%d %dx%d) rot=%u box=%dx%d m=[%.0f %.0f %.0f %.0f] p=(%.0f,%.0f)",
-         slot, x, y, w, h, rot, bw, bh, dsdx, dtdx, dtdy, dsdy, px, py);
+    LOGI("[media] slot %d geometry rect=(%d,%d %dx%d) rot=%u producer=%dx%d box=%dx%d m=[%.3f %.3f %.3f %.3f] p=(%.0f,%.0f)",
+         slot, x, y, w, h, rot, pw, ph, bw, bh, dsdx, dtdx, dtdy, dsdy, px, py);
     return 0;
 }
 

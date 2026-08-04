@@ -65,6 +65,7 @@ mod app_role;
 mod eventfd_signal;
 mod assets_impl;
 mod theme_impl;
+mod shell_control_impl;
 mod launcher_impl;
 mod status_impl;
 // Task 35 step 1: app loader skeleton (no callers wired yet).

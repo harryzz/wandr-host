@@ -1156,11 +1156,18 @@ mod android {
             // the caller asked for on-screen video.
             let mut surface: *mut ANativeWindow = ptr::null_mut();
             if let Some(rect) = config.rect.filter(|r| r.visible()) {
-                // Destination buffer = the DISPLAY rect (not the coded size):
-                // the decoder's output buffers scale ONCE into it. Sizing it to
-                // the coded hint would crush a larger stream down to the hint
-                // and then stretch it to the rect — visible quality loss.
-                let (slot, win) = media::create(rect.w, rect.h, z_remote(config.layer))
+                // Producer buffer = the video's CODED size (config.width×height), NOT the
+                // display rect. MediaCodec decode-to-surface calls
+                // native_window_set_buffers_dimensions(coded) on the producer window, which
+                // silently overrides a rect-sized buffer — so creating at the rect made the
+                // on-screen scale come out as rect_w/coded_w (0.375 for 4K, 0.75 for 1080p):
+                // every non-matching resolution was shrunk. Create at the coded size and let
+                // sf_media_set_geometry scale the full frame into the rect via the container
+                // matrix (the guest's rect is already aspect-correct).
+                let (slot, win) = media::create(
+                    config.width.max(1) as i32, config.height.max(1) as i32,
+                    z_remote(config.layer),
+                )
                     .ok_or(VideoError::SurfaceUnavailable)?;
                 dec.slot = Some(slot);
                 surface = win;

@@ -16,6 +16,49 @@ use crate::video;
 use crate::video_host_bindings::wandr::video as wit;
 use crate::HostState;
 
+// ── host-derived keep-awake ──────────────────────────────────────────────────
+// A foreground app actively presenting video frames should hold the screen awake —
+// a video playing IS "use", even with no touch input. Rather than a per-app flag or
+// a new WIT verb, we DERIVE it from real runtime state: every presented frame from
+// the FOREGROUND host pokes the arbiter's `user-activity` (the same idle-clock reset
+// the input dispatcher sends), throttled so the hot present path (24–60 fps) only
+// touches the socket a few times a minute. When playback pauses/stops or the app is
+// backgrounded, the pokes stop and the normal screen-off timeout resumes. This is
+// app-agnostic (any video, any guest) and safe: `user-activity` only resets the idle
+// clock — it never wakes or unlocks the panel — so a background frame or a stray
+// present can never turn the screen on by itself.
+const KEEPAWAKE_POKE_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+static KEEPAWAKE_LAST: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+fn keepawake_on_present() {
+    // Only the foreground app holds the screen awake; a backgrounded player that keeps
+    // decoding must not. Desktop has no arbiter and defaults to Foreground — the send
+    // below is a no-op there (nothing listening on the socket).
+    if crate::app_role::role() != crate::app_role::AppRole::Foreground {
+        return;
+    }
+    {
+        let now = std::time::Instant::now();
+        let mut last = KEEPAWAKE_LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match *last {
+            Some(t) if now.duration_since(t) < KEEPAWAKE_POKE_EVERY => return,
+            _ => *last = Some(now),
+        }
+    }
+    #[cfg(target_os = "android")]
+    {
+        use std::io::Write;
+        if let Ok(mut s) = crate::arbiter_sock::UnixStream::connect(
+            crate::arbiter_sock::arbiter_sock_path(),
+        ) {
+            let _ = s.write_all(b"user-activity\n");
+            let _ = s.flush();
+            let _ = s.shutdown(std::net::Shutdown::Write);
+        }
+    }
+}
+
 // ── resource backing structs (mapped via bindgen `with`) ─────────────────────
 
 pub struct EncoderState(pub video::VideoEncoder);
@@ -376,6 +419,7 @@ impl wit::decoder::HostDecodedFrame for HostState {
         if let Ok(st) = self.table.get_mut(&self_) {
             if let Some(frame) = st.0.take() {
                 video::schedule_present(at_ns, frame);
+                keepawake_on_present();
             }
         }
     }

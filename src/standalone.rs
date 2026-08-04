@@ -1360,18 +1360,40 @@ fn run_cwasm_loop(
                     if orient != GEOM_ORIENT_KEEP {
                         authoritative_orient = Some(orient);
                     }
+                    // A pending orientation FLIP is about to change the logical dims
+                    // (portrait⇄landscape swap). Dispatching a resize NOW would send the
+                    // guest the OLD (pre-flip) dims tagged with the NEW orient — an
+                    // inconsistent (orient, dims) pair. An async-layout guest (Compose)
+                    // lays out against those wrong dims and computes its video/UI rects in
+                    // the wrong coordinate space, so they land off-screen (device-verified:
+                    // Signal's call self-view + peer went off-screen on rotate). The
+                    // orientation block applies the flip and dispatches ONE consistent
+                    // resize next iteration — so here we resize only when the dims are
+                    // already correct (inset/keyboard changes with no pending flip).
+                    let flip_pending = authoritative_orient
+                        .map(|o| o != store.data().renderer.current_orient)
+                        .unwrap_or(false);
                     let (lw, lh) = {
                         let r = &store.data().renderer;
                         (r.logical_width, r.logical_height)
                     };
-                    if let Err(e) = crate::input::dispatch_resize_routed(&mut store, &guest_input, lw, lh)
-                    {
-                        log::warn!("standalone: geometry on_resize({lw}x{lh}) failed: {e:#}");
+                    if flip_pending {
+                        log::info!(
+                            "standalone: geometry insets=({inset_top},{inset_bottom}) kb={keyboard_px} \
+                             orient={orient} pending-flip → deferring resize to orientation block \
+                             (avoids inconsistent {lw}x{lh}@orient{orient})"
+                        );
+                    } else {
+                        if let Err(e) =
+                            crate::input::dispatch_resize_routed(&mut store, &guest_input, lw, lh)
+                        {
+                            log::warn!("standalone: geometry on_resize({lw}x{lh}) failed: {e:#}");
+                        }
+                        log::info!(
+                            "standalone: geometry insets=({inset_top},{inset_bottom}) \
+                             kb={keyboard_px} orient={orient} → logical {lw}x{lh}"
+                        );
                     }
-                    log::info!(
-                        "standalone: geometry insets=({inset_top},{inset_bottom}) \
-                         kb={keyboard_px} orient={orient} → logical {lw}x{lh}"
-                    );
                 }
             }
         }
