@@ -27,14 +27,19 @@ use crate::HostState;
 // app-agnostic (any video, any guest) and safe: `user-activity` only resets the idle
 // clock — it never wakes or unlocks the panel — so a background frame or a stray
 // present can never turn the screen on by itself.
+// Android-only: the whole mechanism (app_role signal + arbiter socket) exists only
+// on the device backend. The desktop backends have no arbiter and no app_role module,
+// so keep-awake is a no-op there (nothing to hold the screen against).
+#[cfg(target_os = "android")]
 const KEEPAWAKE_POKE_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(target_os = "android")]
 static KEEPAWAKE_LAST: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 
+#[cfg(target_os = "android")]
 fn keepawake_on_present() {
     // Only the foreground app holds the screen awake; a backgrounded player that keeps
-    // decoding must not. Desktop has no arbiter and defaults to Foreground — the send
-    // below is a no-op there (nothing listening on the socket).
+    // decoding must not.
     if crate::app_role::role() != crate::app_role::AppRole::Foreground {
         return;
     }
@@ -46,18 +51,18 @@ fn keepawake_on_present() {
             _ => *last = Some(now),
         }
     }
-    #[cfg(target_os = "android")]
+    use std::io::Write;
+    if let Ok(mut s) =
+        crate::arbiter_sock::UnixStream::connect(crate::arbiter_sock::arbiter_sock_path())
     {
-        use std::io::Write;
-        if let Ok(mut s) = crate::arbiter_sock::UnixStream::connect(
-            crate::arbiter_sock::arbiter_sock_path(),
-        ) {
-            let _ = s.write_all(b"user-activity\n");
-            let _ = s.flush();
-            let _ = s.shutdown(std::net::Shutdown::Write);
-        }
+        let _ = s.write_all(b"user-activity\n");
+        let _ = s.flush();
+        let _ = s.shutdown(std::net::Shutdown::Write);
     }
 }
+
+#[cfg(not(target_os = "android"))]
+fn keepawake_on_present() {}
 
 // ── resource backing structs (mapped via bindgen `with`) ─────────────────────
 
