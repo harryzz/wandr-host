@@ -9,15 +9,7 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Manual "Run workflow" button. Leave `release_tag` empty to just build; set it
-  # (e.g. v0.1.0) to also cut a GitHub Release with the built binaries. No push or
-  # git-tag ever auto-publishes — releasing is always an explicit manual action.
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: 'Publish a Release with this tag (e.g. v0.1.0). Empty = build only.'
-        required: false
-        default: ''
+  workflow_dispatch:          # manual build button; releasing is a separate workflow
 
 env:
   CARGO_TERM_COLOR: always
@@ -210,43 +202,3 @@ jobs:
           name: wandr-host-android-aarch64
           path: target/aarch64-linux-android/release/wasm-android-host
           if-no-files-found: warn
-
-  # MANUAL release only: runs when you click "Run workflow" and provide a
-  # `release_tag`. It reuses the desktop+android artifacts from this same run,
-  # gives each a unique platform name (they're all `wasm-android-host`), checksums
-  # them, and publishes a Release tagged `release_tag` (the tag is created if it
-  # doesn't exist). `install.sh`/`install.ps1` pull from `releases/latest`.
-  release:
-    name: release
-    needs: [desktop, android]
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != ''
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write        # required to create the release + upload assets
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist          # dist/wandr-host-<name>/wasm-android-host[.exe]
-
-      - name: Stage assets (per-platform, optional, checksums)
-        run: |
-          set -eu
-          mkdir -p out
-          # Copy each platform binary IF its build produced one — a missing artifact
-          # (e.g. macOS when its runner never allocated) is skipped, not fatal.
-          copy() { if [ -f "$1" ]; then cp "$1" "out/$2"; echo "  + $2"; else echo "  - $2 (build unavailable — skipped)"; fi; }
-          copy dist/wandr-host-linux-x86_64/wasm-android-host       wandr-host-linux-x86_64
-          copy dist/wandr-host-macos-aarch64/wasm-android-host      wandr-host-macos-aarch64
-          copy dist/wandr-host-windows-x86_64/wasm-android-host.exe wandr-host-windows-x86_64.exe
-          copy dist/wandr-host-android-aarch64/wasm-android-host    wandr-host-android-aarch64
-          chmod +x out/wandr-host-* 2>/dev/null || true
-          [ -n "$(ls -A out)" ] || { echo "::error::no host binaries were produced"; exit 1; }
-          ( cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS )
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.release_tag }}
-          name: ${{ github.event.inputs.release_tag }}
-          files: out/*
-          generate_release_notes: true
-          fail_on_unmatched_files: true
