@@ -8,6 +8,7 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ['v*']          # a v* tag cuts a GitHub Release (see the `release` job)
   pull_request:
   workflow_dispatch:
 
@@ -191,3 +192,36 @@ jobs:
           name: wandr-host-android-aarch64
           path: target/aarch64-linux-android/release/wasm-android-host
           if-no-files-found: warn
+
+  # Publish the per-platform host binaries to a GitHub Release on a v* tag.
+  # The build jobs already produced the artifacts; this only collects, gives each
+  # a unique platform-tagged name (they're all `wasm-android-host`), checksums
+  # them, and uploads. `install.sh`/`install.ps1` pull from `releases/latest`.
+  release:
+    name: release
+    needs: [desktop, android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # required to create the release + upload assets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist          # dist/wandr-host-<name>/wasm-android-host[.exe]
+
+      - name: Stage assets (unique names + checksums)
+        run: |
+          set -eu
+          mkdir -p out
+          cp dist/wandr-host-linux-x86_64/wasm-android-host       out/wandr-host-linux-x86_64
+          cp dist/wandr-host-macos-aarch64/wasm-android-host      out/wandr-host-macos-aarch64
+          cp dist/wandr-host-windows-x86_64/wasm-android-host.exe out/wandr-host-windows-x86_64.exe
+          cp dist/wandr-host-android-aarch64/wasm-android-host    out/wandr-host-android-aarch64
+          chmod +x out/wandr-host-linux-x86_64 out/wandr-host-macos-aarch64 out/wandr-host-android-aarch64
+          ( cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS )
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
