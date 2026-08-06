@@ -157,8 +157,8 @@ pub(crate) fn device_rotation_deg() -> u32 {
 #[cfg(target_os = "android")]
 pub use android::{
     ensure_binder_threadpool, schedule_present, video_surface_alloc,
-    video_surface_presented_rect, video_surface_remove, video_surface_set_rect,
-    video_surface_set_rotation, TakenFrame, VideoDecoder, VideoEncoder,
+    video_surface_presented_rect, video_surface_reapply_if_rotated, video_surface_remove,
+    video_surface_set_rect, video_surface_set_rotation, TakenFrame, VideoDecoder, VideoEncoder,
 };
 
 /// Monotonic host clock in nanoseconds — the timeline `present(at-ns)` speaks.
@@ -176,8 +176,9 @@ pub fn monotonic_now_ns() -> u64 {
 #[cfg(not(target_os = "android"))]
 pub use crate::video_desktop::{
     ensure_binder_threadpool, monotonic_now_ns, schedule_present, video_surface_alloc,
-    video_surface_presented_rect, video_surface_remove, video_surface_set_rect,
-    video_surface_set_rotation, Accel, TakenFrame, VideoDecoder, VideoEncoder,
+    video_surface_presented_rect, video_surface_reapply_if_rotated, video_surface_remove,
+    video_surface_set_rect, video_surface_set_rotation, Accel, TakenFrame, VideoDecoder,
+    VideoEncoder,
 };
 
 // ── NDK FFI (shared with video_probe.rs) ──────────────────────────────────
@@ -738,8 +739,26 @@ mod android {
         slot: i32,
         /// The producer window — the codec's render target once a decoder attaches.
         win: *mut ANativeWindow,
+        /// LOGICAL (guest-space, portrait) rect — mapped to panel coords per the
+        /// live device rotation, exactly as the old decoder's `apply_geometry` did.
         rect: super::VideoRect,
-        degrees: u32,
+        /// Peer CVO (content orientation); composed with device rotation for the
+        /// SF buffer transform.
+        cvo: u32,
+        /// Device-rotation generation this surface's geometry was last applied at —
+        /// re-applied on `present` when the device rotates (portrait↔landscape).
+        geom_gen: u32,
+    }
+
+    /// Compose the logical rect + peer CVO with the LIVE device rotation and push it
+    /// to the SF layer — the split's port of the decoder's old `apply_geometry`. Panel
+    /// mapping + `(cvo + dev)` transform is what keeps the video upright and in-view
+    /// across device rotation; without it landscape throws it off-screen and portrait
+    /// sticks at 90°.
+    fn apply_vsurface_geometry(s: &mut VSurface) {
+        let dev = super::device_rotation_deg();
+        media::set_geometry(s.slot, map_rect_to_panel(s.rect, dev), (s.cvo + dev) % 360);
+        s.geom_gen = super::geom_gen();
     }
     thread_local! {
         static VSURFACES: std::cell::RefCell<std::collections::HashMap<u32, VSurface>> =
@@ -753,29 +772,43 @@ mod android {
         else {
             return 0; // no surface (surfaceless / shim absent)
         };
-        media::set_geometry(slot, rect, degrees);
         media::set_visible(slot, true);
         let id = VSURF_NEXT.with(|n| {
             let v = n.get();
             n.set(v.wrapping_add(1).max(1));
             v
         });
-        VSURFACES.with(|m| m.borrow_mut().insert(id, VSurface { slot, win, rect, degrees }));
+        let mut vs = VSurface { slot, win, rect, cvo: degrees, geom_gen: super::geom_gen() };
+        apply_vsurface_geometry(&mut vs); // compose with device rotation from the start
+        VSURFACES.with(|m| m.borrow_mut().insert(id, vs));
         id
     }
     pub fn video_surface_set_rect(id: u32, rect: super::VideoRect) {
         VSURFACES.with(|m| {
             if let Some(s) = m.borrow_mut().get_mut(&id) {
                 s.rect = rect;
-                media::set_rect(s.slot, rect);
+                apply_vsurface_geometry(s); // remap to panel per current device rotation
             }
         });
     }
     pub fn video_surface_set_rotation(id: u32, degrees: u32) {
         VSURFACES.with(|m| {
             if let Some(s) = m.borrow_mut().get_mut(&id) {
-                s.degrees = degrees;
-                media::set_transform(s.slot, degrees);
+                s.cvo = degrees;
+                apply_vsurface_geometry(s); // recompose (cvo + device rotation)
+            }
+        });
+    }
+    /// Re-apply geometry if the DEVICE rotated since the last apply — called per
+    /// present, so a portrait↔landscape flip mid-call re-maps the rect + transform
+    /// even when neither set-rect nor set-rotation fires. (The old decoder did this
+    /// on submit via the same `geom_gen` check.)
+    pub fn video_surface_reapply_if_rotated(id: u32) {
+        VSURFACES.with(|m| {
+            if let Some(s) = m.borrow_mut().get_mut(&id) {
+                if s.geom_gen != super::geom_gen() {
+                    apply_vsurface_geometry(s);
+                }
             }
         });
     }

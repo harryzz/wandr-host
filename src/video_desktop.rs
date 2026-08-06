@@ -340,6 +340,9 @@ pub fn video_surface_presented_rect(id: u32) -> Option<VideoRect> {
 pub fn video_surface_remove(id: u32) {
     surface_remove(id);
 }
+/// No-op on desktop: the WSLg window does not device-rotate, so there is no
+/// device-rotation to recompose. (Android composes CVO + device rotation here.)
+pub fn video_surface_reapply_if_rotated(_id: u32) {}
 
 /// No binder off-Android (the Android path spins up an rsbinder threadpool for
 /// the camera/codec HAL; desktop nokhwa/libvpx need none).

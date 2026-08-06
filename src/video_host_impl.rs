@@ -493,7 +493,10 @@ impl wandr_wit::present::HostVideoSurface for HostState {
             let _ = self.table.delete(frame);
             return;
         };
-        // GUEST-TIMED: consume the frame and schedule it onto this surface.
+        // Recompose geometry if the DEVICE rotated (portrait↔landscape) — per frame,
+        // so the video stays upright + in-view without waiting for a set-rect/rotation.
+        video::video_surface_reapply_if_rotated(id);
+        // Consume the frame and schedule it onto this surface.
         if let Ok(mut fs) = self.table.delete(frame) {
             if let Some(taken) = fs.0.take() {
                 taken.present_to(id, at_ns);
