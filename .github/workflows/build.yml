@@ -22,6 +22,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Only one build per ref at a time — a newer push/dispatch cancels the older run
+# instead of piling up and fighting over the scarce macOS/android runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   desktop:
     name: ${{ matrix.name }}
