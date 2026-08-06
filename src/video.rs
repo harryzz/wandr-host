@@ -736,6 +736,8 @@ mod android {
     // MediaCodec output to a slot for the AUTO/RTP path.
     struct VSurface {
         slot: i32,
+        /// The producer window — the codec's render target once a decoder attaches.
+        win: *mut ANativeWindow,
         rect: super::VideoRect,
         degrees: u32,
     }
@@ -747,7 +749,7 @@ mod android {
 
     pub fn video_surface_alloc(rect: super::VideoRect, layer: super::ZLayer, degrees: u32) -> u32 {
         // Producer buffer sized to the rect; sf_media_set_geometry scales/places it.
-        let Some((slot, _win)) = media::create(rect.w.max(1), rect.h.max(1), z_remote(layer))
+        let Some((slot, win)) = media::create(rect.w.max(1), rect.h.max(1), z_remote(layer))
         else {
             return 0; // no surface (surfaceless / shim absent)
         };
@@ -758,7 +760,7 @@ mod android {
             n.set(v.wrapping_add(1).max(1));
             v
         });
-        VSURFACES.with(|m| m.borrow_mut().insert(id, VSurface { slot, rect, degrees }));
+        VSURFACES.with(|m| m.borrow_mut().insert(id, VSurface { slot, win, rect, degrees }));
         id
     }
     pub fn video_surface_set_rect(id: u32, rect: super::VideoRect) {
@@ -1285,8 +1287,16 @@ mod android {
                 }
                 dec.fmt = AMediaFormat_new();
                 fmt_set_str(dec.fmt, "mime", config.codec.mime());
-                fmt_set_i32(dec.fmt, "width", config.width.max(1) as i32);
-                fmt_set_i32(dec.fmt, "height", config.height.max(1) as i32);
+                // task 120: the split decoder-config is DIMENSIONLESS (WebCodecs-correct
+                // — the bitstream's keyframe carries the coded size and overrides any
+                // hint). But Android MediaCodec REQUIRES width/height at configure() and
+                // rejects 1x1, so default to a nominal 1280x720 when unset; the decoder
+                // resizes to the real size on the first keyframe (INFO_OUTPUT_FORMAT_
+                // CHANGED). A non-zero config value (legacy/diag) still wins.
+                let cfg_w = if config.width == 0 { 1280 } else { config.width };
+                let cfg_h = if config.height == 0 { 720 } else { config.height };
+                fmt_set_i32(dec.fmt, "width", cfg_w as i32);
+                fmt_set_i32(dec.fmt, "height", cfg_h as i32);
                 let dcfg = AMediaCodec_configure(dec.codec, dec.fmt, surface, ptr::null_mut(), 0);
                 if dcfg != AMEDIA_OK {
                     log::warn!("video: decoder configure status={dcfg}");
@@ -1340,14 +1350,43 @@ mod android {
             self.decoded
         }
 
-        /// task 120 (AUTO / `video-surface.attach`): associate this decoder with the
-        /// embedder surface `id`. The zero-copy MediaCodec→Surface rebind
-        /// (configure-time surface + `AMediaCodec_setOutputSurface`) so RTP output
-        /// auto-composites into the attached slot is completed and DEVICE-VERIFIED in
-        /// the Signal pass; recorded here so the surface registry and the decoder
-        /// agree and the split builds for aarch64-android.
+        /// task 120 (`video-surface.attach`): bind this codec to the embedder surface
+        /// `id` so decoded output composites into its slot — the SAME contract the
+        /// desktop backend honors by setting its target surface. MediaCodec takes a
+        /// surface only at `configure()`, and the decoder was opened surface-free
+        /// (ByteBuffer), so re-bind with stop → configure(window) → start. The unified
+        /// guest flow calls `attach` BEFORE the first `submit`, so nothing is in
+        /// flight. After this, `present(frame, at-ns)` (releaseOutputBufferAtTime)
+        /// composites into the slot; before it, decode is to-buffer (part-1 loopback).
         pub fn set_surface_id(&mut self, id: u32) {
             self.attached_surface = Some(id);
+            let Some((slot, win)) =
+                VSURFACES.with(|m| m.borrow().get(&id).map(|s| (s.slot, s.win)))
+            else {
+                log::warn!("video: attach — unknown surface id {id}");
+                return;
+            };
+            if win.is_null() {
+                return;
+            }
+            unsafe {
+                if self.started {
+                    AMediaCodec_stop(self.codec);
+                    self.started = false;
+                }
+                let dcfg = AMediaCodec_configure(self.codec, self.fmt, win, ptr::null_mut(), 0);
+                if dcfg != AMEDIA_OK {
+                    log::warn!("video: attach reconfigure status={dcfg}");
+                    return;
+                }
+                if AMediaCodec_start(self.codec) != AMEDIA_OK {
+                    log::warn!("video: attach start failed");
+                    return;
+                }
+            }
+            self.started = true;
+            self.slot = Some(slot);
+            log::info!("video: decoder attached to surface slot {slot}");
         }
 
         // ── PLAYBACK (task 117 M2) ────────────────────────────────────────
@@ -1372,10 +1411,10 @@ mod android {
             if data.is_empty() {
                 return Err(VideoError::BadFrame);
             }
-            if self.slot.is_none() {
-                // No compositing surface → nowhere for a scheduled present to land.
-                return Err(VideoError::SurfaceUnavailable);
-            }
+            // No slot requirement: the unified `submit` decodes + HOLDS output
+            // regardless of a surface. With a surface (attached) the guest drains via
+            // `next_decoded` + `present` (releaseOutputBufferAtTime); without one
+            // (part-1 loopback) it drains via `next_decoded` and drops (count only).
             self.playback = true;
             if self.geom_gen != super::geom_gen() {
                 self.apply_geometry();
