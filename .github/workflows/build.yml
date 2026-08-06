@@ -32,12 +32,17 @@ jobs:
   desktop:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # macOS Apple-Silicon runners are scarce on public repos and frequently fail to
+    # even allocate ("Set up job"). Mark that leg optional so its flake neither fails
+    # the workflow nor blocks a release — its binary is published when a runner is
+    # available and skipped otherwise (see the release job's optional copy).
+    continue-on-error: ${{ matrix.optional || false }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - { name: linux-x86_64,   os: ubuntu-latest }
-          - { name: macos-aarch64,  os: macos-latest }
+          - { name: macos-aarch64,  os: macos-latest, optional: true }
           - { name: windows-x86_64, os: windows-latest }
     steps:
       - uses: actions/checkout@v4
@@ -223,15 +228,19 @@ jobs:
         with:
           path: dist          # dist/wandr-host-<name>/wasm-android-host[.exe]
 
-      - name: Stage assets (unique names + checksums)
+      - name: Stage assets (per-platform, optional, checksums)
         run: |
           set -eu
           mkdir -p out
-          cp dist/wandr-host-linux-x86_64/wasm-android-host       out/wandr-host-linux-x86_64
-          cp dist/wandr-host-macos-aarch64/wasm-android-host      out/wandr-host-macos-aarch64
-          cp dist/wandr-host-windows-x86_64/wasm-android-host.exe out/wandr-host-windows-x86_64.exe
-          cp dist/wandr-host-android-aarch64/wasm-android-host    out/wandr-host-android-aarch64
-          chmod +x out/wandr-host-linux-x86_64 out/wandr-host-macos-aarch64 out/wandr-host-android-aarch64
+          # Copy each platform binary IF its build produced one — a missing artifact
+          # (e.g. macOS when its runner never allocated) is skipped, not fatal.
+          copy() { if [ -f "$1" ]; then cp "$1" "out/$2"; echo "  + $2"; else echo "  - $2 (build unavailable — skipped)"; fi; }
+          copy dist/wandr-host-linux-x86_64/wasm-android-host       wandr-host-linux-x86_64
+          copy dist/wandr-host-macos-aarch64/wasm-android-host      wandr-host-macos-aarch64
+          copy dist/wandr-host-windows-x86_64/wasm-android-host.exe wandr-host-windows-x86_64.exe
+          copy dist/wandr-host-android-aarch64/wasm-android-host    wandr-host-android-aarch64
+          chmod +x out/wandr-host-* 2>/dev/null || true
+          [ -n "$(ls -A out)" ] || { echo "::error::no host binaries were produced"; exit 1; }
           ( cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS )
 
       - uses: softprops/action-gh-release@v2
