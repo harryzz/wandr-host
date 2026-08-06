@@ -316,6 +316,31 @@ fn surface_remove(id: u32) {
     });
 }
 
+// ── task 120: public surface handles for the wandr:video EMBEDDER ─────────────
+// The split contract makes `video-surface` its OWN resource: `wasi:video-codec`
+// is surface-free (codec decoder = decode-to-buffer, content-bearing frames), and
+// the embedder owns the child surface + placement + present-scheduling. These wrap
+// the existing surface registry so the embedder drives it without a codec decoder.
+pub fn video_surface_alloc(rect: VideoRect, layer: ZLayer, rotation: u32) -> u32 {
+    alloc_surface(rect, false, rotation, layer)
+}
+pub fn video_surface_set_rect(id: u32, rect: VideoRect) {
+    surface_with(id, |s| s.rect = rect);
+}
+pub fn video_surface_set_rotation(id: u32, degrees: u32) {
+    surface_with(id, |s| s.rotation = degrees);
+}
+pub fn video_surface_presented_rect(id: u32) -> Option<VideoRect> {
+    SURFACES.with(|m| {
+        m.borrow().get(&id).and_then(|s| {
+            (s.content.is_some() && s.rect.w > 0 && s.rect.h > 0).then_some(s.rect)
+        })
+    })
+}
+pub fn video_surface_remove(id: u32) {
+    surface_remove(id);
+}
+
 /// No binder off-Android (the Android path spins up an rsbinder threadpool for
 /// the camera/codec HAL; desktop nokhwa/libvpx need none).
 pub fn ensure_binder_threadpool() -> bool {
@@ -684,6 +709,33 @@ pub struct TakenFrame {
 impl TakenFrame {
     pub fn timestamp_us(&self) -> i64 {
         self.pts_us
+    }
+    /// task 120 (`wasi:video-codec` frame accessors). Display dimensions of the
+    /// decoded picture.
+    pub fn width(&self) -> u32 {
+        self.w
+    }
+    pub fn height(&self) -> u32 {
+        self.h
+    }
+    /// Content CVO. Desktop frames arrive upright (libvpx/GStreamer apply no
+    /// rotation); the peer/display CVO is handled at composite by the embedder's
+    /// `video-surface.set-rotation`. 0 until a rotating source ships.
+    pub fn rotation(&self) -> u32 {
+        0
+    }
+    /// The WebCodecs `copyTo`/`read-rgba` escape hatch — deferred (no guest
+    /// pixel-reader consumer yet). The zero-copy present path never calls it.
+    pub fn read_rgba(&self) -> Option<Vec<u8>> {
+        None
+    }
+    /// task 120: retarget this decoded frame onto `id` (the embedder's
+    /// `video-surface`) and schedule it at `at_ns`. The codec decoder is
+    /// surface-free, so the frame carries its own pixels and the EMBEDDER chooses
+    /// the destination surface — this is `video-surface.present(frame, at-ns)`.
+    pub fn present_to(mut self, id: u32, at_ns: u64) {
+        self.surface_id = Some(id);
+        schedule_present(at_ns, self);
     }
     /// Paint it now. `surface_id == None` = decode-to-buffer, so this is the
     /// counted-and-dropped diagnostic path and presenting is a no-op.
@@ -1134,6 +1186,13 @@ impl VideoDecoder {
         if let Some(id) = self.surface_id {
             surface_with(id, |s| s.rotation = degrees);
         }
+    }
+    /// task 120 (AUTO / `video-surface.attach`): bind an embedder-owned surface to
+    /// this codec decoder so the auto-render `submit` path composites into it (the
+    /// RTP-call path where the guest never pulls `next-decoded`). The codec decoder
+    /// otherwise opens surface-free; the embedder supplies the destination.
+    pub fn set_surface_id(&mut self, id: u32) {
+        self.surface_id = Some(id);
     }
 }
 

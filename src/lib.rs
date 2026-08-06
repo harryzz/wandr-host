@@ -380,16 +380,39 @@ mod crypto_host_bindings {
 /// Phase 4); handles are host resources mapped to the backing structs in
 /// `video_host_impl` and stored in `HostState.table`. Backend = `video.rs`
 /// (NDK camera2/mediandk, promoted from the `--probe-video` spike).
+// Task 120 — the fused wandr:video, re-expressed as the EMBEDDER over the split
+// stack: wasi:video-codec (codec) + wasi:camera (facing) + wasi:eme (DRM, stubbed)
+// + wandr:video (present + capture-encode). ONE bindgen on the aggregating
+// `video-host` world generates Host traits for every imported interface; impls in
+// video_host_impl.rs over the same video.rs/video_desktop.rs backend.
 mod video_host_bindings {
     wasmtime::component::bindgen!({
-        path: "contracts/wit/video.wit",
+        path: "contracts/wit/video",
         world: "video-host",
         with: {
-            "wandr:video/encoder.video-encoder": crate::video_host_impl::EncoderState,
-            "wandr:video/decoder.video-decoder": crate::video_host_impl::DecoderState,
-            // Playback (task 117 M2): one decoded frame the guest holds while it
-            // decides when to present it.
-            "wandr:video/decoder.decoded-frame": crate::video_host_impl::DecodedFrameState,
+            "wasi:eme/eme.media-keys": crate::video_host_impl::MediaKeysStub,
+            "wasi:eme/eme.key-session": crate::video_host_impl::KeySessionStub,
+            "wasi:video-codec/types.frame": crate::video_host_impl::FrameState,
+            "wasi:video-codec/decoder.video-decoder": crate::video_host_impl::DecoderState,
+            "wasi:video-codec/encoder.video-encoder": crate::video_host_impl::CodecEncoderState,
+            "wandr:video/present.video-surface": crate::video_host_impl::VideoSurfaceState,
+            "wandr:video/capture-encode.call-encoder": crate::video_host_impl::CallEncoderState,
+        },
+    });
+}
+// Task 120 — the diagnostics surface (list-decoders / implementation /
+// decoded-frames), kept OFF the standard in its own package. Reuses the shared
+// codec/eme types + the `video-decoder` resource from `video_host_bindings` (so
+// the borrowed decoder maps to the same DecoderState and those interfaces are not
+// re-generated / re-linked here).
+mod video_diag_bindings {
+    wasmtime::component::bindgen!({
+        path: "contracts/proposals/wandr-video-diag/wit",
+        world: "video-diag",
+        with: {
+            "wasi:eme/eme": crate::video_host_bindings::wasi::eme::eme,
+            "wasi:video-codec/types": crate::video_host_bindings::wasi::video_codec::types,
+            "wasi:video-codec/decoder": crate::video_host_bindings::wasi::video_codec::decoder,
         },
     });
 }

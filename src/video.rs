@@ -173,8 +173,9 @@ pub fn monotonic_now_ns() -> u64 {
 // The cross-platform peer of the android NDK/MediaCodec path below.
 #[cfg(not(target_os = "android"))]
 pub use crate::video_desktop::{
-    ensure_binder_threadpool, monotonic_now_ns, schedule_present, Accel, TakenFrame, VideoDecoder,
-    VideoEncoder,
+    ensure_binder_threadpool, monotonic_now_ns, schedule_present, video_surface_alloc,
+    video_surface_presented_rect, video_surface_remove, video_surface_set_rect,
+    video_surface_set_rotation, Accel, TakenFrame, VideoDecoder, VideoEncoder,
 };
 
 // ── NDK FFI (shared with video_probe.rs) ──────────────────────────────────

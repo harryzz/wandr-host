@@ -465,7 +465,9 @@ impl LoadedApp {
         crate::crypto_host_bindings::CryptoHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("CryptoHost::add_to_linker: {e:#}"))?; // task 93 Phase A wandr:crypto
         crate::video_host_bindings::VideoHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
-            .map_err(|e| anyhow!("VideoHost::add_to_linker: {e:#}"))?; // task 93 Phase 1 wandr:video
+            .map_err(|e| anyhow!("VideoHost::add_to_linker: {e:#}"))?; // task 120 wandr:video embedder (+ wasi:video-codec/camera/eme)
+        crate::video_diag_bindings::VideoDiag::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+            .map_err(|e| anyhow!("VideoDiag::add_to_linker: {e:#}"))?; // task 120 wandr:video-diag
         crate::notify_host_bindings::NotifyHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("NotifyHost::add_to_linker: {e:#}"))?; // Signal bg-receipt M3
         crate::keyguard_host_bindings::KeyguardHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
@@ -637,7 +639,9 @@ impl LoadedApp {
         crate::crypto_host_bindings::CryptoHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("CryptoHost::add_to_linker: {e:#}"))?; // task 93 Phase A wandr:crypto
         crate::video_host_bindings::VideoHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
-            .map_err(|e| anyhow!("VideoHost::add_to_linker: {e:#}"))?; // task 93 Phase 1 wandr:video
+            .map_err(|e| anyhow!("VideoHost::add_to_linker: {e:#}"))?; // task 120 wandr:video embedder (+ wasi:video-codec/camera/eme)
+        crate::video_diag_bindings::VideoDiag::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+            .map_err(|e| anyhow!("VideoDiag::add_to_linker: {e:#}"))?; // task 120 wandr:video-diag
         crate::notify_host_bindings::NotifyHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("NotifyHost::add_to_linker: {e:#}"))?; // Signal bg-receipt M3
         crate::keyguard_host_bindings::KeyguardHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
