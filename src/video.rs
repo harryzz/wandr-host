@@ -156,7 +156,9 @@ pub(crate) fn device_rotation_deg() -> u32 {
 // presentation timestamp straight to the HW compositor.
 #[cfg(target_os = "android")]
 pub use android::{
-    ensure_binder_threadpool, schedule_present, TakenFrame, VideoDecoder, VideoEncoder,
+    ensure_binder_threadpool, schedule_present, video_surface_alloc,
+    video_surface_presented_rect, video_surface_remove, video_surface_set_rect,
+    video_surface_set_rotation, TakenFrame, VideoDecoder, VideoEncoder,
 };
 
 /// Monotonic host clock in nanoseconds — the timeline `present(at-ns)` speaks.
@@ -662,6 +664,33 @@ mod android {
             self.pts_us
         }
 
+        // task 120 (wasi:video-codec frame accessors). The Android frame is an
+        // opaque MediaCodec output-buffer index (zero-copy → surface); the pixels
+        // never reach the CPU, so dimensions/rotation are not tracked here and
+        // there is no RGBA readback. No Android consumer reads them (Signal drives
+        // the AUTO path; the players are desktop) — return inert values.
+        pub fn width(&self) -> u32 {
+            0
+        }
+        pub fn height(&self) -> u32 {
+            0
+        }
+        pub fn rotation(&self) -> u32 {
+            0
+        }
+        pub fn read_rgba(&self) -> Option<Vec<u8>> {
+            None
+        }
+        /// task 120: `video-surface.present(frame, at-ns)`. On Android the output
+        /// buffer is bound to the surface its DECODER was configured/attached with,
+        /// so `id` is informational — release it to that surface at the deadline via
+        /// the HW compositor. (The embedder↔decoder surface binding is set by
+        /// `VideoDecoder::set_surface_id`; full zero-copy AUTO is device-verified in
+        /// the Signal pass.)
+        pub fn present_to(self, _id: u32, at_ns: u64) {
+            schedule_present(at_ns, self);
+        }
+
         /// Present as soon as possible (`present(at-ns)` with `at-ns == 0`).
         pub fn present_now(mut self) {
             if self.alive.load(Relaxed) {
@@ -696,6 +725,67 @@ mod android {
             }
         }
         frame.consumed = true;
+    }
+
+    // ── task 120: embedder-owned compositing surfaces (wandr:video video-surface)
+    // ───────────────────────────────────────────────────────────────────────────
+    // The split contract makes `video-surface` its own resource. On Android a
+    // surface is a `media::` child-surface SLOT (SurfaceView model). This registry
+    // lets the embedder create/place/destroy a slot independently of a codec
+    // decoder; `VideoDecoder::set_surface_id` (attach) is what binds a decoder's
+    // MediaCodec output to a slot for the AUTO/RTP path.
+    struct VSurface {
+        slot: i32,
+        rect: super::VideoRect,
+        degrees: u32,
+    }
+    thread_local! {
+        static VSURFACES: std::cell::RefCell<std::collections::HashMap<u32, VSurface>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+        static VSURF_NEXT: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+    }
+
+    pub fn video_surface_alloc(rect: super::VideoRect, layer: super::ZLayer, degrees: u32) -> u32 {
+        // Producer buffer sized to the rect; sf_media_set_geometry scales/places it.
+        let Some((slot, _win)) = media::create(rect.w.max(1), rect.h.max(1), z_remote(layer))
+        else {
+            return 0; // no surface (surfaceless / shim absent)
+        };
+        media::set_geometry(slot, rect, degrees);
+        media::set_visible(slot, true);
+        let id = VSURF_NEXT.with(|n| {
+            let v = n.get();
+            n.set(v.wrapping_add(1).max(1));
+            v
+        });
+        VSURFACES.with(|m| m.borrow_mut().insert(id, VSurface { slot, rect, degrees }));
+        id
+    }
+    pub fn video_surface_set_rect(id: u32, rect: super::VideoRect) {
+        VSURFACES.with(|m| {
+            if let Some(s) = m.borrow_mut().get_mut(&id) {
+                s.rect = rect;
+                media::set_rect(s.slot, rect);
+            }
+        });
+    }
+    pub fn video_surface_set_rotation(id: u32, degrees: u32) {
+        VSURFACES.with(|m| {
+            if let Some(s) = m.borrow_mut().get_mut(&id) {
+                s.degrees = degrees;
+                media::set_transform(s.slot, degrees);
+            }
+        });
+    }
+    pub fn video_surface_presented_rect(id: u32) -> Option<super::VideoRect> {
+        VSURFACES.with(|m| m.borrow().get(&id).map(|s| s.rect))
+    }
+    pub fn video_surface_remove(id: u32) {
+        VSURFACES.with(|m| {
+            if let Some(s) = m.borrow_mut().remove(&id) {
+                media::destroy(s.slot);
+            }
+        });
     }
 
     // ── encoder: camera → input surface → HW VP8 ──────────────────────────
@@ -1110,6 +1200,10 @@ mod android {
         started: bool,
         decoded: u64,
         slot: Option<i32>,
+        /// task 120: the embedder `video-surface` this decoder is attached to for
+        /// the AUTO/RTP path (`set_surface_id`). Recorded so the registry and the
+        /// decoder agree; the zero-copy MediaCodec→Surface rebind is the Signal pass.
+        attached_surface: Option<u32>,
         /// True when this decoder cleared the app layer's opaque flag (so it
         /// must restore it on teardown).
         opaque_cleared: bool,
@@ -1145,6 +1239,7 @@ mod android {
                 started: false,
                 decoded: 0,
                 slot: None,
+                attached_surface: None,
                 opaque_cleared: false,
                 cvo: config.rotation % 360,
                 guest_rect: super::VideoRect { x: 0, y: 0, w: 0, h: 0 },
@@ -1243,6 +1338,16 @@ mod android {
 
         pub fn decoded_frames(&self) -> u64 {
             self.decoded
+        }
+
+        /// task 120 (AUTO / `video-surface.attach`): associate this decoder with the
+        /// embedder surface `id`. The zero-copy MediaCodec→Surface rebind
+        /// (configure-time surface + `AMediaCodec_setOutputSurface`) so RTP output
+        /// auto-composites into the attached slot is completed and DEVICE-VERIFIED in
+        /// the Signal pass; recorded here so the surface registry and the decoder
+        /// agree and the split builds for aarch64-android.
+        pub fn set_surface_id(&mut self, id: u32) {
+            self.attached_surface = Some(id);
         }
 
         // ── PLAYBACK (task 117 M2) ────────────────────────────────────────
