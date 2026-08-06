@@ -466,8 +466,11 @@ impl LoadedApp {
             .map_err(|e| anyhow!("CryptoHost::add_to_linker: {e:#}"))?; // task 93 Phase A wandr:crypto
         crate::video_host_bindings::VideoHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("VideoHost::add_to_linker: {e:#}"))?; // task 120 wandr:video embedder (+ wasi:video-codec/camera/eme)
-        crate::video_diag_bindings::VideoDiag::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
-            .map_err(|e| anyhow!("VideoDiag::add_to_linker: {e:#}"))?; // task 120 wandr:video-diag
+        // ONLY the diag interface — the shared wasi:video-codec/eme interfaces are
+        // already linked by VideoHost above (the world-level add_to_linker would
+        // re-add them → "defined twice").
+        crate::video_diag_bindings::wandr::video_diag::diag::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+            .map_err(|e| anyhow!("video-diag add_to_linker: {e:#}"))?; // task 120 wandr:video-diag
         crate::notify_host_bindings::NotifyHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("NotifyHost::add_to_linker: {e:#}"))?; // Signal bg-receipt M3
         crate::keyguard_host_bindings::KeyguardHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
@@ -640,8 +643,11 @@ impl LoadedApp {
             .map_err(|e| anyhow!("CryptoHost::add_to_linker: {e:#}"))?; // task 93 Phase A wandr:crypto
         crate::video_host_bindings::VideoHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("VideoHost::add_to_linker: {e:#}"))?; // task 120 wandr:video embedder (+ wasi:video-codec/camera/eme)
-        crate::video_diag_bindings::VideoDiag::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
-            .map_err(|e| anyhow!("VideoDiag::add_to_linker: {e:#}"))?; // task 120 wandr:video-diag
+        // ONLY the diag interface — the shared wasi:video-codec/eme interfaces are
+        // already linked by VideoHost above (the world-level add_to_linker would
+        // re-add them → "defined twice").
+        crate::video_diag_bindings::wandr::video_diag::diag::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
+            .map_err(|e| anyhow!("video-diag add_to_linker: {e:#}"))?; // task 120 wandr:video-diag
         crate::notify_host_bindings::NotifyHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
             .map_err(|e| anyhow!("NotifyHost::add_to_linker: {e:#}"))?; // Signal bg-receipt M3
         crate::keyguard_host_bindings::KeyguardHost::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s| s)
