@@ -75,6 +75,16 @@ chmod +x "$tmp"
 mv "$tmp" "$BIN_DIR/wandr-host"
 info "installed → $BIN_DIR/wandr-host"
 
+# ── the `wandr` app-manager CLI (sits beside the host) ───────────────────────
+RAW="https://raw.githubusercontent.com/$REPO/main"
+if dl "$RAW/wandr" "$BIN_DIR/wandr.tmp" 2>/dev/null; then
+  chmod +x "$BIN_DIR/wandr.tmp" && mv "$BIN_DIR/wandr.tmp" "$BIN_DIR/wandr"
+  info "installed → $BIN_DIR/wandr"
+else
+  rm -f "$BIN_DIR/wandr.tmp"
+  warn "could not fetch the 'wandr' CLI (host installed fine; grab it later from $RAW/wandr)."
+fi
+
 # ── runtime dep: GStreamer (the video DECODE backend) ────────────────────────
 if command -v gst-inspect-1.0 >/dev/null 2>&1 || pkg-config --exists gstreamer-1.0 2>/dev/null; then
   :
@@ -93,4 +103,4 @@ case ":${PATH}:" in
      printf '    echo '\''export PATH="%s:$PATH"'\'' >> ~/.zshrc   # or ~/.bashrc\n' "$BIN_DIR" ;;
 esac
 
-printf '\ndone. run an installed app with:  wandr-host --app <app-id>\n'
+printf '\ndone. next:  wandr list   →   wandr install <id>   →   wandr run <id>\n'

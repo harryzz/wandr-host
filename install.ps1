@@ -58,6 +58,15 @@ $dest = Join-Path $BinDir 'wandr-host.exe'
 Move-Item -Force -Path $tmp -Destination $dest
 Info "installed -> $dest"
 
+# --- the `wandr` app-manager CLI (sits beside the host) ---------------------
+$raw = "https://raw.githubusercontent.com/$Repo/main"
+foreach ($f in 'wandr.ps1', 'wandr.cmd') {
+  try {
+    Invoke-WebRequest -Uri "$raw/$f" -OutFile (Join-Path $BinDir $f) -UseBasicParsing
+    Info "installed -> $BinDir\$f"
+  } catch { Warn "could not fetch $f (host installed fine; grab it later from $raw/$f)." }
+}
+
 # --- runtime dep: GStreamer (the video DECODE backend) ----------------------
 if (-not (Get-Command gst-inspect-1.0.exe -ErrorAction SilentlyContinue) -and -not $env:GSTREAMER_1_0_ROOT_MSVC_X86_64) {
   Warn "GStreamer not found - video playback needs it:"
@@ -72,4 +81,4 @@ if (($userPath -split ';') -notcontains $BinDir) {
 }
 
 Write-Host ""
-Write-Host "done. run an installed app with:  wandr-host --app <app-id>"
+Write-Host "done. next:  wandr list   ->   wandr install <id>   ->   wandr run <id>"
