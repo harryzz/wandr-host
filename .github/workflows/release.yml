@@ -61,6 +61,12 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          # The default GITHUB_TOKEN is blocked from the releases API on this repo
+          # ("Resource not accessible by integration") even with contents:write. Use
+          # a fine-grained PAT secret RELEASE_TOKEN (Contents: Read+Write on this repo)
+          # if present; falls back to GITHUB_TOKEN (which will 403 until the secret
+          # is added). Create: Settings → Secrets → Actions → New → RELEASE_TOKEN.
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
           tag_name: ${{ github.event.inputs.release_tag }}
           name: ${{ github.event.inputs.release_tag }}
           target_commitish: ${{ steps.src.outputs.sha }}   # tag the exact built commit
