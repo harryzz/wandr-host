@@ -8,7 +8,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--install") {
         let Some(wandrpkg) = args.get(i + 1) else {
-            eprintln!("wandr-host --install: requires a <wandrpkg-dir> path");
+            eprintln!("wandr-host --install: requires a <wandrpkg> path (bundle dir or .wandrpkg archive)");
             std::process::exit(2);
         };
         match wasm_android_host::install_wandrpkg(std::path::Path::new(wandrpkg)) {
@@ -144,9 +144,10 @@ fn main() {
 //                                                  bin is never executed by
 //                                                  the APK; android_main in
 //                                                  the cdylib is the entry).
-//   `wandr-host --install <wandrpkg-dir>`           → task-35 installer: read
-//                                                  bundle, AOT-precompile,
-//                                                  write `cache-key.toml`.
+//   `wandr-host --install <wandrpkg>`              → task-35 installer: read
+//                                                  bundle (dir OR .wandrpkg zip),
+//                                                  AOT-precompile, write
+//                                                  `cache-key.toml`.
 //   `wandr-host --standalone [--app <app-id>]`    → task-33 boot-model:
 //                                                  privileged process that
 //                                                  owns the display. Loads
@@ -572,7 +573,7 @@ fn main() {
 
     if let Some(i) = args.iter().position(|a| a == "--install") {
         let Some(wandrpkg) = args.get(i + 1) else {
-            eprintln!("wandr-host --install: requires a <wandrpkg-dir> path");
+            eprintln!("wandr-host --install: requires a <wandrpkg> path (bundle dir or .wandrpkg archive)");
             std::process::exit(2);
         };
         android_logger::init_once(

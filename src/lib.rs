@@ -2337,12 +2337,30 @@ pub fn run() {
     event_loop.run_app(&mut App::from_parts(engine, loaded)).unwrap();
 }
 
-/// CLI entry for `wandr-host --install <wandrpkg-dir>`. Reads the bundle,
-/// AOT-precompiles each component on-device, writes the install dir,
-/// and stamps `cache-key.toml`. Honors `WANDR_APPS_ROOT` for sandboxed
-/// smoke testing.
-pub fn install_wandrpkg(wandrpkg_dir: &Path) -> anyhow::Result<app_installer::InstalledApp> {
+/// CLI entry for `wandr-host --install <wandrpkg>`. `<wandrpkg>` is either an
+/// unpacked bundle DIRECTORY or a `.wandrpkg` ZIP ARCHIVE (what CI publishes and
+/// `wandr install` downloads) — an archive is unzipped to a temp dir first. Reads
+/// the bundle, AOT-precompiles each component on-device, writes the install dir,
+/// and stamps `cache-key.toml`. Honors `WANDR_APPS_ROOT` for sandboxed smoke testing.
+pub fn install_wandrpkg(wandrpkg: &Path) -> anyhow::Result<app_installer::InstalledApp> {
     use app_installer::{AppInstaller, PackageBundle};
+
+    // Accept a directory as-is; unzip a file to a scratch dir and install from the
+    // bundle root inside it. `_extracted` holds the TempDir until this fn returns —
+    // install() copies everything it needs out of the bundle before then.
+    let (bundle_root, _extracted): (PathBuf, Option<tempfile::TempDir>) = if wandrpkg.is_dir() {
+        (wandrpkg.to_path_buf(), None)
+    } else if wandrpkg.is_file() {
+        let (tmp, root) = unpack_wandrpkg_archive(wandrpkg)?;
+        log::info!("install: unpacked archive {} → {}", wandrpkg.display(), root.display());
+        (root, Some(tmp))
+    } else {
+        anyhow::bail!(
+            "{} is neither a .wandrpkg directory nor an archive file",
+            wandrpkg.display()
+        );
+    };
+    let wandrpkg_dir = bundle_root.as_path();
     // Cross-AOT: on a beefy PC, set WANDR_AOT_TARGET=<device triple> (e.g.
     // aarch64-linux-android) to precompile FOR the device instead of the host arch. The
     // cwasm + cache-key are written for that target; pushed to the device they load without
@@ -2368,4 +2386,69 @@ pub fn install_wandrpkg(wandrpkg_dir: &Path) -> anyhow::Result<app_installer::In
         installed.app_id, installed.version, installed.install_dir.display(),
     );
     Ok(installed)
+}
+
+/// Unzip a `.wandrpkg` archive into a fresh temp dir. Returns the `TempDir`
+/// (keep it alive while the extracted files are in use) and the bundle root —
+/// the directory holding `package.toml`, be that the archive root or a single
+/// top-level wrapper dir (`zip -r foo.wandrpkg foo/`).
+fn unpack_wandrpkg_archive(archive: &Path) -> anyhow::Result<(tempfile::TempDir, PathBuf)> {
+    use anyhow::Context;
+    use std::io;
+
+    let file = std::fs::File::open(archive)
+        .with_context(|| format!("open {}", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(io::BufReader::new(file))
+        .with_context(|| format!("{} is not a valid zip (.wandrpkg) archive", archive.display()))?;
+
+    let tmp = tempfile::Builder::new().prefix("wandrpkg-").tempdir()?;
+    let out = tmp.path().to_path_buf();
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        // enclosed_name() rejects absolute paths and `..` escapes (zip-slip guard).
+        let rel = entry
+            .enclosed_name()
+            .ok_or_else(|| anyhow::anyhow!("archive entry '{}' has an unsafe path", entry.name()))?;
+        let dest = out.join(rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&dest)?;
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut sink = std::fs::File::create(&dest)
+            .with_context(|| format!("write {}", dest.display()))?;
+        io::copy(&mut entry, &mut sink)?;
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode));
+        }
+    }
+
+    let root = find_bundle_root(&out).ok_or_else(|| {
+        anyhow::anyhow!("{}: no package.toml found in the archive", archive.display())
+    })?;
+    Ok((tmp, root))
+}
+
+/// The bundle root inside an extracted archive: the dir with `package.toml`,
+/// accepting either the extraction root or exactly one top-level wrapper dir.
+/// More than one candidate is ambiguous → `None`.
+fn find_bundle_root(dir: &Path) -> Option<PathBuf> {
+    if dir.join("package.toml").is_file() {
+        return Some(dir.to_path_buf());
+    }
+    let mut found = None;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let p = entry.ok()?.path();
+        if p.is_dir() && p.join("package.toml").is_file() {
+            if found.is_some() {
+                return None; // ambiguous — multiple wrapper dirs
+            }
+            found = Some(p);
+        }
+    }
+    found
 }

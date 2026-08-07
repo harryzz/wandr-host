@@ -83,6 +83,8 @@ digest             = "0.10"
 # Runtime HWCAP detection (aes/sha2/sha1) for the caps `hardware-accelerated` flag.
 cpufeatures        = "0.2"
 toml               = { version = "0.8", default-features = false, features = ["parse", "display"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
+tempfile = "3"
 
 # skia-safe: GL backend only (no Vulkan needed — EGL gives us GLES)
 # [spike] bumped 0.93.1 -> 0.99.0 (Skia m144 -> m150) to test whether the newer Android
