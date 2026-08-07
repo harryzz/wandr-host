@@ -23,7 +23,7 @@ $HostExe   = Join-Path $BinDir 'wandr-host.exe'
 # Host reads/writes installed apps at <WANDR_APPS_ROOT>\apps\<id>\<version>.
 $AppsRoot     = $WandrHome
 $InstalledDir = Join-Path $AppsRoot 'apps'
-$Registry  = if ($env:WANDR_REGISTRY) { $env:WANDR_REGISTRY } else { 'https://harryzz.github.io/wandr-apps/index.json' }
+$Registry  = if ($env:WANDR_REGISTRY) { $env:WANDR_REGISTRY } else { 'https://harryzz.github.io/wandr/registry/index.json' }
 
 function Info($m) { Write-Host "> $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "! $m" -ForegroundColor Yellow }
