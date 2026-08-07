@@ -6,15 +6,13 @@ name: build
 # reads to generate AIDL bindings — hence its own job with submodule caching.
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:          # manual build button; releasing is a separate workflow
+  workflow_dispatch:          # manual only — no auto-build on push/PR (avoid burning CI on every commit)
+  #   Actions → build → Run workflow. Releasing is a separate manual workflow.
 
 env:
   CARGO_TERM_COLOR: always
 
-# Only one build per ref at a time — a newer push/dispatch cancels the older run
+# Only one build per ref at a time — a newer dispatch cancels the older run
 # instead of piling up and fighting over the scarce macOS/android runners.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
